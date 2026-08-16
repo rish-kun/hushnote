@@ -650,7 +650,8 @@ final class AppCoordinator {
     /// Whether a key is already in the Keychain, so the field can say so.
     func hasStoredCredential(for provider: InsightProviderChoice) async -> Bool {
         guard let key = Self.credentialKey(for: provider) else { return false }
-        return (try? await credentials.credential(for: key)) ?? nil != nil
+        guard let stored = try? await credentials.credential(for: key) else { return false }
+        return stored != nil
     }
 
     /// Saves the key, then actually verifies it. The key is never held anywhere
@@ -668,9 +669,10 @@ final class AppCoordinator {
         } catch {
             return .failed("The Keychain refused to save the key: \(error.localizedDescription)")
         }
-        guard case .available = await (try? selectedInsightProvider())?.healthCheck()
-            ?? .unavailable("The provider could not be created.")
-        else {
+        guard let provider = try? await selectedInsightProvider() else {
+            return .failed("The provider could not be prepared. Check Settings.")
+        }
+        guard case .available = await provider.healthCheck() else {
             return .failed("The key was saved, but the provider did not accept it.")
         }
         return .verified
