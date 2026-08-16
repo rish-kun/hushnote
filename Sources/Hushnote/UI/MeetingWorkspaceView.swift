@@ -225,7 +225,8 @@ struct CompletedMeetingView: View {
         switch state.selectedWorkspaceTab {
         case "Notes": MeetingNotesView(meetingID: meetingID)
         case "Summary": summaryWorkspace
-        case "Transcript": TranscriptView(isEditable: true)
+        case "Transcript":
+            TranscriptView(isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase))
         case "Ask": AskMeetingView()
         default: EmptyView()
         }
@@ -322,10 +323,36 @@ struct MeetingNotesView: View {
     }
 }
 
+/// When a transcript line may be edited, and when a change to one is the user's
+/// rather than the model's.
+enum TranscriptEditPolicy {
+    /// A transcript that is still being produced is not the user's to correct.
+    /// While capturing, every live delta replaces `state.transcript` wholesale;
+    /// while finalizing, the final pass mints new segment identifiers and
+    /// re-keys corrections by overlap. An edit made in either window is racing
+    /// a writer it cannot see.
+    nonisolated static func allowsEditing(phase: RecordingPhase) -> Bool {
+        !phase.isBusy
+    }
+
+    /// `.onChange(of:)` cannot distinguish a keystroke from a model-driven
+    /// rewrite of the same binding, so focus decides. A field the user is not
+    /// typing in did not produce the change, and an unchanged value is not an
+    /// edit at all.
+    nonisolated static func isHumanEdit(
+        isFocused: Bool,
+        from oldText: String,
+        to newText: String
+    ) -> Bool {
+        isFocused && oldText != newText
+    }
+}
+
 struct TranscriptView: View {
     let isEditable: Bool
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
+    @FocusState private var focusedLine: UUID?
 
     var body: some View {
         @Bindable var state = state
@@ -344,7 +371,13 @@ struct TranscriptView: View {
                             TextField("Transcript", text: $line.text, axis: .vertical)
                                 .textFieldStyle(.plain)
                                 .lineLimit(1...8)
-                                .onChange(of: line.text) { _, text in
+                                .focused($focusedLine, equals: line.id)
+                                .onChange(of: line.text) { previous, text in
+                                    guard TranscriptEditPolicy.isHumanEdit(
+                                        isFocused: focusedLine == line.id,
+                                        from: previous,
+                                        to: text
+                                    ) else { return }
                                     line.isUserEdited = true
                                     coordinator.queueTranscriptEdit(id: line.segmentID, text: text)
                                 }
