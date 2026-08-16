@@ -26,8 +26,11 @@ private struct WhisperKitDecoder: LiveSpeechDecoder, @unchecked Sendable {
 
 public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     private struct SourceBuffer: Sendable {
+        /// Only the audio that is still in play. Committed samples are physically
+        /// dropped, so a decode never re-encodes the whole meeting.
         var samples: [Float] = []
-        var firstFrameStartMilliseconds: Int64?
+        /// Meeting time of `samples[0]`, added back to every emitted timestamp.
+        var windowOriginMilliseconds: Int64?
         var lastSequenceNumber: Int64?
         var lastDecodedSampleCount = 0
         var revision = 0
@@ -105,7 +108,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         if let last = buffer.lastSequenceNumber, frame.sequenceNumber <= last {
             throw SpeechPipelineError.invalidFrameSequence
         }
-        buffer.firstFrameStartMilliseconds = buffer.firstFrameStartMilliseconds
+        buffer.windowOriginMilliseconds = buffer.windowOriginMilliseconds
             ?? frame.startMilliseconds
         buffer.lastSequenceNumber = frame.sequenceNumber
         buffer.samples.append(contentsOf: frame.samples)
@@ -160,18 +163,41 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             return
         }
 
-        var options = DecodingOptions(
+        // Committed audio is dropped after each decode, so the window only grows
+        // past the cap when nothing commits — long silence, or VAD finding no
+        // speech. Enforce the cap here rather than after the decode so the
+        // decoder itself never sees more than one Whisper window. Never discard
+        // audio a decode has not seen yet.
+        let capSamples = Self.samples(milliseconds: Self.maximumWindowMilliseconds)
+        if buffer.samples.count > capSamples {
+            let excess = min(buffer.samples.count - capSamples, buffer.lastDecodedSampleCount)
+            if excess > 0 {
+                buffer.samples.removeFirst(excess)
+                let trimmedOrigin = (buffer.windowOriginMilliseconds ?? 0)
+                    + Self.milliseconds(samples: excess)
+                buffer.windowOriginMilliseconds = trimmedOrigin
+                buffer.lastDecodedSampleCount -= excess
+                // Audio that is gone can no longer be revised.
+                buffer.stablePrefixCount = max(
+                    buffer.stablePrefixCount,
+                    buffer.segments.prefix { $0.endMilliseconds <= trimmedOrigin }.count
+                )
+                buffers[source] = buffer
+            }
+        }
+
+        // `clipTimestamps` is deliberately absent: WhisperKit clears it
+        // unconditionally on the `.vad` path (`WhisperKit.swift`, the
+        // `chunkedOptions?.clipTimestamps = []` line in `transcribe(audioArray:)`),
+        // so asking it to skip committed audio never worked. The window itself
+        // is trimmed instead.
+        let options = DecodingOptions(
             language: configuration.languageCode,
             wordTimestamps: true,
             chunkingStrategy: .vad
         )
 
         let frozenPrefix = Array(buffer.segments.prefix(buffer.stablePrefixCount))
-        if let frozenEnd = frozenPrefix.last?.endMilliseconds,
-            let origin = buffer.firstFrameStartMilliseconds
-        {
-            options.clipTimestamps = [Float(frozenEnd - origin) / 1_000]
-        }
 
         // Keep an immutable view of the samples being decoded. The actor can be
         // re-entered while Core ML is running, so later frames may already have
@@ -181,7 +207,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             samples: decodedSamples,
             options: options
         )
-        let origin = buffer.firstFrameStartMilliseconds ?? 0
+        let origin = buffer.windowOriginMilliseconds ?? 0
         // Every decoded segment consumes one ordinal whether or not it survives
         // filtering, so an identifier is never handed out twice.
         let decoded = result.flatMap(\.segments)
@@ -261,17 +287,32 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             ]
         }
 
-        var updatedBuffer = buffers[source] ?? buffer
-        updatedBuffer.revision = buffer.revision + 1
-        updatedBuffer.nextSegmentOrdinal = nextOrdinal
-        updatedBuffer.lastDecodedSampleCount = decodedSamples.count
-        updatedBuffer.segments = hypothesis
-        updatedBuffer.stablePrefixCount = final
+        let stablePrefixCount = final
             ? hypothesis.count
             : max(
                 buffer.stablePrefixCount,
                 hypothesis.count - configuration.confirmationLagSegments
             )
+
+        // Everything before the committed boundary is settled, so its audio is
+        // dropped. Without this the buffer grows for the whole meeting and each
+        // decode re-runs the encoder from t=0, which crosses a real-time factor
+        // of 1.0 within minutes and never recovers.
+        let windowEnd = origin + Self.milliseconds(samples: decodedSamples.count)
+        let committedEnd = hypothesis.prefix(stablePrefixCount).last?.endMilliseconds ?? origin
+        let droppedSamples = min(
+            decodedSamples.count,
+            Self.samples(milliseconds: max(0, min(committedEnd, windowEnd) - origin))
+        )
+
+        var updatedBuffer = buffers[source] ?? buffer
+        updatedBuffer.revision = buffer.revision + 1
+        updatedBuffer.nextSegmentOrdinal = nextOrdinal
+        updatedBuffer.samples.removeFirst(droppedSamples)
+        updatedBuffer.windowOriginMilliseconds = origin + Self.milliseconds(samples: droppedSamples)
+        updatedBuffer.lastDecodedSampleCount = decodedSamples.count - droppedSamples
+        updatedBuffer.segments = hypothesis
+        updatedBuffer.stablePrefixCount = stablePrefixCount
         updatedBuffer.isDecoding = false
         buffers[source] = updatedBuffer
 
@@ -289,6 +330,19 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
 
     private func milliseconds(_ seconds: Float) -> Int64 {
         Int64((Double(seconds) * 1_000).rounded())
+    }
+
+    /// Upper bound on uncommitted audio. Matching WhisperKit's own 30s window
+    /// (`Constants.defaultWindowSamples`) keeps a capped window off the VAD
+    /// chunking path, which is the expensive branch.
+    private static let maximumWindowMilliseconds: Int64 = 30_000
+
+    private static func milliseconds(samples: Int) -> Int64 {
+        Int64(samples) * 1_000 / Int64(WhisperKit.sampleRate)
+    }
+
+    private static func samples(milliseconds: Int64) -> Int {
+        Int(milliseconds * Int64(WhisperKit.sampleRate) / 1_000)
     }
 
     private func clearSession() {

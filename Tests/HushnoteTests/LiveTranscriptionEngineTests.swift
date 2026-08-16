@@ -93,6 +93,81 @@ struct LiveTranscriptionEngineTests {
         #expect(Set(wordIDs).count == wordIDs.count)
     }
 
+    @Test("Committed audio leaves the live window instead of being re-decoded")
+    func dropsCommittedAudioFromTheWindow() async throws {
+        let meetingID = UUID()
+        let decoder = WindowMirroringDecoder()
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(
+            configuration: configuration(meetingID: meetingID, confirmationLagSegments: 2)
+        )
+        var deltas = stream.makeAsyncIterator()
+
+        var last: TranscriptDelta?
+        for index in 0..<60 {
+            try await engine.push(frame(
+                meetingID: meetingID,
+                sequence: Int64(index) + 1,
+                startMilliseconds: Int64(index) * 1_000
+            ))
+            last = try await deltas.next()
+        }
+
+        let windows = await decoder.receivedSampleCounts
+        // A minute of speech must never be re-encoded from t=0. Only the audio
+        // after the committed prefix is still in play.
+        #expect(windows.max() ?? 0 <= 16_000 * 6)
+        // Timestamps stay in meeting time even though the window no longer
+        // starts at t=0.
+        #expect(last?.segments.last?.endMilliseconds == 60_000)
+        #expect(last?.segments.count == 60)
+    }
+
+    @Test("The live window is capped even when nothing ever commits")
+    func capsTheWindowWhenNothingCommits() async throws {
+        let meetingID = UUID()
+        let decoder = ScriptedDecoder([[]])
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
+        var deltas = stream.makeAsyncIterator()
+
+        for index in 0..<60 {
+            try await engine.push(frame(
+                meetingID: meetingID,
+                sequence: Int64(index) + 1,
+                startMilliseconds: Int64(index) * 1_000
+            ))
+            _ = try await deltas.next()
+        }
+
+        // 480_000 samples is WhisperKit's own 30s window; past it every decode
+        // pays for VAD chunking on top of an unbounded buffer.
+        let windows = await decoder.receivedSampleCounts
+        #expect(windows.max() ?? 0 <= 480_000)
+    }
+
+    @Test("Clip timestamps are never sent, because the VAD path discards them")
+    func neverSendsClipTimestamps() async throws {
+        let meetingID = UUID()
+        let decoder = WindowMirroringDecoder()
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
+        var deltas = stream.makeAsyncIterator()
+
+        for index in 0..<6 {
+            try await engine.push(frame(
+                meetingID: meetingID,
+                sequence: Int64(index) + 1,
+                startMilliseconds: Int64(index) * 1_000
+            ))
+            _ = try await deltas.next()
+        }
+
+        let options = await decoder.receivedOptions
+        #expect(options.count == 6)
+        #expect(options.allSatisfy { $0.clipTimestamps.isEmpty })
+    }
+
     @Test("Identifiers are scoped to the meeting that produced them")
     func identifiersDoNotCollideAcrossMeetings() async throws {
         let first = UUID()
@@ -169,6 +244,7 @@ private actor ScriptedDecoder: LiveSpeechDecoder {
     private let scripts: [[TranscriptionSegment]]
     private var callCount = 0
     private(set) var receivedSampleCounts: [Int] = []
+    private(set) var receivedOptions: [DecodingOptions] = []
 
     init(_ scripts: [[TranscriptionSegment]]) {
         self.scripts = scripts
@@ -179,16 +255,42 @@ private actor ScriptedDecoder: LiveSpeechDecoder {
         options: DecodingOptions
     ) async throws -> [TranscriptionResult] {
         receivedSampleCounts.append(samples.count)
+        receivedOptions.append(options)
         let index = min(callCount, scripts.count - 1)
         callCount += 1
-        let segments = scripts[index]
-        return [
-            TranscriptionResult(
-                text: segments.map(\.text).joined(separator: " "),
-                segments: segments,
-                language: "en",
-                timings: TranscriptionTimings()
-            )
-        ]
+        return [result(segments: scripts[index])]
     }
+}
+
+/// Behaves the way Whisper does: it only ever sees the window it is handed, and
+/// reports timings relative to the start of that window.
+private actor WindowMirroringDecoder: LiveSpeechDecoder {
+    private(set) var receivedSampleCounts: [Int] = []
+    private(set) var receivedOptions: [DecodingOptions] = []
+
+    func decodeWindow(
+        samples: [Float],
+        options: DecodingOptions
+    ) async throws -> [TranscriptionResult] {
+        receivedSampleCounts.append(samples.count)
+        receivedOptions.append(options)
+        let seconds = samples.count / 16_000
+        let segments = (0..<seconds).map { index in
+            whisperSegment(
+                start: Float(index),
+                end: Float(index + 1),
+                text: "second \(index)"
+            )
+        }
+        return [result(segments: segments)]
+    }
+}
+
+private func result(segments: [TranscriptionSegment]) -> TranscriptionResult {
+    TranscriptionResult(
+        text: segments.map(\.text).joined(separator: " "),
+        segments: segments,
+        language: "en",
+        timings: TranscriptionTimings()
+    )
 }
