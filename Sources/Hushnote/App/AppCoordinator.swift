@@ -43,7 +43,6 @@ final class AppCoordinator {
     @ObservationIgnored private var liveSessionGeneration: UUID?
     @ObservationIgnored private var sequenceNumbers: [AudioSource: Int64] = [:]
     @ObservationIgnored private var assembler: TranscriptAssembler?
-    @ObservationIgnored private var stagedAPIKeys: [InsightProviderChoice: String] = [:]
     @ObservationIgnored private var cachedSegments: [UUID: [TranscriptSegment]] = [:]
     @ObservationIgnored private var pendingEditTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingNoteTasks: [UUID: Task<Void, Never>] = [:]
@@ -641,22 +640,40 @@ final class AppCoordinator {
         }
     }
 
-    func stageAPIKey(_ key: String, provider: InsightProviderChoice) {
-        stagedAPIKeys[provider] = key
+    /// Whether a key is already in the Keychain, so the field can say so.
+    func hasStoredCredential(for provider: InsightProviderChoice) async -> Bool {
+        guard let key = Self.credentialKey(for: provider) else { return false }
+        return (try? await credentials.credential(for: key)) ?? nil != nil
     }
 
-    func saveStagedAPIKey(provider: InsightProviderChoice) async {
-        let value = stagedAPIKeys[provider, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return }
+    /// Saves the key, then actually verifies it. The key is never held anywhere
+    /// but the Keychain and the caller's own field.
+    func saveAndVerifyAPIKey(
+        _ key: String,
+        provider: InsightProviderChoice
+    ) async -> CredentialFieldState {
+        let value = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, let credentialKey = Self.credentialKey(for: provider) else {
+            return .absent
+        }
         do {
-            switch provider {
-            case .openAI: try await credentials.setCredential(value, for: .openAIAPIKey)
-            case .anthropic: try await credentials.setCredential(value, for: .anthropicAPIKey)
-            default: return
-            }
-            stagedAPIKeys[provider] = nil
+            try await credentials.setCredential(value, for: credentialKey)
         } catch {
-            state.markFailed(.init(kind: .credentialStorage, message: "Keychain could not save the credential: \(error.localizedDescription)"))
+            return .failed("The Keychain refused to save the key: \(error.localizedDescription)")
+        }
+        guard case .available = await (try? selectedInsightProvider())?.healthCheck()
+            ?? .unavailable("The provider could not be created.")
+        else {
+            return .failed("The key was saved, but the provider did not accept it.")
+        }
+        return .verified
+    }
+
+    private static func credentialKey(for provider: InsightProviderChoice) -> ProviderCredential? {
+        switch provider {
+        case .openAI: .openAIAPIKey
+        case .anthropic: .anthropicAPIKey
+        default: nil
         }
     }
 

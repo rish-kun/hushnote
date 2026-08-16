@@ -1,5 +1,96 @@
 import SwiftUI
 
+/// What the app knows about a provider credential, and what it may claim.
+enum CredentialFieldState: Equatable {
+    /// The Keychain has not been asked yet.
+    case unknown
+    case absent
+    case stored
+    case verifying
+    case verified
+    case failed(String)
+}
+
+enum CredentialField {
+    nonisolated static func canSubmit(entry: String, state: CredentialFieldState) -> Bool {
+        guard state != .verifying else { return false }
+        return !entry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    nonisolated static func statusText(_ state: CredentialFieldState) -> String {
+        switch state {
+        case .unknown: ""
+        case .absent: "No key is stored for this provider."
+        case .stored: "A key is stored in your Keychain."
+        case .verifying: "Checking the key with the provider…"
+        case .verified: "The key works and is saved in your Keychain."
+        case .failed(let reason): reason
+        }
+    }
+
+    /// A key that verified is in the Keychain; leaving the plaintext in a view
+    /// for the rest of the session serves nothing. A key that failed is left
+    /// alone so it can be corrected rather than retyped.
+    nonisolated static func clearsEntry(after state: CredentialFieldState) -> Bool {
+        state == .verified
+    }
+}
+
+/// The key lives in local state and nowhere else until it is saved, so an
+/// unrelated re-render cannot resync the field out from under the typing.
+struct APIKeyField: View {
+    let provider: InsightProviderChoice
+    @Environment(AppCoordinator.self) private var coordinator
+    @State private var entry = ""
+    @State private var status = CredentialFieldState.unknown
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            SecureField("API key", text: $entry)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 480)
+                .onSubmit(submit)
+
+            HStack(spacing: 12) {
+                Button(status == .verifying ? "Verifying…" : "Save and verify", action: submit)
+                    .buttonStyle(.bordered)
+                    .disabled(!CredentialField.canSubmit(entry: entry, state: status))
+                if status == .verifying {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            let text = CredentialField.statusText(status)
+            if !text.isEmpty {
+                Text(text)
+                    .font(.caption)
+                    .foregroundStyle(isFailure ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(.secondary))
+                    .accessibilityLabel(text)
+            }
+        }
+        .task(id: provider) {
+            entry = ""
+            status = await coordinator.hasStoredCredential(for: provider) ? .stored : .absent
+        }
+    }
+
+    private var isFailure: Bool {
+        if case .failed = status { return true }
+        return false
+    }
+
+    private func submit() {
+        guard CredentialField.canSubmit(entry: entry, state: status) else { return }
+        let key = entry
+        status = .verifying
+        Task {
+            let result = await coordinator.saveAndVerifyAPIKey(key, provider: provider)
+            status = result
+            if CredentialField.clearsEntry(after: result) { entry = "" }
+        }
+    }
+}
+
 struct ModelManagerView: View {
     @Environment(AppCoordinator.self) private var coordinator
 
@@ -93,14 +184,7 @@ struct SettingsView: View {
                     ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
 
                     if state.selectedProvider == .openAI || state.selectedProvider == .anthropic {
-                        SecureField("API key", text: Binding(
-                            get: { "" },
-                            set: { coordinator.stageAPIKey($0, provider: state.selectedProvider) }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 480)
-                        Button("Save and verify") { Task { await coordinator.saveStagedAPIKey(provider: state.selectedProvider) } }
-                            .buttonStyle(.bordered)
+                        APIKeyField(provider: state.selectedProvider)
                     } else if state.selectedProvider == .chatGPT {
                         Button("Connect ChatGPT") { Task { await coordinator.connectChatGPT() } }
                             .buttonStyle(.borderedProminent)
