@@ -251,6 +251,36 @@ struct LiveTranscriptionEngineTests {
         #expect(delta.revision == 1)
     }
 
+    @Test("finish waits for the in-flight decode instead of starting a second one")
+    func finishDoesNotDecodeConcurrently() async throws {
+        let meetingID = UUID()
+        let decoder = GatedDecoder()
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
+
+        let collected = Task {
+            var deltas: [TranscriptDelta] = []
+            for try await delta in stream { deltas.append(delta) }
+            return deltas
+        }
+
+        try await engine.push(frame(meetingID: meetingID, sequence: 1, startMilliseconds: 0))
+        await decoder.waitForStart(count: 1)
+        async let finished: Void = engine.finish()
+        // Let both the live decode and the final decode run. WhisperKit has
+        // mutable timing and decoder state and gives no re-entrancy guarantee,
+        // so they must not overlap.
+        await decoder.open()
+        try await finished
+
+        #expect(await decoder.peakConcurrentCalls == 1)
+        let deltas = try await collected.value
+        // A late non-final delta landing after the final one would un-finalize
+        // the transcript.
+        #expect(deltas.last?.isFinal == true)
+        #expect(deltas.filter(\.isFinal).count == 1)
+    }
+
     @Test("Identifiers are scoped to the meeting that produced them")
     func identifiersDoNotCollideAcrossMeetings() async throws {
         let first = UUID()

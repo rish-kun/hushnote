@@ -161,6 +161,19 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         guard configuration != nil else { throw SpeechPipelineError.sessionNotRunning }
         let token = sessionToken
 
+        // WhisperKit holds mutable timing and decoder state and makes no
+        // re-entrancy promise, so the final decode has to wait for the live one.
+        // Ordering matters too: a late non-final delta arriving after the final
+        // delta would un-finalize the transcript.
+        isFinishing = true
+        for task in decodeTasks.values { _ = await task.value }
+        decodeTasks.removeAll()
+        // An in-flight decode can fail, which tears the session down.
+        guard token == sessionToken, configuration != nil else {
+            isFinishing = false
+            throw SpeechPipelineError.sessionNotRunning
+        }
+
         do {
             for source in buffers.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
                 try await decode(source: source, final: true, token: token)
