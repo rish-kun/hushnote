@@ -150,7 +150,7 @@ struct CompletedMeetingView: View {
                         if let meeting {
                             Text(meeting.startedAt, format: .dateTime.weekday(.wide).month(.wide).day().hour().minute())
                             Text("·")
-                            Text(TimestampButton.format(meeting.duration))
+                            Text(DurationText.clock(meeting.duration))
                             Text("·")
                             Text(meeting.template.rawValue)
                         }

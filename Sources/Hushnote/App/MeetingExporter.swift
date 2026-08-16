@@ -44,7 +44,7 @@ enum MeetingExporter {
         insights: InsightWorkspaceState
     ) -> String {
         var lines = ["# \(meeting.title)", ""]
-        lines.append("_\(meeting.startedAt.formatted(date: .long, time: .shortened)) · \(TimestampButton.format(meeting.duration))_")
+        lines.append("_\(meeting.startedAt.formatted(date: .long, time: .shortened)) · \(DurationText.clock(meeting.duration))_")
         if !insights.summary.isEmpty {
             lines += ["", "## Summary", "", insights.summary]
         }
@@ -54,7 +54,7 @@ enum MeetingExporter {
         lines += ["", "## Transcript", ""]
         for segment in transcript {
             let speaker = segment.speakerName ?? segment.speakerID ?? "Speaker"
-            lines.append("**[\(TimestampButton.format(Double(segment.startMilliseconds) / 1_000))] \(speaker):** \(segment.text)")
+            lines.append("**[\(DurationText.clock(Double(segment.startMilliseconds) / 1_000))] \(speaker):** \(segment.text)")
             lines.append("")
         }
         return lines.joined(separator: "\n")

@@ -160,7 +160,7 @@ struct AppShellView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(state.recordingPhase == .paused ? "Recording paused" : "Recording")
                             .font(.callout.weight(.semibold))
-                        Text(TimestampButton.format(state.elapsed))
+                        Text(DurationText.clock(state.elapsed))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
@@ -286,7 +286,7 @@ struct MeetingsHomeView: View {
                                 HStack(spacing: 10) {
                                     Text(meeting.template.rawValue)
                                     Text("·")
-                                    Text(TimestampButton.format(meeting.duration))
+                                    Text(DurationText.clock(meeting.duration))
                                 }
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)

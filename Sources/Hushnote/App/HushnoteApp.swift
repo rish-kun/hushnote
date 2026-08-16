@@ -69,7 +69,7 @@ private struct MenuBarMeetingView: View {
 
     var body: some View {
         if state.recordingPhase.isCapturing {
-            Text(state.recordingPhase == .paused ? "Paused · \(TimestampButton.format(state.elapsed))" : "Recording · \(TimestampButton.format(state.elapsed))")
+            Text(state.recordingPhase == .paused ? "Paused · \(DurationText.clock(state.elapsed))" : "Recording · \(DurationText.clock(state.elapsed))")
             Divider()
             Button(state.recordingPhase == .paused ? "Resume" : "Pause") {
                 Task { await coordinator.togglePause() }

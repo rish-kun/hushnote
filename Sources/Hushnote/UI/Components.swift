@@ -35,10 +35,10 @@ struct RecordingPill: View {
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(isPaused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilionInk))
 
-            Text(TimestampButton.format(state.elapsed))
+            Text(DurationText.clock(state.elapsed))
                 .font(.callout.monospacedDigit().weight(.medium))
                 .contentTransition(.numericText())
-                .accessibilityLabel("Elapsed time \(TimestampButton.format(state.elapsed))")
+                .accessibilityLabel("Elapsed time \(DurationText.spoken(state.elapsed))")
 
             Divider()
                 .frame(height: 22)
@@ -224,10 +224,10 @@ struct ElapsedTimeLabel: View {
     @Environment(AppViewState.self) private var state
 
     var body: some View {
-        Text(TimestampButton.format(state.elapsed))
+        Text(DurationText.clock(state.elapsed))
             .font(font)
             .contentTransition(.numericText())
-            .accessibilityLabel("Elapsed time \(TimestampButton.format(state.elapsed))")
+            .accessibilityLabel("Elapsed time \(DurationText.spoken(state.elapsed))")
     }
 }
 
@@ -297,7 +297,7 @@ struct TimestampButton: View {
 
     var body: some View {
         Button(action: action) {
-            Text(Self.format(seconds))
+            Text(DurationText.clock(seconds))
                 .font(.caption.monospacedDigit().weight(.medium))
                 .foregroundStyle(HushnoteTheme.moss)
                 .padding(.horizontal, 7)
@@ -305,12 +305,44 @@ struct TimestampButton: View {
                 .background(HushnoteTheme.moss.opacity(0.09), in: Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Jump to \(Self.format(seconds))")
+        .accessibilityLabel("Jump to \(DurationText.clock(seconds))")
     }
 
-    nonisolated static func format(_ seconds: TimeInterval) -> String {
+}
+
+/// One duration, two readings: the clock face on screen and the units a screen
+/// reader speaks.
+enum DurationText {
+    /// `MM:SS` below an hour, `H:MM:SS` above it. Fractions truncate: a
+    /// timestamp must point at the word that has already been said, never the
+    /// one after it.
+    nonisolated static func clock(_ seconds: TimeInterval) -> String {
+        let (hours, minutes, secs) = components(seconds)
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, secs)
+            : String(format: "%02d:%02d", minutes, secs)
+    }
+
+    /// "1 hour 5 minutes 12 seconds", not "one hundred thirty five colon zero
+    /// zero". Empty components are dropped rather than spoken as zeroes.
+    nonisolated static func spoken(_ seconds: TimeInterval) -> String {
+        let (hours, minutes, secs) = components(seconds)
+        var parts: [String] = []
+        if hours > 0 { parts.append(unit(hours, "hour")) }
+        if minutes > 0 { parts.append(unit(minutes, "minute")) }
+        if secs > 0 || parts.isEmpty { parts.append(unit(secs, "second")) }
+        return parts.joined(separator: " ")
+    }
+
+    private nonisolated static func components(
+        _ seconds: TimeInterval
+    ) -> (hours: Int, minutes: Int, seconds: Int) {
         let total = max(0, Int(seconds))
-        return String(format: "%02d:%02d", total / 60, total % 60)
+        return (total / 3_600, (total / 60) % 60, total % 60)
+    }
+
+    private nonisolated static func unit(_ value: Int, _ name: String) -> String {
+        "\(value) \(name)\(value == 1 ? "" : "s")"
     }
 }
 
