@@ -21,7 +21,10 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         qos: .userInitiated
     )
     private let listenerQueue = DispatchQueue(label: "com.hushnote.system-audio-listener")
-    private let availableQueueSlots = DispatchSemaphore(value: 64)
+    /// Roughly a second of headroom at typical device buffer sizes, and the
+    /// number of pre-allocated copy slots the ring holds.
+    static let queueSlotCount = 64
+    private let availableQueueSlots = DispatchSemaphore(value: queueSlotCount)
     private let sampleHandler: SampleHandler
     private let noticeHandler: NoticeHandler?
     private let watchdog: CaptureStallWatchdog
@@ -32,6 +35,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
     private var aggregateDeviceID = kAudioObjectUnknown
     private var ioProcID: AudioDeviceIOProcID?
     private var audioFormat: AVAudioFormat?
+    private var bufferRing: CaptureBufferRing?
     private var formatListener: AudioObjectPropertyListenerBlock?
     private var listeningTapID = kAudioObjectUnknown
     private var running = false
@@ -132,6 +136,20 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             try Self.addTap(tapUID, to: aggregateDeviceID)
             try Self.waitUntilInputStreamIsReady(on: aggregateDeviceID)
 
+            // Allocated once, here, rather than once per callback inside the
+            // IOProc. Sized from the device's own buffer size with room to
+            // spare, and matched to the queue's slot count so a slot cannot be
+            // reused while its buffer is still in flight.
+            let slotFrames = max(2_048, Self.bufferFrameSize(of: aggregateDeviceID) * 2)
+            guard let ring = CaptureBufferRing(
+                format: format,
+                capacityFrames: slotFrames,
+                slotCount: Self.queueSlotCount
+            ) else {
+                throw AudioPipelineError.unsupportedAudioFormat
+            }
+            bufferRing = ring
+
             var createdIOProc: AudioDeviceIOProcID?
             let handler = sampleHandler
             let processingQueue = processingQueue
@@ -152,7 +170,10 @@ final class SystemAudioTapCapture: @unchecked Sendable {
                         drops.noteBackpressureDrop(frames: offeredFrames)
                         return
                     }
-                    guard let buffer = Self.ownedCopy(of: inputData, format: format) else {
+                    guard let buffer = ring.copy(
+                        from: inputData,
+                        frames: AVAudioFrameCount(offeredFrames)
+                    ) else {
                         availableQueueSlots.signal()
                         drops.noteCopyFailure(frames: offeredFrames)
                         return
@@ -216,6 +237,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             tapID = kAudioObjectUnknown
         }
         audioFormat = nil
+        bufferRing = nil
     }
 
     func pause() throws {
@@ -387,37 +409,25 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         return Int64(first.mDataByteSize) / bytesPerFrame
     }
 
-    private static func ownedCopy(
-        of inputData: UnsafePointer<AudioBufferList>,
-        format: AVAudioFormat
-    ) -> AVAudioPCMBuffer? {
-        guard let borrowed = AVAudioPCMBuffer(
-            pcmFormat: format,
-            bufferListNoCopy: inputData,
-            deallocator: nil
-        ),
-        let owned = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: borrowed.frameLength)
-        else { return nil }
-        owned.frameLength = borrowed.frameLength
-
-        let source = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
-        let destination = UnsafeMutableAudioBufferListPointer(owned.mutableAudioBufferList)
-        guard source.count == destination.count else { return nil }
-        for index in 0..<source.count {
-            guard let sourceData = source[index].mData,
-                  let destinationData = destination[index].mData
-            else { continue }
-            let byteCount = min(Int(source[index].mDataByteSize), Int(destination[index].mDataByteSize))
-            memcpy(destinationData, sourceData, byteCount)
-            destination[index].mDataByteSize = UInt32(byteCount)
-        }
-        return owned
-    }
-
     /// Aggregate-device composition happens asynchronously inside the HAL.
     /// Creating the device and setting its tap list can both succeed before an
     /// input stream is published. Starting an IOProc in that window produces
     /// the intermittent `'nope'` (1852797029) error.
+    /// The device's own IO buffer size, which is what the IOProc will deliver.
+    private static func bufferFrameSize(of deviceID: AudioObjectID) -> AVAudioFrameCount {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr,
+              value > 0
+        else { return 4_096 }
+        return AVAudioFrameCount(value)
+    }
+
     private static func waitUntilInputStreamIsReady(on deviceID: AudioObjectID) throws {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,
@@ -463,7 +473,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
 
     /// The format read at start is used to wrap every buffer for the rest of the
     /// session, so any change to it invalidates the whole capture path: a
-    /// different channel count makes `ownedCopy` return nil forever, and a
+    /// different channel count makes every buffer copy fail forever, and a
     /// different rate writes the remainder of the meeting pitch-shifted and
     /// time-stretched. There is no safe partial adaptation mid-take.
     static func isFatalFormatChange(from previous: AVAudioFormat, to updated: AVAudioFormat) -> Bool {
