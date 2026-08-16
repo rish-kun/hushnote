@@ -207,6 +207,58 @@ struct LevelMeter: View {
     }
 }
 
+/// Reads `systemLevel` — written once per Core Audio buffer, tens of times a
+/// second — inside a leaf so the observation dependency never reaches a parent
+/// body that also renders the live transcript.
+struct SystemLevelMeter: View {
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        LevelMeter(level: state.systemLevel, label: "System", tint: HushnoteTheme.vermilion)
+    }
+}
+
+/// Reads `elapsed`, which ticks every second, in isolation for the same reason.
+struct ElapsedTimeLabel: View {
+    var font: Font = .callout.monospacedDigit().weight(.medium)
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        Text(TimestampButton.format(state.elapsed))
+            .font(font)
+            .contentTransition(.numericText())
+            .accessibilityLabel("Elapsed time \(TimestampButton.format(state.elapsed))")
+    }
+}
+
+/// The post-Stop pipeline, shown above the meeting it is finalizing. Isolated
+/// from its host so per-stage progress does not invalidate the workspace.
+struct FinalizationBanner: View {
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView().controlSize(.small)
+            Text(state.finalizationLabel)
+                .font(.callout.weight(.medium))
+            Spacer()
+            if case .finalizing(let progress) = state.recordingPhase {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .frame(width: 132)
+                    .tint(HushnoteTheme.vermilion)
+            }
+        }
+        .padding(.horizontal, 30)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Finalizing this meeting. \(state.finalizationLabel)")
+    }
+}
+
 struct EmptyMeetingIllustration: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {

@@ -1,11 +1,53 @@
 import SwiftUI
 
+/// Which face of a meeting workspace belongs on screen.
+///
+/// The window has to follow the recording rather than the database: a meeting
+/// being captured owns the live controls, the level meter and the
+/// "live transcription is unavailable" notice, none of which exist anywhere
+/// else in the app.
+enum MeetingWorkspaceRoute: Equatable {
+    case active
+    case finalizing
+    case completed
+
+    /// - Parameter activeMeetingID: the meeting currently being captured, if any.
+    ///   A different meeting's recording must never take over this window; its
+    ///   Stop button would end a session the user is not looking at.
+    nonisolated static func route(
+        phase: RecordingPhase,
+        activeMeetingID: UUID?,
+        meetingID: UUID
+    ) -> MeetingWorkspaceRoute {
+        guard activeMeetingID == meetingID else { return .completed }
+        switch phase {
+        case .preparing, .recording, .paused: return .active
+        case .finalizing: return .finalizing
+        case .idle, .failed: return .completed
+        }
+    }
+}
+
 struct MeetingWorkspaceView: View {
     let meetingID: UUID
     @Environment(AppViewState.self) private var state
 
     var body: some View {
-        CompletedMeetingView(meetingID: meetingID)
+        switch MeetingWorkspaceRoute.route(
+            phase: state.recordingPhase,
+            activeMeetingID: state.activeMeetingID,
+            meetingID: meetingID
+        ) {
+        case .active:
+            ActiveMeetingView(meetingID: meetingID)
+        case .finalizing:
+            VStack(spacing: 0) {
+                FinalizationBanner()
+                CompletedMeetingView(meetingID: meetingID)
+            }
+        case .completed:
+            CompletedMeetingView(meetingID: meetingID)
+        }
     }
 }
 
@@ -23,12 +65,12 @@ struct ActiveMeetingView: View {
                         .font(.system(size: 21, weight: .semibold, design: .serif))
                     Text(state.recordingPhase == .paused ? "Capture paused" : "Recording locally")
                         .font(.caption)
-                        .foregroundStyle(state.recordingPhase == .paused ? .secondary : HushnoteTheme.vermilion)
+                        .foregroundStyle(state.recordingPhase == .paused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilion))
                 }
                 Spacer()
-                Text(TimestampButton.format(state.elapsed))
-                    .font(.title3.monospacedDigit().weight(.medium))
-                    .accessibilityLabel("Elapsed time \(TimestampButton.format(state.elapsed))")
+                // A leaf view: `elapsed` ticks every second and must not
+                // invalidate the live transcript below.
+                ElapsedTimeLabel(font: .title3.monospacedDigit().weight(.medium))
                 Button(state.recordingPhase == .paused ? "Resume" : "Pause") {
                     Task { await coordinator.togglePause() }
                 }
@@ -45,7 +87,10 @@ struct ActiveMeetingView: View {
             .background(.bar)
 
             HStack {
-                LevelMeter(level: state.systemLevel, label: "System", tint: HushnoteTheme.vermilion)
+                // Also a leaf view. `systemLevel` is written once per Core Audio
+                // buffer — reading it here would re-render the whole transcript
+                // tens of times a second.
+                SystemLevelMeter()
                 Spacer()
                 Label("Live text is provisional", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
@@ -245,48 +290,6 @@ struct CompletedMeetingView: View {
         }
     }
 
-    private func insightSection(title: String, empty: String, content: [String]) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(title)
-                        .font(.system(size: 24, weight: .semibold, design: .serif))
-                    Spacer()
-                    ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
-                    Button(state.insights.isGenerating ? "Generating…" : (content.isEmpty ? "Generate notes" : "Regenerate")) {
-                        Task { await coordinator.generateInsights(meetingID: meetingID) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.ink)
-                    .disabled(state.insights.isGenerating)
-                }
-
-                if let error = state.insights.error {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(HushnoteTheme.vermilion)
-                } else if content.isEmpty {
-                    Text(empty)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 30)
-                } else {
-                    ForEach(Array(content.enumerated()), id: \.offset) { index, item in
-                        HStack(alignment: .top, spacing: 15) {
-                            Text(String(format: "%02d", index + 1))
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.tertiary)
-                                .padding(.top, 3)
-                            Text(item)
-                                .textSelection(.enabled)
-                                .lineSpacing(4)
-                        }
-                        if index < content.count - 1 { Divider().opacity(0.45) }
-                    }
-                }
-            }
-            .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
-            .padding(38)
-        }
-    }
 }
 
 struct MeetingNotesView: View {
