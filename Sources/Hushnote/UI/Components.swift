@@ -33,7 +33,7 @@ struct RecordingPill: View {
 
             Text(isPaused ? "Paused" : "Recording")
                 .font(.callout.weight(.semibold))
-                .foregroundStyle(isPaused ? .secondary : HushnoteTheme.vermilion)
+                .foregroundStyle(isPaused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilionInk))
 
             Text(TimestampButton.format(state.elapsed))
                 .font(.callout.monospacedDigit().weight(.medium))

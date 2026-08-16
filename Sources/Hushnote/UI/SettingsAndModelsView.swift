@@ -24,7 +24,7 @@ struct ModelManagerView: View {
                     HStack(alignment: .top, spacing: 22) {
                         Image(systemName: model.name.contains("large-v3") ? "waveform.circle.fill" : "waveform.circle")
                             .font(.system(size: 25))
-                            .foregroundStyle(model.name.contains("large-v3") ? HushnoteTheme.vermilion : .secondary)
+                            .foregroundStyle(model.name.contains("large-v3") ? HushnoteTheme.vermilionInk : .secondary)
                             .frame(width: 34)
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
@@ -104,7 +104,7 @@ struct SettingsView: View {
                     } else if state.selectedProvider == .chatGPT {
                         Button("Connect ChatGPT") { Task { await coordinator.connectChatGPT() } }
                             .buttonStyle(.borderedProminent)
-                            .tint(HushnoteTheme.ink)
+                            .tint(HushnoteTheme.inkFill)
                         Text("Uses Codex App Server’s managed login and Codex rate limits. It does not expose ChatGPT history.")
                             .font(.caption)
                             .foregroundStyle(.secondary)

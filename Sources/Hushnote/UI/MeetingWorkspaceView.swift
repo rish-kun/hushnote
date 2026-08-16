@@ -65,7 +65,7 @@ struct ActiveMeetingView: View {
                         .font(.system(size: 21, weight: .semibold, design: .serif))
                     Text(state.recordingPhase == .paused ? "Capture paused" : "Recording locally")
                         .font(.caption)
-                        .foregroundStyle(state.recordingPhase == .paused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilion))
+                        .foregroundStyle(state.recordingPhase == .paused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilionInk))
                 }
                 Spacer()
                 // A leaf view: `elapsed` ticks every second and must not
@@ -116,7 +116,7 @@ struct ActiveMeetingView: View {
                 VStack(spacing: 13) {
                     Image(systemName: "waveform")
                         .font(.system(size: 28, weight: .light))
-                        .foregroundStyle(HushnoteTheme.vermilion)
+                        .foregroundStyle(HushnoteTheme.vermilionInk)
                     Text("Listening for the conversation…")
                         .font(.system(size: 20, weight: .medium, design: .serif))
                     Text("The source tracks are already being written to disk.")
@@ -189,16 +189,21 @@ struct CompletedMeetingView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 24) {
                     ForEach(tabs, id: \.self) { tab in
+                        let isSelected = state.selectedWorkspaceTab == tab
                         Button(tab) { state.selectedWorkspaceTab = tab }
                             .buttonStyle(.plain)
-                            .font(.callout.weight(state.selectedWorkspaceTab == tab ? .semibold : .regular))
-                            .foregroundStyle(state.selectedWorkspaceTab == tab ? HushnoteTheme.ink : .secondary)
+                            .font(.callout.weight(isSelected ? .semibold : .regular))
+                            .foregroundStyle(isSelected ? AnyShapeStyle(HushnoteTheme.ink) : AnyShapeStyle(.secondary))
                             .padding(.vertical, 11)
                             .overlay(alignment: .bottom) {
-                                if state.selectedWorkspaceTab == tab {
+                                if isSelected {
                                     Rectangle().fill(HushnoteTheme.vermilion).frame(height: 2)
                                 }
                             }
+                            // Weight, colour and a 2pt underline are all
+                            // invisible to VoiceOver, which otherwise announces
+                            // four identical buttons.
+                            .accessibilityAddTraits(isSelected ? [.isSelected] : [])
                     }
                 }
                 .padding(.horizontal, 38)
@@ -244,13 +249,13 @@ struct CompletedMeetingView: View {
                         Task { await coordinator.generateInsights(meetingID: meetingID) }
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.ink)
+                    .tint(HushnoteTheme.inkFill)
                     .disabled(state.insights.isGenerating || state.transcript.isEmpty)
                 }
 
                 if let error = state.insights.error {
                     Label(error, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(HushnoteTheme.vermilion)
+                        .foregroundStyle(HushnoteTheme.vermilionInk)
                 } else if state.insights.summary.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Summary will appear here")
@@ -430,7 +435,7 @@ struct AskMeetingView: View {
                     .onSubmit { Task { await coordinator.answerQuestion() } }
                 Button("Ask") { Task { await coordinator.answerQuestion() } }
                     .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.ink)
+                    .tint(HushnoteTheme.inkFill)
                     .disabled(state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
@@ -440,7 +445,7 @@ struct AskMeetingView: View {
             if let error = state.insights.error {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .font(.callout)
-                    .foregroundStyle(HushnoteTheme.vermilion)
+                    .foregroundStyle(HushnoteTheme.vermilionInk)
             }
 
             if !state.insights.answer.isEmpty {

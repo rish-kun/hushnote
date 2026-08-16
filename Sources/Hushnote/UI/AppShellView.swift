@@ -82,7 +82,7 @@ struct AppShellView: View {
 
         return HStack(spacing: 12) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(HushnoteTheme.vermilion)
+                .foregroundStyle(HushnoteTheme.vermilionInk)
             Text(failure.message)
                 .font(.callout)
                 .lineLimit(3)
@@ -127,11 +127,11 @@ struct AppShellView: View {
         case .openModels:
             Button("Open Models") { state.selection = .models }
                 .buttonStyle(.borderedProminent)
-                .tint(HushnoteTheme.ink)
+                .tint(HushnoteTheme.inkFill)
         case .openSettings:
             Button("Open Settings") { state.selection = .settings }
                 .buttonStyle(.borderedProminent)
-                .tint(HushnoteTheme.ink)
+                .tint(HushnoteTheme.inkFill)
         }
     }
 
@@ -211,7 +211,7 @@ struct MeetingsHomeView: View {
                 Spacer()
                 Button("New Meeting Note") { Task { await coordinator.createMeetingNote() } }
                     .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.ink)
+                    .tint(HushnoteTheme.inkFill)
                     .disabled(state.recordingPhase.isBusy)
             }
             .padding(.horizontal, 38)
@@ -244,7 +244,7 @@ struct MeetingsHomeView: View {
                 if state.searchText.isEmpty {
                     Button("Create your first note") { Task { await coordinator.createMeetingNote() } }
                         .buttonStyle(.borderedProminent)
-                        .tint(HushnoteTheme.ink)
+                        .tint(HushnoteTheme.inkFill)
                         .disabled(state.recordingPhase.isBusy)
                 }
             }
@@ -277,7 +277,7 @@ struct MeetingsHomeView: View {
                                     if meeting.isRecoverable {
                                         Text("RECOVER")
                                             .font(.caption2.weight(.bold))
-                                            .foregroundStyle(HushnoteTheme.vermilion)
+                                            .foregroundStyle(HushnoteTheme.vermilionInk)
                                     }
                                 }
                                 Text(meeting.excerpt)
