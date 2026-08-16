@@ -117,6 +117,44 @@ enum InsightProviderChoice: String, CaseIterable, Identifiable {
     var isLocal: Bool { self == .local }
 }
 
+/// A failure the app has to own, because the person who caused it is not
+/// necessarily looking at the view that raised it.
+struct AppAlert: Equatable {
+    var title: String
+    var message: String
+}
+
+/// The operations that can fail in front of the user.
+enum FailureKind: Equatable {
+    case meetingLoad
+    case noteSave
+    case transcriptEditSave
+    case insightGeneration
+    case questionAnswering
+    case export
+}
+
+/// Where a failure has to appear to be seen at all.
+enum FailureRoute: Equatable {
+    /// The workspace that asked for it, where the result would have appeared.
+    case insightWorkspace
+    /// The app, surfaced once in `AppShellView`. Saving and exporting happen
+    /// behind the user's attention: a silent save failure leaves them typing
+    /// into an editor that no longer persists, and a silent export failure just
+    /// never produces a file.
+    case appAlert(title: String)
+
+    nonisolated static func route(for kind: FailureKind) -> FailureRoute {
+        switch kind {
+        case .meetingLoad: .appAlert(title: "This meeting could not be opened")
+        case .noteSave: .appAlert(title: "Your notes are not being saved")
+        case .transcriptEditSave: .appAlert(title: "Your transcript correction was not saved")
+        case .export: .appAlert(title: "The export did not finish")
+        case .insightGeneration, .questionAnswering: .insightWorkspace
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class AppViewState {
@@ -139,6 +177,23 @@ final class AppViewState {
     var meetingNotes: [UUID: String] = [:]
     var finalizationStage: FinalizationStage?
     var finalizationDetail: String?
+    var alert: AppAlert?
+
+    /// Sends a failure to the channel it belongs to. The two channels are
+    /// independent: a failed export must not replace a summary the user still
+    /// has, and a failed regenerate must not raise a modal.
+    func report(_ kind: FailureKind, _ message: String) {
+        switch FailureRoute.route(for: kind) {
+        case .insightWorkspace:
+            insights.error = message
+        case .appAlert(let title):
+            alert = AppAlert(title: title, message: message)
+        }
+    }
+
+    func dismissAlert() {
+        alert = nil
+    }
 
     var finalizationLabel: String {
         finalizationDetail ?? finalizationStage?.title ?? "Finalizing transcript…"

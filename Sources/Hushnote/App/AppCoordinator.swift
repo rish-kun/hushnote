@@ -398,7 +398,7 @@ final class AppCoordinator {
             guard state.activeMeetingID != id else { return }
             state.transcript = segments.map(Self.lineItem)
         } catch {
-            state.insights.error = error.localizedDescription
+            state.report(.meetingLoad, error.localizedDescription)
         }
     }
 
@@ -414,7 +414,7 @@ final class AppCoordinator {
             } catch is CancellationError {
                 return
             } catch {
-                self?.state.insights.error = "Notes could not be saved: \(error.localizedDescription)"
+                self?.state.report(.noteSave, error.localizedDescription)
             }
         }
     }
@@ -525,7 +525,7 @@ final class AppCoordinator {
             } catch is CancellationError {
                 return
             } catch {
-                self?.state.insights.error = "Transcript edit could not be saved: \(error.localizedDescription)"
+                self?.state.report(.transcriptEditSave, error.localizedDescription)
             }
         }
     }
@@ -616,7 +616,7 @@ final class AppCoordinator {
         do {
             try MeetingExporter.export(meeting: meeting, transcript: transcript, insights: state.insights, format: format)
         } catch {
-            state.insights.error = "Export failed: \(error.localizedDescription)"
+            state.report(.export, error.localizedDescription)
         }
     }
 

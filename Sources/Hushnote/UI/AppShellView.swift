@@ -60,6 +60,21 @@ struct AppShellView: View {
                 .disabled(state.recordingPhase.isBusy)
             }
         }
+        // The one place a saving or exporting failure is surfaced. These happen
+        // behind the user's attention, so they cannot be left on whichever tab
+        // raised them.
+        .alert(
+            state.alert?.title ?? "",
+            isPresented: Binding(
+                get: { state.alert != nil },
+                set: { if !$0 { state.dismissAlert() } }
+            ),
+            presenting: state.alert
+        ) { _ in
+            Button("OK", role: .cancel) { state.dismissAlert() }
+        } message: { alert in
+            Text(alert.message)
+        }
     }
 
     private func recordingErrorBanner(_ message: String) -> some View {

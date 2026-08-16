@@ -434,6 +434,15 @@ struct AskMeetingView: View {
                     .disabled(state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
 
+            // Answering writes to `insights.error`, which only the summary
+            // workspace used to render — so a question that failed looked
+            // exactly like one that was never asked.
+            if let error = state.insights.error {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(HushnoteTheme.vermilion)
+            }
+
             if !state.insights.answer.isEmpty {
                 VStack(alignment: .leading, spacing: 14) {
                     Text(state.insights.answer)
