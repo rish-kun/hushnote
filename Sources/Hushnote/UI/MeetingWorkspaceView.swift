@@ -363,11 +363,13 @@ struct TranscriptView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @FocusState private var focusedLine: UUID?
+    @State private var isFollowing = true
 
     var body: some View {
         @Bindable var state = state
 
-        ScrollView {
+        ScrollViewReader { proxy in
+            ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach($state.transcript) { $line in
                     HStack(alignment: .top, spacing: 15) {
@@ -410,12 +412,69 @@ struct TranscriptView: View {
             .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
             .padding(.horizontal, 38)
             .padding(.vertical, 20)
+            }
+            // A live transcript is a live region: VoiceOver should not treat a
+            // new line as a layout change to re-announce from the top.
+            .accessibilityAddTraits(.updatesFrequently)
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                TranscriptFollow.isFollowing(
+                    contentOffsetY: geometry.contentOffset.y,
+                    containerHeight: geometry.containerSize.height,
+                    contentHeight: geometry.contentSize.height
+                )
+            } action: { _, following in
+                isFollowing = following
+            }
+            .onChange(of: state.transcript.last?.id) { _, last in
+                guard isFollowing, let last else { return }
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(last, anchor: .bottom)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                // Only offered once the user has actually left the bottom, so
+                // it never competes with the transcript it would scroll.
+                if !isFollowing, let last = state.transcript.last?.id {
+                    Button {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(last, anchor: .bottom)
+                        }
+                        isFollowing = true
+                    } label: {
+                        Label("Jump to latest", systemImage: "arrow.down")
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(.regularMaterial, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(20)
+                }
+            }
         }
         .overlay {
             if state.transcript.isEmpty {
                 ContentUnavailableView("No transcript", systemImage: "text.quote", description: Text("The final transcript has not been produced yet."))
             }
         }
+    }
+}
+
+/// Whether the transcript is still following the newest line.
+///
+/// Auto-scrolling unconditionally fights anyone who has scrolled up to read, so
+/// following is a state the user can leave by scrolling and return to
+/// deliberately.
+enum TranscriptFollow {
+    /// - Parameter tolerance: slack so a partly-scrolled line, or a bounce past
+    ///   the end, does not read as the user taking over.
+    nonisolated static func isFollowing(
+        contentOffsetY: Double,
+        containerHeight: Double,
+        contentHeight: Double,
+        tolerance: Double = 24
+    ) -> Bool {
+        contentOffsetY + containerHeight >= contentHeight - tolerance
     }
 }
 
