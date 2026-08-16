@@ -155,6 +155,9 @@ final class CaptureOutputBridge: @unchecked Sendable {
     }
 
     static func level(for samples: [Float], source: AudioSource) -> AudioLevel {
+        // Without this the empty case divides by zero and reports NaN, which
+        // poisons every meter arithmetic downstream of it.
+        guard !samples.isEmpty else { return AudioLevel(source: source, rms: 0, peak: 0) }
         var peak: Float = 0
         var energy: Double = 0
         for sample in samples {
@@ -162,7 +165,9 @@ final class CaptureOutputBridge: @unchecked Sendable {
             energy += Double(sample * sample)
         }
         let rms = Float(sqrt(energy / Double(samples.count)))
-        return AudioLevel(source: source, rms: rms, peak: peak)
+        // A rate converter's ringing can overshoot full scale. A meter reports
+        // full scale, never more.
+        return AudioLevel(source: source, rms: min(1, rms), peak: min(1, peak))
     }
 
 }

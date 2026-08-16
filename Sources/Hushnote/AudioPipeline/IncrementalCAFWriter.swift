@@ -1,5 +1,4 @@
 import AVFoundation
-import CoreMedia
 import Foundation
 
 /// AVAudioConverter invokes its input block synchronously and serially for one
@@ -68,37 +67,6 @@ final class IncrementalCAFWriter {
         }
     }
 
-    func append(_ sampleBuffer: CMSampleBuffer) throws -> AVAudioPCMBuffer {
-        guard CMSampleBufferDataIsReady(sampleBuffer),
-              let description = CMSampleBufferGetFormatDescription(sampleBuffer)
-        else {
-            throw AudioPipelineError.invalidAudioBuffer
-        }
-        let format = AVAudioFormat(cmAudioFormatDescription: description)
-
-        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frameCount > 0,
-              let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)
-        else {
-            throw AudioPipelineError.unsupportedAudioFormat
-        }
-        pcmBuffer.frameLength = frameCount
-
-        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
-            sampleBuffer,
-            at: 0,
-            frameCount: Int32(frameCount),
-            into: pcmBuffer.mutableAudioBufferList
-        )
-        guard status == noErr else {
-            throw AudioPipelineError.writerFailed("CoreMedia error \(status)")
-        }
-
-        return try append(pcmBuffer)
-    }
-
-    /// Internal PCM entry point keeps normalization independently testable
-    /// without manufacturing ScreenCaptureKit sample buffers.
     func append(_ pcmBuffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
         do {
             let recoveryBuffer = try recoveryPCMBuffer(from: pcmBuffer)
@@ -201,6 +169,12 @@ final class IncrementalCAFWriter {
 }
 
 extension AVAudioPCMBuffer {
+    /// Full scale is 32768, not 32767. Dividing by `Int16.max` maps full
+    /// negative scale to -1.000031, outside the range every later stage — the
+    /// meter, the resampler, the model feed — assumes.
+    fileprivate static let int16Scale = Float(1) / 32_768
+    fileprivate static let int32Scale = Float(1) / 2_147_483_648
+
     func monoFloatSamples() -> [Float] {
         guard frameLength > 0 else { return [] }
         let frames = Int(frameLength)
@@ -234,14 +208,14 @@ extension AVAudioPCMBuffer {
                 let values = data[0]
                 for frame in 0..<frames {
                     for channel in 0..<channels {
-                        output[frame] += Float(values[frame * channels + channel]) / Float(Int16.max)
+                        output[frame] += Float(values[frame * channels + channel]) * Self.int16Scale
                     }
                 }
             } else {
                 for channel in 0..<channels {
                     let values = data[channel]
                     for frame in 0..<frames {
-                        output[frame] += Float(values[frame]) / Float(Int16.max)
+                        output[frame] += Float(values[frame]) * Self.int16Scale
                     }
                 }
             }
@@ -255,14 +229,14 @@ extension AVAudioPCMBuffer {
                 let values = data[0]
                 for frame in 0..<frames {
                     for channel in 0..<channels {
-                        output[frame] += Float(values[frame * channels + channel]) / Float(Int32.max)
+                        output[frame] += Float(values[frame * channels + channel]) * Self.int32Scale
                     }
                 }
             } else {
                 for channel in 0..<channels {
                     let values = data[channel]
                     for frame in 0..<frames {
-                        output[frame] += Float(values[frame]) / Float(Int32.max)
+                        output[frame] += Float(values[frame]) * Self.int32Scale
                     }
                 }
             }
