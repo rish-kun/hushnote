@@ -1,5 +1,98 @@
 import SwiftUI
 
+/// Where a speech model stands right now.
+///
+/// `ready` means the model has been loaded successfully in this session. There
+/// is no API on the speech engine for asking what is already on disk, so the
+/// screen does not claim to know.
+enum ModelAvailability: Equatable, Sendable {
+    case notInstalled
+    case downloading
+    case ready
+    case failed(String)
+}
+
+struct ModelRow: Identifiable {
+    var model: SpeechModel
+    var availability: ModelAvailability
+    var role: String?
+
+    var id: String { model.id }
+}
+
+/// Resolves the names the app carries around -- draft selections and display
+/// names -- to catalog models.
+///
+/// The old rule was a chain of lowercased `contains` that fell through to Large
+/// v3 for anything it did not recognise, so asking for Tiny downloaded a
+/// three-gigabyte model.
+enum SpeechModelResolver {
+    nonisolated static func model(named name: String) -> SpeechModel {
+        let value = name.lowercased()
+        if let exact = SpeechModelCatalog.all.first(where: {
+            $0.displayName.lowercased() == value || $0.id.lowercased() == value
+        }) {
+            return exact
+        }
+        return switch value {
+        case let v where v.contains("turbo"): SpeechModelCatalog.whisperLargeV3Turbo
+        case let v where v.contains("large-v3"): SpeechModelCatalog.whisperLargeV3
+        case let v where v.contains("medium"): SpeechModelCatalog.whisperMedium
+        case let v where v.contains("small"): SpeechModelCatalog.whisperSmall
+        case let v where v.contains("base"): SpeechModelCatalog.whisperBase
+        case let v where v.contains("tiny"): SpeechModelCatalog.whisperTiny
+        default: SpeechModelCatalog.whisperLargeV3
+        }
+    }
+}
+
+enum ModelListPolicy {
+    nonisolated static func rows(
+        availability: [String: ModelAvailability],
+        draft: MeetingDraft
+    ) -> [ModelRow] {
+        let live = SpeechModelResolver.model(named: draft.liveModel).id
+        let final = SpeechModelResolver.model(named: draft.finalModel).id
+        return SpeechModelCatalog.all.map { model in
+            ModelRow(
+                model: model,
+                availability: availability[model.id] ?? .notInstalled,
+                role: model.id == live ? "Live default" : (model.id == final ? "Final default" : nil)
+            )
+        }
+    }
+
+    /// A download loads a multi-gigabyte Core ML model onto the same Neural
+    /// Engine the live transcriber and the final pass are using, so it waits
+    /// until the machine is not in the middle of a meeting.
+    nonisolated static func canDownload(
+        availability: ModelAvailability,
+        phase: RecordingPhase
+    ) -> Bool {
+        guard !phase.isBusy else { return false }
+        switch availability {
+        case .notInstalled, .failed: return true
+        case .downloading, .ready: return false
+        }
+    }
+
+    nonisolated static func downloadLabel(_ availability: ModelAvailability) -> String {
+        switch availability {
+        case .notInstalled: "Download"
+        case .downloading: "Downloading…"
+        case .ready: "Ready"
+        case .failed: "Retry"
+        }
+    }
+
+    nonisolated static func sizeText(_ model: SpeechModel) -> String {
+        let gigabytes = Double(model.approximateDownloadBytes) / 1_000_000_000
+        return gigabytes >= 1
+            ? String(format: "~%.1f GB", gigabytes)
+            : "~\(model.approximateDownloadBytes / 1_000_000) MB"
+    }
+}
+
 /// What the app knows about a provider credential, and what it may claim.
 enum CredentialFieldState: Equatable {
     /// The Keychain has not been asked yet.
@@ -92,17 +185,17 @@ struct APIKeyField: View {
 }
 
 struct ModelManagerView: View {
+    @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
-    private let models: [(name: String, role: String, size: String, note: String)] = [
-        ("Whisper small", "Reduced resource", "~466 MB", "Fast multilingual transcription for quick checks."),
-        ("Whisper medium", "Balanced", "~1.5 GB", "A practical middle ground for older Apple Silicon."),
-        ("Whisper large-v3-turbo", "Live default", "~1.6 GB", "High-quality provisional text with lower decoder latency."),
-        ("Whisper large-v3", "Final default", "~3 GB", "The accuracy-first post-meeting pass.")
-    ]
-
     var body: some View {
-        ScrollView {
+        let rows = ModelListPolicy.rows(
+            availability: coordinator.modelAvailability,
+            draft: state.draft
+        )
+        let isBusy = state.recordingPhase.isBusy
+
+        return ScrollView {
             VStack(alignment: .leading, spacing: 30) {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("Speech models")
@@ -111,31 +204,17 @@ struct ModelManagerView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                ForEach(models, id: \.name) { model in
-                    HStack(alignment: .top, spacing: 22) {
-                        Image(systemName: model.name.contains("large-v3") ? "waveform.circle.fill" : "waveform.circle")
-                            .font(.system(size: 25))
-                            .foregroundStyle(model.name.contains("large-v3") ? HushnoteTheme.vermilionInk : .secondary)
-                            .frame(width: 34)
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text(model.name).font(.headline)
-                                Text(model.role.uppercased())
-                                    .font(.caption2.weight(.bold))
-                                    .tracking(0.8)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(model.note)
-                                .foregroundStyle(.secondary)
-                            Text(model.size)
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                        Button("Download") { Task { await coordinator.downloadModel(model.name) } }
-                            .buttonStyle(.bordered)
-                    }
-                    .padding(.vertical, 6)
+                if isBusy {
+                    Label(
+                        "Downloads pause while a meeting is being captured or finalized. They use the same Neural Engine as the transcriber.",
+                        systemImage: "pause.circle"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                }
+
+                ForEach(rows) { row in
+                    modelRow(row, isBusy: isBusy)
                     Divider().opacity(0.5)
                 }
 
@@ -151,6 +230,61 @@ struct ModelManagerView: View {
             .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
             .padding(38)
         }
+    }
+
+    @ViewBuilder
+    private func modelRow(_ row: ModelRow, isBusy: Bool) -> some View {
+        let isDefault = row.role != nil
+
+        HStack(alignment: .top, spacing: 22) {
+            Image(systemName: isDefault ? "waveform.circle.fill" : "waveform.circle")
+                .font(.system(size: 25))
+                .foregroundStyle(isDefault ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(.secondary))
+                .frame(width: 34)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(row.model.displayName).font(.headline)
+                    if let role = row.role {
+                        Text(role.uppercased())
+                            .font(.caption2.weight(.bold))
+                            .tracking(0.8)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(row.model.tier.rawValue.capitalized + (row.model.isMultilingual ? " · multilingual" : ""))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Text(ModelListPolicy.sizeText(row.model))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                    if case .failed(let reason) = row.availability {
+                        Text(reason)
+                            .font(.caption)
+                            .foregroundStyle(HushnoteTheme.vermilionInk)
+                            .lineLimit(2)
+                    }
+                }
+            }
+            Spacer()
+            HStack(spacing: 8) {
+                if row.availability == .downloading {
+                    ProgressView().controlSize(.small)
+                }
+                Button(ModelListPolicy.downloadLabel(row.availability)) {
+                    Task { await coordinator.downloadModel(row.model) }
+                }
+                .buttonStyle(.bordered)
+                .disabled(!ModelListPolicy.canDownload(
+                    availability: row.availability,
+                    phase: state.recordingPhase
+                ))
+            }
+        }
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(row.model.displayName), \(ModelListPolicy.downloadLabel(row.availability))"
+        )
     }
 }
 

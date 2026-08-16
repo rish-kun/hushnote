@@ -253,10 +253,15 @@ struct CompletedMeetingView: View {
                     .disabled(state.insights.isGenerating || state.transcript.isEmpty)
                 }
 
+                // The error sits beside the summary rather than replacing it: a
+                // regenerate that failed must not take away the summary the
+                // user already had.
                 if let error = state.insights.error {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(HushnoteTheme.vermilionInk)
-                } else if state.insights.summary.isEmpty {
+                }
+
+                if state.insights.summary.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Summary will appear here")
                             .font(.headline)
@@ -433,10 +438,18 @@ struct AskMeetingView: View {
                     .background(Color(nsColor: .textBackgroundColor).opacity(0.7))
                     .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.secondary.opacity(0.25)))
                     .onSubmit { Task { await coordinator.answerQuestion() } }
-                Button("Ask") { Task { await coordinator.answerQuestion() } }
-                    .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.inkFill)
-                    .disabled(state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button(state.insights.isGenerating ? "Asking…" : "Ask") {
+                    Task { await coordinator.answerQuestion() }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.inkFill)
+                .disabled(
+                    state.insights.isGenerating
+                        || state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
+                if state.insights.isGenerating {
+                    ProgressView().controlSize(.small)
+                }
             }
 
             // Answering writes to `insights.error`, which only the summary

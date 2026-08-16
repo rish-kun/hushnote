@@ -598,6 +598,10 @@ final class AppCoordinator {
     func answerQuestion() async {
         guard let meetingID = selectedMeetingID else { return }
         state.insights.error = nil
+        // Without this the Ask button produced no visual change at all for the
+        // length of an LLM round trip.
+        state.insights.isGenerating = true
+        defer { state.insights.isGenerating = false }
         do {
             let segments = try await transcriptSegments(for: meetingID)
             let provider = try await selectedInsightProvider()
@@ -612,20 +616,23 @@ final class AppCoordinator {
         }
     }
 
-    func downloadModel(_ displayName: String) async {
-        let model: SpeechModel
-        let lower = displayName.lowercased()
-        if lower.contains("small") { model = SpeechModelCatalog.whisperSmall }
-        else if lower.contains("medium") { model = SpeechModelCatalog.whisperMedium }
-        else if lower.contains("turbo") { model = SpeechModelCatalog.whisperLargeV3Turbo }
-        else { model = SpeechModelCatalog.whisperLargeV3 }
+    /// What the models screen knows about each model, keyed by model id.
+    private(set) var modelAvailability: [String: ModelAvailability] = [:]
 
+    func downloadModel(_ model: SpeechModel) async {
+        guard ModelListPolicy.canDownload(
+            availability: modelAvailability[model.id] ?? .notInstalled,
+            phase: state.recordingPhase
+        ) else { return }
+        modelAvailability[model.id] = .downloading
         do {
             let engine = speechEngine ?? WhisperKitTranscriptionEngine()
             try await engine.load(model: model)
             speechEngine = engine
             loadedModel = model
+            modelAvailability[model.id] = .ready
         } catch {
+            modelAvailability[model.id] = .failed(error.localizedDescription)
             state.markFailed(.init(kind: .modelDownload, message: "Model download failed: \(error.localizedDescription)"))
         }
     }
@@ -813,16 +820,7 @@ final class AppCoordinator {
     }
 
     private func speechModel(named name: String) -> SpeechModel {
-        switch name.lowercased() {
-        case let value where value.contains("small"):
-            SpeechModelCatalog.whisperSmall
-        case let value where value.contains("medium"):
-            SpeechModelCatalog.whisperMedium
-        case let value where value.contains("turbo"):
-            SpeechModelCatalog.whisperLargeV3Turbo
-        default:
-            SpeechModelCatalog.whisperLargeV3
-        }
+        SpeechModelResolver.model(named: name)
     }
 
     private func updateListItem(_ meeting: Meeting, excerpt: String) {
