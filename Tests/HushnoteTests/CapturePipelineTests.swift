@@ -24,6 +24,9 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
     var stopCost: TimeInterval = 0
     var startError: Error?
     var resumeError: Error?
+    /// Audio the device delivers from inside `resume()`, before the call
+    /// returns.
+    var emitDuringResumeMilliseconds = 0
 
     var calls: [Call] { lock.withLock { _calls } }
     var isRunning: Bool { lock.withLock { _isRunning } }
@@ -70,6 +73,11 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
         lock.withLock { _calls.append(.resume) }
         if let resumeError { throw resumeError }
         lock.withLock { _isRunning = true }
+        // The device begins delivering the instant it is started, which is
+        // before `resume()` returns to its caller.
+        if emitDuringResumeMilliseconds > 0 {
+            emit(milliseconds: emitDuringResumeMilliseconds, startingAt: 2_000)
+        }
     }
 
     /// Emits capture-sized 48 kHz buffers the way the HAL's IOProc would.
@@ -78,7 +86,8 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
     func emit(
         milliseconds: Int,
         startingAt presentationSeconds: Double = 1_000,
-        amplitude: Float = 0.25
+        amplitude: Float = 0.25,
+        evenIfStopped: Bool = false
     ) -> Int {
         let frameRate = 48_000.0
         let framesPerBuffer = 1_024
@@ -89,7 +98,7 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
             let count = min(framesPerBuffer, totalFrames - frame)
             let buffer = Self.buffer(frames: count, amplitude: amplitude)
             let handler = lock.withLock { self.handler }
-            guard let handler, isRunning else { break }
+            guard let handler, isRunning || evenIfStopped else { break }
             handler(buffer, presentationSeconds + Double(frame) / frameRate)
             emitted += count
             frame += count
@@ -129,6 +138,72 @@ final class EventCollector: @unchecked Sendable {
                 return nil
             }
         }
+    }
+}
+
+/// `pause()` stops accepting samples before stopping the device. `resume()` did
+/// the mirror image of the wrong thing: it started the device first, so
+/// anything the HAL delivered before `output.resume()` ran was discarded, and
+/// `accumulatedPause` never accounted for it either.
+@Suite("Pause and resume")
+struct CaptureResumeTests {
+    @Test("Audio delivered while resuming is kept")
+    func resumeKeepsTheFirstBuffers() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fake = FakeSystemAudioCapture()
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
+            return fake
+        }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fake.emit(milliseconds: 500)
+        try await pipeline.pause()
+        // The device delivers 200 ms from inside its own start call, before
+        // `resume()` returns.
+        fake.emitDuringResumeMilliseconds = 200
+        try await pipeline.resume()
+        fake.emit(milliseconds: 300, startingAt: 2_001)
+        let artifacts = try await pipeline.stop()
+
+        #expect(
+            abs(artifacts.durationMilliseconds - 1_000) <= 5,
+            "stored \(artifacts.durationMilliseconds) ms; 200 ms of it arrived during the resume"
+        )
+    }
+
+    @Test("A device that refuses to restart leaves the meeting paused")
+    func failedResumeRollsBack() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fake = FakeSystemAudioCapture()
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
+            return fake
+        }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fake.emit(milliseconds: 500)
+        try await pipeline.pause()
+        fake.resumeError = AudioPipelineError.audioCaptureFailed
+
+        await #expect(throws: AudioPipelineError.audioCaptureFailed) {
+            try await pipeline.resume()
+        }
+
+        #expect(await pipeline.status == .paused, "a refused restart is still a pause")
+        // A straggler from a device that never restarted must not land in a
+        // meeting the user believes is paused.
+        fake.emit(milliseconds: 300, startingAt: 2_000, evenIfStopped: true)
+        let artifacts = try await pipeline.stop()
+
+        #expect(
+            abs(artifacts.durationMilliseconds - 500) <= 5,
+            "stored \(artifacts.durationMilliseconds) ms; only the first 500 ms was recorded"
+        )
     }
 }
 

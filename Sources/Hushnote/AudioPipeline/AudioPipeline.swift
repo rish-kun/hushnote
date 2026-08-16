@@ -143,8 +143,19 @@ public actor AudioPipeline {
         guard currentStatus == .paused, let output, let capture else {
             throw AudioPipelineError.notRunning
         }
-        try capture.resume()
+        // Accept samples before starting the device, mirroring `pause()`, which
+        // stops accepting before it stops the device. The other order discards
+        // whatever the HAL delivers between the two calls — and the device
+        // starts delivering before `resume()` even returns.
         output.resume()
+        do {
+            try capture.resume()
+        } catch {
+            // The device never restarted, so nothing may be accepted into a
+            // meeting the user still sees as paused.
+            output.pause()
+            throw error
+        }
         updateStatus(.recording)
     }
 
