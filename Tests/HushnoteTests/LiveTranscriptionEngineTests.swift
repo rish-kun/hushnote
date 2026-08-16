@@ -199,6 +199,58 @@ struct LiveTranscriptionEngineTests {
         #expect(!overlaps)
     }
 
+    @Test("push enqueues audio instead of waiting for the decoder")
+    func pushReturnsBeforeTheDecodeCompletes() async throws {
+        let meetingID = UUID()
+        let decoder = GatedDecoder()
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
+        var deltas = stream.makeAsyncIterator()
+
+        try await engine.push(frame(meetingID: meetingID, sequence: 1, startMilliseconds: 0))
+        await decoder.waitForStart(count: 1)
+        let completedWhenPushReturned = await decoder.completedCalls
+        // A second chunk must be accepted while the first decode is still
+        // running. The capture stream buffers only the newest 256 chunks, so a
+        // blocking push silently discards audio that is already on disk.
+        try await engine.push(frame(meetingID: meetingID, sequence: 2, startMilliseconds: 1_000))
+        await decoder.open()
+        _ = try await deltas.next()
+
+        #expect(completedWhenPushReturned == 0)
+    }
+
+    @Test("cancel stops the in-flight decode and cannot be resurrected")
+    func cancelStopsTheInFlightDecode() async throws {
+        let meetingID = UUID()
+        let decoder = GatedDecoder()
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
+
+        try await engine.push(frame(meetingID: meetingID, sequence: 1, startMilliseconds: 0))
+        await decoder.waitForStart(count: 1)
+        await engine.cancel()
+        await decoder.waitForCancellation(count: 1)
+
+        #expect(await decoder.cancelledCalls == 1)
+        // The stream is closed and no delta from the dead session may arrive.
+        var received = 0
+        for try await _ in stream { received += 1 }
+        #expect(received == 0)
+
+        // A cancelled session must not accept audio, and the next session must
+        // start from a clean buffer rather than inheriting the dead one.
+        await #expect(throws: SpeechPipelineError.sessionNotRunning) {
+            try await engine.push(frame(meetingID: meetingID, sequence: 2, startMilliseconds: 1_000))
+        }
+        await decoder.open()
+        let next = try await engine.start(configuration: configuration(meetingID: meetingID))
+        var deltas = next.makeAsyncIterator()
+        try await engine.push(frame(meetingID: meetingID, sequence: 1, startMilliseconds: 0))
+        let delta = try #require(await deltas.next())
+        #expect(delta.revision == 1)
+    }
+
     @Test("Identifiers are scoped to the meeting that produced them")
     func identifiersDoNotCollideAcrossMeetings() async throws {
         let first = UUID()
@@ -314,6 +366,60 @@ private actor WindowMirroringDecoder: LiveSpeechDecoder {
             )
         }
         return [result(segments: segments)]
+    }
+}
+
+/// Holds every decode open until the test releases it, so the engine's
+/// concurrency can be observed. The wait is bounded and cancellable: a broken
+/// engine makes the test fail slowly rather than hang.
+private actor GatedDecoder: LiveSpeechDecoder {
+    private var isOpen = false
+    private(set) var startedCalls = 0
+    private(set) var completedCalls = 0
+    private(set) var cancelledCalls = 0
+    private(set) var activeCalls = 0
+    private(set) var peakConcurrentCalls = 0
+
+    func open() {
+        isOpen = true
+    }
+
+    func waitForStart(count: Int) async {
+        await poll { self.startedCalls >= count }
+    }
+
+    func waitForCancellation(count: Int) async {
+        await poll { self.cancelledCalls >= count }
+    }
+
+    func decodeWindow(
+        samples: [Float],
+        options: DecodingOptions
+    ) async throws -> [TranscriptionResult] {
+        startedCalls += 1
+        activeCalls += 1
+        peakConcurrentCalls = max(peakConcurrentCalls, activeCalls)
+        defer { activeCalls -= 1 }
+        var waited = Duration.zero
+        while !isOpen, waited < .seconds(5) {
+            do {
+                try await Task.sleep(for: .milliseconds(2))
+            } catch {
+                cancelledCalls += 1
+                throw CancellationError()
+            }
+            waited += .milliseconds(2)
+        }
+        completedCalls += 1
+        return [result(segments: [whisperSegment(start: 0, end: 1, text: "gated")])]
+    }
+
+    private func poll(_ condition: () -> Bool) async {
+        var waited = Duration.zero
+        while !condition(), waited < .seconds(5) {
+            try? await Task.sleep(for: .milliseconds(2))
+            waited += .milliseconds(2)
+        }
     }
 }
 

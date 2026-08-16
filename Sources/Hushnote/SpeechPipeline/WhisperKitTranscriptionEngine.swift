@@ -53,6 +53,13 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     private var configuration: TranscriptionSessionConfiguration?
     private var buffers: [AudioSource: SourceBuffer] = [:]
     private var continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
+    /// Decoding runs in tasks the engine owns, so it can be cancelled and waited
+    /// on. One per source, because sources decode independently.
+    private var decodeTasks: [AudioSource: Task<Void, Never>] = [:]
+    /// Identifies the session a decode was started for. A decode that outlives
+    /// its session must not write its stale buffer back over a live one.
+    private var sessionToken = UUID()
+    private var isFinishing = false
 
     public init() {}
 
@@ -87,6 +94,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
 
         let pair = AsyncThrowingStream<TranscriptDelta, Error>.makeStream()
         self.configuration = configuration
+        sessionToken = UUID()
         buffers.removeAll(keepingCapacity: true)
         continuation = pair.continuation
         pair.continuation.onTermination = { [weak self] _ in
@@ -113,31 +121,49 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         buffer.lastSequenceNumber = frame.sequenceNumber
         buffer.samples.append(contentsOf: frame.samples)
 
-        let addedSamples = buffer.samples.count - buffer.lastDecodedSampleCount
-        let requiredSamples = Int(
-            (Double(configuration.minimumDecodeIntervalMilliseconds) / 1_000.0)
-                * Double(WhisperKit.sampleRate)
-        )
-        let shouldDecode = addedSamples >= requiredSamples && !buffer.isDecoding
-        if shouldDecode { buffer.isDecoding = true }
         buffers[frame.source] = buffer
+        // Enqueue only. The capture side consumes an AsyncStream that buffers
+        // the newest 256 chunks, so awaiting a decode here makes the ring
+        // overflow and silently discard audio that is already safe on disk.
+        startDecodeIfNeeded(source: frame.source)
+    }
 
-        guard shouldDecode else { return }
+    private func startDecodeIfNeeded(source: AudioSource) {
+        guard let configuration, !isFinishing else { return }
+        guard var buffer = buffers[source], !buffer.isDecoding else { return }
+        let addedSamples = buffer.samples.count - buffer.lastDecodedSampleCount
+        let requiredSamples = Self.samples(
+            milliseconds: configuration.minimumDecodeIntervalMilliseconds
+        )
+        guard addedSamples >= requiredSamples else { return }
+
+        buffer.isDecoding = true
+        buffers[source] = buffer
+        let token = sessionToken
+        decodeTasks[source] = Task { [weak self] in
+            await self?.runDecode(source: source, final: false, token: token)
+        }
+    }
+
+    private func runDecode(source: AudioSource, final: Bool, token: UUID) async {
         do {
-            try await decode(source: frame.source, final: false)
+            try await decode(source: source, final: final, token: token)
+        } catch is CancellationError {
+            // The session that owned this decode is already torn down.
         } catch {
+            guard token == sessionToken else { return }
             continuation?.finish(throwing: error)
             clearSession()
-            throw error
         }
     }
 
     public func finish() async throws {
         guard configuration != nil else { throw SpeechPipelineError.sessionNotRunning }
+        let token = sessionToken
 
         do {
             for source in buffers.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
-                try await decode(source: source, final: true)
+                try await decode(source: source, final: true, token: token)
             }
             continuation?.finish()
             clearSession()
@@ -149,11 +175,18 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     }
 
     public func cancel() async {
+        // The decode keeps a reference to nothing but its session token, so a
+        // late completion is discarded rather than written back into the
+        // dictionary `clearSession` just emptied.
+        for task in decodeTasks.values { task.cancel() }
+        decodeTasks.removeAll()
         continuation?.finish()
         clearSession()
     }
 
-    private func decode(source: AudioSource, final: Bool) async throws {
+    private func decode(source: AudioSource, final: Bool, token: UUID) async throws {
+        guard token == sessionToken else { throw CancellationError() }
+        try Task.checkCancellation()
         guard let decoder, let configuration, var buffer = buffers[source] else {
             throw SpeechPipelineError.sessionNotRunning
         }
@@ -207,6 +240,11 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             samples: decodedSamples,
             options: options
         )
+        // The session may have ended while Core ML was running. Everything below
+        // writes back into engine state, so a dead session stops here rather
+        // than resurrecting the buffers `clearSession` just emptied.
+        guard token == sessionToken else { throw CancellationError() }
+        try Task.checkCancellation()
         let origin = buffer.windowOriginMilliseconds ?? 0
         // Every decoded segment consumes one ordinal whether or not it survives
         // filtering, so an identifier is never handed out twice.
@@ -309,7 +347,9 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             Self.samples(milliseconds: max(0, min(committedEnd, windowEnd) - origin))
         )
 
-        var updatedBuffer = buffers[source] ?? buffer
+        // Read the live buffer rather than falling back to the local copy: the
+        // fallback reinstated a buffer that no longer exists.
+        guard var updatedBuffer = buffers[source] else { throw CancellationError() }
         updatedBuffer.revision = buffer.revision + 1
         updatedBuffer.nextSegmentOrdinal = nextOrdinal
         updatedBuffer.samples.removeFirst(droppedSamples)
@@ -353,6 +393,10 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         configuration = nil
         buffers.removeAll(keepingCapacity: true)
         continuation = nil
+        isFinishing = false
+        // Retiring the token is what makes a decode that is still inside Core ML
+        // harmless: it can no longer match, so it cannot write anything back.
+        sessionToken = UUID()
     }
 }
 
