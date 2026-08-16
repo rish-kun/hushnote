@@ -80,6 +80,24 @@ struct CaptureWatchdogTests {
         #expect(recorder.stalls.count == 1)
     }
 
+    /// The timer's callback takes a temporary strong reference to the watchdog.
+    /// If the capture is released while a tick is in flight, that reference is
+    /// the last one, so `deinit` — and the `stop()` it calls — run on the timer's
+    /// own queue. Anything that blocks on that queue deadlocks the capture
+    /// teardown there.
+    @Test("Stopping the timer from inside its own tick does not deadlock")
+    func stopFromInsideTickDoesNotDeadlock() {
+        let watchdog = CaptureStallWatchdog(threshold: 0.4)
+        let finished = DispatchSemaphore(value: 0)
+        watchdog.onTick = {
+            watchdog.stopTimer()
+            finished.signal()
+        }
+        watchdog.startTimer()
+
+        #expect(finished.wait(timeout: .now() + 3) == .success, "the tick never returned")
+    }
+
     @Test("A stopped watchdog never fires")
     func stopSilencesIt() {
         let recorder = StallRecorder()

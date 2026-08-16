@@ -41,7 +41,12 @@ final class CaptureStallWatchdog: @unchecked Sendable {
     // real-time thread on every buffer.
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let timerQueue = DispatchQueue(label: "com.hushnote.capture-watchdog")
-    private var timer: DispatchSourceTimer?
+    // Held behind a lock rather than a queue sync. The tick handler takes a
+    // temporary strong reference to this object, so when capture is released
+    // mid-tick that reference is the last one and `deinit` — with the `stop()`
+    // it calls — runs on the timer's own queue. Blocking on that queue from
+    // there deadlocks capture teardown.
+    private let timerBox = OSAllocatedUnfairLock<DispatchSourceTimer?>(initialState: nil)
     private let clock: @Sendable () -> TimeInterval
 
     init(
@@ -53,7 +58,7 @@ final class CaptureStallWatchdog: @unchecked Sendable {
     }
 
     deinit {
-        timer?.cancel()
+        timerBox.withLock { $0 }?.cancel()
     }
 
     /// Arms the deadline. The device is given the same grace as any later gap,
@@ -105,28 +110,34 @@ final class CaptureStallWatchdog: @unchecked Sendable {
     // MARK: - Production driving
 
     func startTimer() {
-        timerQueue.sync {
-            timer?.cancel()
-            let created = DispatchSource.makeTimerSource(queue: timerQueue)
-            // Checking four times per threshold bounds the reporting delay to
-            // well under a second past the deadline.
-            let interval = max(0.1, threshold / 4)
-            created.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(100))
-            created.setEventHandler { [weak self] in
-                guard let self else { return }
-                self.state.withLock { $0.onTick }?()
-                self.check(at: self.clock())
-            }
-            created.resume()
-            timer = created
+        let created = DispatchSource.makeTimerSource(queue: timerQueue)
+        // Checking four times per threshold bounds the reporting delay to
+        // well under a second past the deadline.
+        let interval = max(0.1, threshold / 4)
+        created.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(100))
+        created.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.state.withLock { $0.onTick }?()
+            self.check(at: self.clock())
         }
+        created.resume()
+        let previous = timerBox.withLock { box -> DispatchSourceTimer? in
+            let old = box
+            box = created
+            return old
+        }
+        previous?.cancel()
     }
 
+    /// Safe to call from anywhere, the timer's own handler included:
+    /// `DispatchSourceTimer.cancel()` never blocks on the source's queue.
     func stopTimer() {
-        timerQueue.sync {
-            timer?.cancel()
-            timer = nil
+        let existing = timerBox.withLock { box -> DispatchSourceTimer? in
+            let old = box
+            box = nil
+            return old
         }
+        existing?.cancel()
     }
 
     /// The clock this watchdog measures against, so callers can stamp events
