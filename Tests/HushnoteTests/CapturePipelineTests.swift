@@ -15,6 +15,7 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
 
     private let lock = NSLock()
     private var handler: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
+    private var failure: (@Sendable (String) -> Void)?
     private var _calls: [Call] = []
     private var _isRunning = false
 
@@ -27,8 +28,20 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
     var calls: [Call] { lock.withLock { _calls } }
     var isRunning: Bool { lock.withLock { _isRunning } }
 
-    func install(_ handler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void) {
-        lock.withLock { self.handler = handler }
+    func install(
+        _ handler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void,
+        failure: @escaping @Sendable (String) -> Void
+    ) {
+        lock.withLock {
+            self.handler = handler
+            self.failure = failure
+        }
+    }
+
+    /// Fires the same channel the stall watchdog and the format listener use.
+    func reportFailure(_ message: String) {
+        let failure = lock.withLock { self.failure }
+        failure?(message)
     }
 
     func start() throws {
@@ -110,8 +123,8 @@ struct CaptureDurationTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fake = FakeSystemAudioCapture()
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler in
-            fake.install(handler)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
+            fake.install(handler, failure: failure)
             return fake
         }
 
@@ -143,8 +156,8 @@ struct CaptureDurationTests {
 
         let fake = FakeSystemAudioCapture()
         fake.stopCost = 0.4
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler in
-            fake.install(handler)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
+            fake.install(handler, failure: failure)
             return fake
         }
 
@@ -165,8 +178,8 @@ struct CaptureDurationTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fake = FakeSystemAudioCapture()
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler in
-            fake.install(handler)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
+            fake.install(handler, failure: failure)
             return fake
         }
 
@@ -182,6 +195,40 @@ struct CaptureDurationTests {
             abs(artifacts.durationMilliseconds - 1_000) <= 5,
             "stored \(artifacts.durationMilliseconds) ms for one second of audio around a 120 ms pause"
         )
+    }
+
+    /// The watchdog and the format listener are only worth having if what they
+    /// report actually reaches the meeting.
+    @Test("A capture failure stops the session and surfaces the reason")
+    func captureFailureStopsTheSession() async throws {
+        let directory = Self.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fake = FakeSystemAudioCapture()
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
+            fake.install(handler, failure: failure)
+            return fake
+        }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fake.emit(milliseconds: 200)
+        fake.reportFailure("System audio stopped reaching Hushnote 3.2 s ago.")
+
+        try await Self.until { await pipeline.status != .recording }
+
+        #expect(await pipeline.status == .failed("System audio stopped reaching Hushnote 3.2 s ago."))
+        #expect(fake.calls.contains(.stop), "a dead device must not be left running")
+    }
+
+    static func until(
+        _ condition: @Sendable () async -> Bool,
+        timeout: Duration = .seconds(2)
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await condition() { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     static func makeDirectory() -> URL {

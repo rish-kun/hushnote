@@ -18,7 +18,8 @@ protocol SystemAudioCapturing: AnyObject, Sendable {
 extension SystemAudioTapCapture: SystemAudioCapturing {}
 
 typealias SystemAudioCaptureFactory = @Sendable (
-    _ sampleHandler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void
+    _ sampleHandler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void,
+    _ failureHandler: @escaping @Sendable (String) -> Void
 ) -> any SystemAudioCapturing
 
 /// Owns one meeting capture using macOS's system-audio-only Core Audio tap.
@@ -36,8 +37,8 @@ public actor AudioPipeline {
     private var systemAudioURL: URL?
 
     public init(rootDirectory: URL? = nil) {
-        self.init(rootDirectory: rootDirectory) { sampleHandler in
-            SystemAudioTapCapture(sampleHandler: sampleHandler)
+        self.init(rootDirectory: rootDirectory) { sampleHandler, failureHandler in
+            SystemAudioTapCapture(sampleHandler: sampleHandler, failureHandler: failureHandler)
         }
     }
 
@@ -82,9 +83,11 @@ public actor AudioPipeline {
             output.failureHandler = { [weak self] message in
                 Task { await self?.captureDidFail(message) }
             }
-            let capture = captureFactory { [weak output] buffer, presentationSeconds in
+            let capture = captureFactory({ [weak output] buffer, presentationSeconds in
                 output?.consume(buffer, presentationSeconds: presentationSeconds)
-            }
+            }, { [weak self] message in
+                Task { await self?.captureDidFail(message) }
+            })
 
             self.sessionID = id
             self.sessionDirectory = directory
