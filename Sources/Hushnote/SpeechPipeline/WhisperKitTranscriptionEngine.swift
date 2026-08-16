@@ -407,6 +407,10 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         buffers.removeAll(keepingCapacity: true)
         continuation = nil
         isFinishing = false
+        // Handles only, never live work: `cancel` cancels before clearing, and
+        // the failure path runs inside the task being dropped. This keeps a new
+        // session from waiting on a dead one's decode.
+        decodeTasks.removeAll()
         // Retiring the token is what makes a decode that is still inside Core ML
         // harmless: it can no longer match, so it cannot write anything back.
         sessionToken = UUID()
