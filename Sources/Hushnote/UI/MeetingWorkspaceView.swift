@@ -366,7 +366,7 @@ struct TranscriptView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach($state.transcript) { $line in
                     HStack(alignment: .top, spacing: 15) {
-                        TimestampButton(seconds: line.start) {}
+                        TimestampButton(seconds: line.start)
                             .frame(width: 58, alignment: .leading)
                         Text(line.speaker)
                             .font(.callout.weight(.semibold))
@@ -455,7 +455,7 @@ struct AskMeetingView: View {
                         .lineSpacing(4)
                     HStack {
                         ForEach(state.insights.answerTimestamps, id: \.self) { time in
-                            TimestampButton(seconds: time) {}
+                            TimestampButton(seconds: time)
                         }
                     }
                 }

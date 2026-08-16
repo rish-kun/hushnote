@@ -291,23 +291,45 @@ struct EmptyMeetingIllustration: View {
     }
 }
 
+/// A moment in the meeting. It becomes a control only when there is somewhere
+/// to go: with no action it is a label, not a keyboard stop that lies.
 struct TimestampButton: View {
     let seconds: TimeInterval
-    let action: () -> Void
+    var action: (() -> Void)?
 
-    var body: some View {
-        Button(action: action) {
-            Text(DurationText.clock(seconds))
-                .font(.caption.monospacedDigit().weight(.medium))
-                .foregroundStyle(HushnoteTheme.moss)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(HushnoteTheme.moss.opacity(0.09), in: Capsule())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Jump to \(DurationText.clock(seconds))")
+    init(seconds: TimeInterval, action: (() -> Void)? = nil) {
+        self.seconds = seconds
+        self.action = action
     }
 
+    var body: some View {
+        if let action {
+            Button(action: action) { stamp }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Self.accessibilityLabel(at: seconds, isInteractive: true))
+        } else {
+            stamp
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(Self.accessibilityLabel(at: seconds, isInteractive: false))
+        }
+    }
+
+    private var stamp: some View {
+        Text(DurationText.clock(seconds))
+            .font(.caption.monospacedDigit().weight(.medium))
+            .foregroundStyle(HushnoteTheme.moss)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(HushnoteTheme.moss.opacity(0.09), in: Capsule())
+    }
+
+    nonisolated static func accessibilityLabel(
+        at seconds: TimeInterval,
+        isInteractive: Bool
+    ) -> String {
+        let spoken = DurationText.spoken(seconds)
+        return isInteractive ? "Jump to \(spoken)" : "At \(spoken)"
+    }
 }
 
 /// One duration, two readings: the clock face on screen and the units a screen
