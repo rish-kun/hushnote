@@ -168,6 +168,37 @@ struct LiveTranscriptionEngineTests {
         #expect(options.allSatisfy { $0.clipTimestamps.isEmpty })
     }
 
+    @Test("A hypothesis never carries a segment that overlaps committed audio")
+    func clipsTailSegmentsThatReachBackIntoFrozenAudio() async throws {
+        let meetingID = UUID()
+        // The second segment claims to end past the audio it was decoded from,
+        // which pushes the committed boundary beyond the window origin. The next
+        // decode then reports speech that starts inside already-frozen audio.
+        let decoder = ScriptedDecoder([
+            [whisperSegment(start: 0, end: 1, text: "one"), whisperSegment(start: 1, end: 5, text: "two")],
+            [whisperSegment(start: 0, end: 4, text: "two again")],
+        ])
+        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let stream = try await engine.start(
+            configuration: configuration(meetingID: meetingID, confirmationLagSegments: 0)
+        )
+        var deltas = stream.makeAsyncIterator()
+
+        try await engine.push(frame(
+            meetingID: meetingID,
+            sequence: 1,
+            startMilliseconds: 0,
+            milliseconds: 2_000
+        ))
+        _ = try await deltas.next()
+        try await engine.push(frame(meetingID: meetingID, sequence: 2, startMilliseconds: 2_000))
+        let delta = try #require(await deltas.next())
+
+        let overlaps = zip(delta.segments, delta.segments.dropFirst())
+            .contains { $0.endMilliseconds > $1.startMilliseconds }
+        #expect(!overlaps)
+    }
+
     @Test("Identifiers are scoped to the meeting that produced them")
     func identifiersDoNotCollideAcrossMeetings() async throws {
         let first = UUID()

@@ -257,6 +257,73 @@ struct TranscriptAssemblerTests {
         #expect(snapshot.segments.map(\.text) == ["one", "two"])
     }
 
+    @Test("A hypothesis that re-cuts a frozen boundary neither duplicates nor drops")
+    func reDecodedOverlapDoesNotDuplicateFrozenSegments() {
+        let meetingID = UUID()
+        var assembler = TranscriptAssembler(meetingID: meetingID)
+        assembler.apply(delta(
+            meetingID: meetingID,
+            revision: 1,
+            stablePrefixCount: 2,
+            segments: [
+                segment("s0", "zero", 0, 1_000, meetingID),
+                segment("s1", "one", 1_000, 2_000, meetingID),
+            ]
+        ))
+
+        // The next decode re-cuts the boundary: u1 starts inside frozen audio but
+        // ends past it, so the engine's end-only tail filter used to let it
+        // through. `normalized` then sorts it between s0 and s1, and freezing by
+        // array position stopped meaning the same utterance.
+        let snapshot = assembler.apply(delta(
+            meetingID: meetingID,
+            revision: 2,
+            stablePrefixCount: 2,
+            segments: [
+                segment("s0", "zero", 0, 1_000, meetingID),
+                segment("s1", "one", 1_000, 2_000, meetingID),
+                segment("u1", "one two", 800, 2_500, meetingID),
+                segment("u2", "three", 2_500, 3_500, meetingID),
+            ]
+        ))
+
+        let ids = snapshot.segments.map(\.id)
+        // A duplicate ID here trips MeetingStore.validate, and the coordinator
+        // swallows that with `try?`, so live persistence dies for the rest of
+        // the meeting.
+        #expect(Set(ids).count == ids.count)
+        #expect(ids == ["s0", "s1", "u2"])
+    }
+
+    @Test("A shorter hypothesis still admits speech past the frozen boundary")
+    func shorterHypothesisDoesNotBlankNewSpeech() {
+        let meetingID = UUID()
+        var assembler = TranscriptAssembler(meetingID: meetingID)
+        assembler.apply(delta(
+            meetingID: meetingID,
+            revision: 1,
+            stablePrefixCount: 2,
+            segments: [
+                segment("a", "one", 0, 1_000, meetingID),
+                segment("b", "two", 1_000, 2_000, meetingID),
+            ]
+        ))
+
+        // VAD merged the committed audio into one segment, so the hypothesis is
+        // no longer than the frozen prefix — but it still carries new speech.
+        let snapshot = assembler.apply(delta(
+            meetingID: meetingID,
+            revision: 2,
+            stablePrefixCount: 0,
+            segments: [
+                segment("merged", "one two", 0, 2_000, meetingID),
+                segment("c", "three", 2_000, 3_000, meetingID),
+            ]
+        ))
+
+        #expect(snapshot.segments.map(\.id) == ["a", "b", "c"])
+    }
+
     private func delta(
         meetingID: UUID,
         source: AudioSource = .system,

@@ -257,7 +257,11 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         }
 
         let boundary = frozenPrefix.last?.endMilliseconds ?? Int64.min
-        let tail = mapped.filter { $0.endMilliseconds > boundary }
+        // Clip on start, not end. A re-decoded segment that starts inside
+        // committed audio repeats text the frozen prefix already holds, and it
+        // sorts ahead of a frozen segment, which breaks any consumer that treats
+        // the prefix as positional.
+        let tail = mapped.filter { $0.startMilliseconds >= boundary }
         var hypothesis = frozenPrefix + tail
 
         // Preserve a text-only result from unusual decoding paths that do not
