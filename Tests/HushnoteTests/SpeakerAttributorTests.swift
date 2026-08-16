@@ -49,6 +49,49 @@ struct SpeakerAttributorTests {
         #expect(result[0].speakerID == "A")
     }
 
+    @Test("A diarizer cluster label is not repeated inside the display name")
+    func doesNotDoublePrefixClusterLabels() {
+        let meetingID = UUID()
+        let segment = transcriptSegment("remote", meetingID: meetingID, source: .system, start: 0, end: 500)
+
+        // FluidAudio emits "S1", "S2"… for its clusters.
+        let result = SpeakerAttributor.assign(
+            turns: [SpeakerTurn(id: "t", speakerID: "S1", startMilliseconds: 0, endMilliseconds: 500)],
+            to: [segment]
+        )
+
+        #expect(result[0].speakerID == "S1")
+        #expect(result[0].speakerName == "Speaker 1")
+    }
+
+    @Test("A zero-duration segment inside a turn is still attributed")
+    func attributesZeroDurationSegments() {
+        let meetingID = UUID()
+        // Whisper emits zero-duration segments at chunk boundaries, and
+        // TranscriptAssembler.normalized permits them.
+        let segment = transcriptSegment("remote", meetingID: meetingID, source: .system, start: 300, end: 300)
+
+        let result = SpeakerAttributor.assign(
+            turns: [SpeakerTurn(id: "a", speakerID: "S2", startMilliseconds: 200, endMilliseconds: 400)],
+            to: [segment]
+        )
+
+        #expect(result[0].speakerID == "S2")
+    }
+
+    @Test("A segment that abuts a turn exactly is still attributed")
+    func attributesAbuttingSegments() {
+        let meetingID = UUID()
+        let segment = transcriptSegment("remote", meetingID: meetingID, source: .system, start: 200, end: 400)
+
+        let result = SpeakerAttributor.assign(
+            turns: [SpeakerTurn(id: "a", speakerID: "S3", startMilliseconds: 0, endMilliseconds: 200)],
+            to: [segment]
+        )
+
+        #expect(result[0].speakerID == "S3")
+    }
+
     @Test("Non-overlapping system speech remains anonymous")
     func noOverlapLeavesSpeakerUnset() {
         let meetingID = UUID()
