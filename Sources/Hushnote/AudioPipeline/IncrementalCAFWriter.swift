@@ -25,9 +25,13 @@ private final class ConverterFlushState: @unchecked Sendable {
 final class IncrementalCAFWriter {
     let url: URL
 
-    private static let recoveryFormat = AVAudioFormat(
+    /// Every recovery take is normalized to this rate, so it is also the rate a
+    /// written-frame count has to be divided by to become a duration.
+    static let recoverySampleRate = 48_000.0
+
+    static let recoveryFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
-        sampleRate: 48_000,
+        sampleRate: recoverySampleRate,
         channels: 1,
         interleaved: false
     )!

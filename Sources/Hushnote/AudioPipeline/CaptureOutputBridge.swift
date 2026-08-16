@@ -18,7 +18,6 @@ final class CaptureOutputBridge: @unchecked Sendable {
     private let resampler = SpeechFeedResampler(targetSampleRate: 16_000)
     private let eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
 
-    private var startInstant: ContinuousClock.Instant?
     private var pauseInstant: ContinuousClock.Instant?
     private var accumulatedPause: Duration = .zero
     private var timelineOriginSeconds: Double?
@@ -34,13 +33,25 @@ final class CaptureOutputBridge: @unchecked Sendable {
         self.eventContinuation = eventContinuation
     }
 
+    /// How much audio this session actually recorded.
+    ///
+    /// This used to be `ContinuousClock` elapsed time minus pauses, which
+    /// counted the 100–400 ms of HAL start-up before the first IOProc callback,
+    /// every dropped buffer, and — because `stop()` reads it after
+    /// `AudioHardwareDestroyAggregateDevice` — the teardown as well. Frames in
+    /// the file are the only figure that cannot drift from the recording, and
+    /// they are what recovery recomputes when a meeting is reopened.
     var durationMilliseconds: Int64 {
-        queue.sync { adjustedElapsedMilliseconds(at: .now) }
+        queue.sync {
+            Self.milliseconds(
+                frames: systemWriter.framesWritten,
+                sampleRate: IncrementalCAFWriter.recoverySampleRate
+            )
+        }
     }
 
     func begin() {
         queue.sync {
-            startInstant = .now
             acceptingSamples = true
         }
     }
@@ -132,13 +143,9 @@ final class CaptureOutputBridge: @unchecked Sendable {
         }
     }
 
-    private func adjustedElapsedMilliseconds(at instant: ContinuousClock.Instant) -> Int64 {
-        guard let startInstant else { return 0 }
-        let effectiveInstant = pauseInstant ?? instant
-        let elapsed = startInstant.duration(to: effectiveInstant) - accumulatedPause
-        let components = elapsed.components
-        let milliseconds = components.seconds * 1_000 + components.attoseconds / 1_000_000_000_000_000
-        return max(0, milliseconds)
+    static func milliseconds(frames: AVAudioFramePosition, sampleRate: Double) -> Int64 {
+        guard frames > 0, sampleRate > 0 else { return 0 }
+        return Int64((Double(frames) / sampleRate * 1_000).rounded())
     }
 
     static func milliseconds(_ duration: Duration) -> Int64 {

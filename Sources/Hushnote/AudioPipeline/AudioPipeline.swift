@@ -1,13 +1,34 @@
 @preconcurrency import AVFoundation
 import Foundation
 
+/// The capture device, behind a seam.
+///
+/// `SystemAudioTapCapture` needs a real Core Audio aggregate device and a
+/// granted privacy permission, neither of which a test can conjure. The
+/// pipeline's own rules — what a session's duration means, which order start
+/// and stop happen in, which session a failure belongs to — are independent of
+/// the device and are verified through this protocol.
+protocol SystemAudioCapturing: AnyObject, Sendable {
+    func start() throws
+    func stop()
+    func pause() throws
+    func resume() throws
+}
+
+extension SystemAudioTapCapture: SystemAudioCapturing {}
+
+typealias SystemAudioCaptureFactory = @Sendable (
+    _ sampleHandler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void
+) -> any SystemAudioCapturing
+
 /// Owns one meeting capture using macOS's system-audio-only Core Audio tap.
 public actor AudioPipeline {
     public nonisolated let events: AsyncStream<AudioCaptureEvent>
 
     private let eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
     private let rootDirectory: URL
-    private var capture: SystemAudioTapCapture?
+    private let captureFactory: SystemAudioCaptureFactory
+    private var capture: (any SystemAudioCapturing)?
     private var output: CaptureOutputBridge?
     private var currentStatus: AudioCaptureStatus = .idle
     private var sessionID: UUID?
@@ -15,10 +36,17 @@ public actor AudioPipeline {
     private var systemAudioURL: URL?
 
     public init(rootDirectory: URL? = nil) {
+        self.init(rootDirectory: rootDirectory) { sampleHandler in
+            SystemAudioTapCapture(sampleHandler: sampleHandler)
+        }
+    }
+
+    init(rootDirectory: URL?, captureFactory: @escaping SystemAudioCaptureFactory) {
         let pair = AsyncStream<AudioCaptureEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
         events = pair.stream
         eventContinuation = pair.continuation
         self.rootDirectory = rootDirectory ?? Self.defaultCaptureDirectory()
+        self.captureFactory = captureFactory
     }
 
     deinit {
@@ -54,7 +82,7 @@ public actor AudioPipeline {
             output.failureHandler = { [weak self] message in
                 Task { await self?.captureDidFail(message) }
             }
-            let capture = SystemAudioTapCapture { [weak output] buffer, presentationSeconds in
+            let capture = captureFactory { [weak output] buffer, presentationSeconds in
                 output?.consume(buffer, presentationSeconds: presentationSeconds)
             }
 
