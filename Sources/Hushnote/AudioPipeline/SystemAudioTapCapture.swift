@@ -93,7 +93,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         var createdTap = kAudioObjectUnknown
         try Self.check(
             AudioHardwareCreateProcessTap(tapDescription, &createdTap),
-            operation: "create the system-audio tap"
+            operation: Operation.createTap
         )
         guard createdTap != kAudioObjectUnknown else {
             throw AudioPipelineError.audioCaptureFailed
@@ -454,11 +454,11 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             // `'nope'` is HAL's transient illegal-operation response. Other
             // errors are deterministic and should be surfaced immediately.
             guard lastStatus == OSStatus(bitPattern: 0x6E6F7065) else {
-                try check(lastStatus, operation: "start system-audio capture")
+                try check(lastStatus, operation: Operation.startDevice)
                 return
             }
         }
-        try check(lastStatus, operation: "start system-audio capture after waiting for Core Audio")
+        try check(lastStatus, operation: Operation.startDeviceAfterWaiting)
     }
 
     /// The format read at start is used to wrap every buffer for the rest of the
@@ -471,6 +471,13 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             || previous.channelCount != updated.channelCount
             || previous.commonFormat != updated.commonFormat
             || previous.isInterleaved != updated.isInterleaved
+    }
+
+    /// Operation names that error mapping keys on, rather than matching prose.
+    enum Operation {
+        static let createTap = "create the system-audio tap"
+        static let startDevice = "start system-audio capture"
+        static let startDeviceAfterWaiting = "start system-audio capture after waiting for Core Audio"
     }
 
     private static func check(_ status: OSStatus, operation: String) throws {

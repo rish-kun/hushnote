@@ -258,5 +258,21 @@ public actor AudioPipeline {
             .appending(path: "RecoveryAudio", directoryHint: .isDirectory)
     }
 
-    private static func mapCaptureError(_ error: Error) -> Error { error }
+    /// Turns a raw Core Audio status into the failure the user can act on.
+    ///
+    /// `'nope'` (kAudioHardwareIllegalOperationError) is what the HAL returns
+    /// both for a privacy denial and for a device-graph update still in flight,
+    /// so the operation it arrived at is what tells them apart. Tap creation is
+    /// where TCC refuses; `AudioDeviceStart` is where the genuine transient
+    /// occurs, and `startDeviceWithRecovery` already retries that one. Without
+    /// this, a user who has never granted System Audio Recording was told to
+    /// "wait a moment and try again", and `.permissionDenied` — the message
+    /// naming the toggle to turn on — was thrown from nowhere at all.
+    static func mapCaptureError(_ error: Error) -> Error {
+        guard case AudioPipelineError.coreAudioFailure(let operation, let status) = error,
+              operation == SystemAudioTapCapture.Operation.createTap,
+              status == OSStatus(bitPattern: 0x6E6F7065)
+        else { return error }
+        return AudioPipelineError.permissionDenied
+    }
 }
