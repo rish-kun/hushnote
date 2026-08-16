@@ -141,6 +141,86 @@ final class EventCollector: @unchecked Sendable {
     }
 }
 
+/// Hands out one fake per `start()`, so a test can hold on to a previous
+/// session's device after the pipeline has moved on.
+final class FakeCaptureFleet: @unchecked Sendable {
+    private let lock = NSLock()
+    private var made: [FakeSystemAudioCapture] = []
+
+    func next(
+        _ handler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void,
+        _ notice: @escaping @Sendable (CaptureNotice) -> Void
+    ) -> FakeSystemAudioCapture {
+        let fake = FakeSystemAudioCapture()
+        fake.install(handler, notice: notice)
+        lock.withLock { made.append(fake) }
+        return fake
+    }
+
+    subscript(index: Int) -> FakeSystemAudioCapture {
+        lock.withLock { made[index] }
+    }
+
+    var count: Int { lock.withLock { made.count } }
+}
+
+/// A failure carries no session identity, so a late one from a finished meeting
+/// stopped whatever capture happened to be current. Reachable in the ordinary
+/// way: a failure fires, the user stops, the user starts the next meeting, and
+/// the stale task then kills the brand-new recording with the old message.
+@Suite("Failure ownership")
+struct CaptureFailureOwnershipTests {
+    @Test("A failure from a finished session cannot stop the next one")
+    func staleFailureIsIgnored() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fleet = FakeCaptureFleet()
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fleet.next(handler, notice)
+        }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[0].emit(milliseconds: 200)
+        _ = try await pipeline.stop()
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[1].emit(milliseconds: 300)
+
+        // The dead session's device finally reports what killed it.
+        fleet[0].report(.failure("System audio stopped reaching Hushnote 3.2 s ago."))
+        try await Task.sleep(for: .milliseconds(120))
+
+        #expect(await pipeline.status == .recording, "the new meeting is still recording")
+        #expect(fleet[1].isRunning, "the new meeting's device must not be torn down")
+
+        fleet[1].emit(milliseconds: 300, startingAt: 1_010)
+        let artifacts = try await pipeline.stop()
+        #expect(
+            abs(artifacts.durationMilliseconds - 600) <= 5,
+            "stored \(artifacts.durationMilliseconds) ms; the second meeting recorded 600 ms"
+        )
+    }
+
+    @Test("A failure from the current session still stops it")
+    func currentFailureStillStops() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fleet = FakeCaptureFleet()
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fleet.next(handler, notice)
+        }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[0].emit(milliseconds: 200)
+        fleet[0].report(.failure("the tap died"))
+
+        try await CaptureDurationTests.until { await pipeline.status != .recording }
+        #expect(await pipeline.status == .failed("the tap died"))
+    }
+}
+
 /// `pause()` stops accepting samples before stopping the device. `resume()` did
 /// the mirror image of the wrong thing: it started the device first, so
 /// anything the HAL delivered before `output.resume()` ran was discarded, and

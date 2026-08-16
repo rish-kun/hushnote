@@ -88,8 +88,11 @@ public actor AudioPipeline {
                 systemAudioURL: systemURL,
                 eventContinuation: eventContinuation
             )
+            // Every failure route is stamped with the session that owns it.
+            // Without that, a failure fired by a meeting the user has already
+            // stopped tears down the next one, with the old message.
             output.failureHandler = { [weak self] message in
-                Task { await self?.captureDidFail(message) }
+                Task { await self?.captureDidFail(message, session: id) }
             }
             let continuation = eventContinuation
             let capture = captureFactory({ [weak output] buffer, presentationSeconds in
@@ -97,7 +100,7 @@ public actor AudioPipeline {
             }, { [weak self] notice in
                 switch notice {
                 case .failure(let message):
-                    Task { await self?.captureDidFail(message) }
+                    Task { await self?.captureDidFail(message, session: id) }
                 case .dropped(let report):
                     // Lost audio does not stop the meeting, but it must never
                     // pass silently: the CAF has no gaps, so everything after a
@@ -227,8 +230,10 @@ public actor AudioPipeline {
         eventContinuation.yield(.status(status))
     }
 
-    private func captureDidFail(_ message: String) async {
-        guard let capture else { return }
+    private func captureDidFail(_ message: String, session: UUID) async {
+        // A failure only speaks for the session that raised it. Anything else
+        // is a message from a meeting that is already over.
+        guard sessionID == session, let capture else { return }
         capture.stop()
         output?.finish()
         resetSession()
