@@ -71,7 +71,7 @@ final class AppCoordinator {
             state.meetings = meetings.map(Self.listItem)
         } catch {
             logger.error("Bootstrap failed: \(error.localizedDescription, privacy: .public)")
-            state.markFailed("The local meeting database could not be loaded.")
+            state.markFailed(.init(kind: .database, message: "The local meeting database could not be loaded."))
         }
     }
 
@@ -89,7 +89,7 @@ final class AppCoordinator {
             state.selection = .meeting(meeting.id)
             state.selectedWorkspaceTab = "Notes"
         } catch {
-            state.markFailed("A new meeting note could not be created: \(error.localizedDescription)")
+            state.markFailed(.init(kind: .database, message: "A new meeting note could not be created: \(error.localizedDescription)"))
         }
     }
 
@@ -147,7 +147,11 @@ final class AppCoordinator {
             if liveSessionGeneration == generation { liveSessionGeneration = nil }
             logger.error("Start failed: \(error.localizedDescription, privacy: .public)")
             try? await store.updateMeetingStatus(id: meeting.id, status: .failed, errorMessage: error.localizedDescription)
-            state.markFailed(error.localizedDescription)
+            state.markFailed(.init(
+                kind: .classifyCapture(error),
+                message: error.localizedDescription,
+                meetingID: meeting.id
+            ))
         }
     }
 
@@ -210,7 +214,11 @@ final class AppCoordinator {
                 state.markPaused(true)
             }
         } catch {
-            state.markFailed(error.localizedDescription)
+            state.markFailed(.init(
+                kind: .classifyCapture(error),
+                message: error.localizedDescription,
+                meetingID: state.activeMeetingID
+            ))
         }
     }
 
@@ -348,7 +356,11 @@ final class AppCoordinator {
                 updateListItem(meeting, excerpt: "Recording is safe. Retry finalization when ready.")
             }
             self.audioPipeline = nil
-            state.markFailed("The recording is safe, but finalization stopped: \(error.localizedDescription)")
+            state.markFailed(.init(
+                kind: .finalization,
+                message: "The recording is safe, but finalization stopped: \(error.localizedDescription)",
+                meetingID: meetingID
+            ))
         }
     }
 
@@ -489,7 +501,11 @@ final class AppCoordinator {
                 meeting.errorMessage = error.localizedDescription
                 updateListItem(meeting, excerpt: "Recording is safe. Retry finalization when ready.")
             }
-            state.markFailed("Recovery stopped, but the original audio remains safe: \(error.localizedDescription)")
+            state.markFailed(.init(
+                kind: .finalization,
+                message: "Recovery stopped, but the original audio remains safe: \(error.localizedDescription)",
+                meetingID: id
+            ))
         }
     }
 
@@ -606,7 +622,7 @@ final class AppCoordinator {
             speechEngine = engine
             loadedModel = model
         } catch {
-            state.markFailed("Model download failed: \(error.localizedDescription)")
+            state.markFailed(.init(kind: .modelDownload, message: "Model download failed: \(error.localizedDescription)"))
         }
     }
 
@@ -635,7 +651,7 @@ final class AppCoordinator {
             }
             stagedAPIKeys[provider] = nil
         } catch {
-            state.markFailed("Keychain could not save the credential: \(error.localizedDescription)")
+            state.markFailed(.init(kind: .credentialStorage, message: "Keychain could not save the credential: \(error.localizedDescription)"))
         }
     }
 
@@ -647,7 +663,7 @@ final class AppCoordinator {
             }
             try await codexProvider.waitForLogin(loginID: challenge.loginID)
         } catch {
-            state.markFailed("ChatGPT connection failed: \(error.localizedDescription)")
+            state.markFailed(.init(kind: .providerConnection, message: "ChatGPT connection failed: \(error.localizedDescription)"))
         }
     }
 
@@ -683,7 +699,13 @@ final class AppCoordinator {
                         \(report.totalDroppedBuffers, privacy: .public) this session
                         """)
                 case .status(let status):
-                    if case .failed(let message) = status { self.state.markFailed(message) }
+                    if case .failed(let message) = status {
+                        self.state.markFailed(.init(
+                            kind: .capture,
+                            message: message,
+                            meetingID: meetingID
+                        ))
+                    }
                 }
             }
         }

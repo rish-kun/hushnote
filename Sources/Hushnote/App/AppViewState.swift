@@ -18,13 +18,90 @@ enum MeetingTemplate: String, CaseIterable, Codable, Sendable, Identifiable {
     var id: Self { self }
 }
 
+/// What kind of thing went wrong, so the failure banner can offer a remedy that
+/// exists. Almost nothing that calls `markFailed` is a recording problem.
+enum RecordingFailureKind: Equatable, Sendable {
+    /// System Audio Recording was refused. The only failure a Privacy pane fixes.
+    case audioPermission
+    /// Capture stopped for a meeting that can be started again.
+    case capture
+    /// The audio is on disk; the pass over it stopped.
+    case finalization
+    case modelDownload
+    case credentialStorage
+    case providerConnection
+    case database
+    /// A message with no claim attached about what caused it.
+    case unknown
+
+    /// Distinguishes the one capture failure a user can act on from the rest.
+    nonisolated static func classifyCapture(_ error: Error) -> RecordingFailureKind {
+        if let audio = error as? AudioPipelineError, audio == .permissionDenied {
+            return .audioPermission
+        }
+        return .capture
+    }
+}
+
+/// A remedy the failure banner can actually deliver.
+///
+/// Retrying carries the meeting it applies to, so "Try Again" with nothing to
+/// retry is unrepresentable. The old banner passed a sidebar-derived optional
+/// straight into `startMeeting`, where nil means "record a brand-new meeting".
+enum FailureRemedy: Equatable, Sendable {
+    case openPrivacySettings
+    case retryRecording(UUID)
+    case retryFinalization(UUID)
+    case openModels
+    case openSettings
+}
+
+/// A failure worth interrupting the window for, with enough structure to be
+/// answered.
+///
+/// `ExpressibleByStringLiteral` is not only for source compatibility: a bare
+/// message genuinely carries no claim about its cause, and is treated as
+/// `.unknown` — offering no remedy rather than a misleading one.
+struct RecordingFailure: Equatable, Sendable, ExpressibleByStringLiteral {
+    var kind: RecordingFailureKind
+    var message: String
+    var meetingID: UUID?
+
+    init(kind: RecordingFailureKind = .unknown, message: String, meetingID: UUID? = nil) {
+        self.kind = kind
+        self.message = message
+        self.meetingID = meetingID
+    }
+
+    init(stringLiteral value: String) {
+        self.init(message: value)
+    }
+
+    var remedies: [FailureRemedy] {
+        switch kind {
+        case .audioPermission:
+            [.openPrivacySettings] + (meetingID.map { [.retryRecording($0)] } ?? [])
+        case .capture:
+            meetingID.map { [.retryRecording($0)] } ?? []
+        case .finalization:
+            meetingID.map { [.retryFinalization($0)] } ?? []
+        case .modelDownload:
+            [.openModels]
+        case .credentialStorage, .providerConnection:
+            [.openSettings]
+        case .database, .unknown:
+            []
+        }
+    }
+}
+
 enum RecordingPhase: Equatable {
     case idle
     case preparing
     case recording
     case paused
     case finalizing(Double)
-    case failed(String)
+    case failed(RecordingFailure)
 
     var isCapturing: Bool {
         self == .recording || self == .paused
@@ -264,11 +341,18 @@ final class AppViewState {
         finalizationDetail = nil
     }
 
-    func markFailed(_ message: String) {
-        recordingPhase = .failed(message)
+    func markFailed(_ failure: RecordingFailure) {
+        recordingPhase = .failed(failure)
         recordingNotice = nil
         finalizationDetail = nil
         elapsedTask?.cancel()
+    }
+
+    /// Clears the failure banner. Only ever a failure: a live recording is never
+    /// something the user meant to dismiss.
+    func dismissFailure() {
+        guard case .failed = recordingPhase else { return }
+        recordingPhase = .idle
     }
 
     private func startElapsedTimer() {

@@ -43,8 +43,8 @@ struct AppShellView: View {
             }
         } detail: {
             VStack(spacing: 0) {
-                if case .failed(let message) = state.recordingPhase {
-                    recordingErrorBanner(message)
+                if case .failed(let failure) = state.recordingPhase {
+                    recordingErrorBanner(failure)
                 }
                 detail
                     .paperBackground()
@@ -77,28 +77,62 @@ struct AppShellView: View {
         }
     }
 
-    private func recordingErrorBanner(_ message: String) -> some View {
-        HStack(spacing: 12) {
+    private func recordingErrorBanner(_ failure: RecordingFailure) -> some View {
+        @Bindable var state = state
+
+        return HStack(spacing: 12) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(HushnoteTheme.vermilion)
-            Text(message)
+            Text(failure.message)
                 .font(.callout)
-                .lineLimit(2)
-            Spacer()
-            Button("System Audio Settings") { coordinator.openPrivacySettings() }
-                .buttonStyle(.bordered)
-            Button("Try Again") { Task { await coordinator.startMeeting(meetingID: selectedMeetingID) } }
-                .buttonStyle(.borderedProminent)
-                .tint(HushnoteTheme.vermilion)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 12)
+            ForEach(Array(failure.remedies.enumerated()), id: \.offset) { _, remedy in
+                remedyButton(remedy)
+            }
+            Button {
+                state.dismissFailure()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss")
+            .accessibilityLabel("Dismiss this message")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
         .background(HushnoteTheme.vermilion.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Hushnote ran into a problem. \(failure.message)")
     }
 
-    private var selectedMeetingID: UUID? {
-        if case .meeting(let id) = state.selection { return id }
-        return nil
+    @ViewBuilder
+    private func remedyButton(_ remedy: FailureRemedy) -> some View {
+        @Bindable var state = state
+
+        switch remedy {
+        case .openPrivacySettings:
+            Button("System Audio Settings") { coordinator.openPrivacySettings() }
+                .buttonStyle(.bordered)
+        case .retryRecording(let id):
+            Button("Try Again") { Task { await coordinator.startMeeting(meetingID: id) } }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.vermilion)
+        case .retryFinalization(let id):
+            Button("Finalize Again") { Task { await coordinator.recoverMeeting(id) } }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.vermilion)
+        case .openModels:
+            Button("Open Models") { state.selection = .models }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.ink)
+        case .openSettings:
+            Button("Open Settings") { state.selection = .settings }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.ink)
+        }
     }
 
     @ViewBuilder
