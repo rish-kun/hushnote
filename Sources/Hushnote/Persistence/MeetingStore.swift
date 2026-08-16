@@ -1,0 +1,448 @@
+import Foundation
+import GRDB
+
+/// The single persistence boundary for meeting metadata and revision-aware
+/// transcript state. Writes are serialized by GRDB and grouped transactionally.
+public actor MeetingStore {
+    private let database: any DatabaseWriter
+
+    public init(databaseURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        var configuration = Configuration()
+        configuration.journalMode = .wal
+        configuration.busyMode = .timeout(5)
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+            try db.execute(sql: "PRAGMA synchronous = NORMAL")
+        }
+        let database = try DatabasePool(path: databaseURL.path, configuration: configuration)
+        try HushnoteDatabaseMigrations.migrator.migrate(database)
+        self.database = database
+    }
+
+    public init(inMemory: Void = ()) throws {
+        var configuration = Configuration()
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let database = try DatabaseQueue(configuration: configuration)
+        try HushnoteDatabaseMigrations.migrator.migrate(database)
+        self.database = database
+    }
+
+    public func saveMeeting(_ meeting: Meeting) throws {
+        try database.write { db in
+            try MeetingRecord(meeting).save(db)
+        }
+    }
+
+    public func meeting(id: UUID) throws -> Meeting? {
+        try database.read { db in
+            try MeetingRecord.fetchOne(db, key: id.uuidString)?.model()
+        }
+    }
+
+    public func meetings(limit: Int? = nil) throws -> [Meeting] {
+        try database.read { db in
+            var request = MeetingRecord.order(Column("updatedAt").desc)
+            if let limit { request = request.limit(limit) }
+            return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    public func updateMeetingStatus(
+        id: UUID,
+        status: MeetingStatus,
+        errorMessage: String? = nil,
+        at date: Date = Date()
+    ) throws {
+        try database.write { db in
+            let changed = try MeetingRecord
+                .filter(key: id.uuidString)
+                .updateAll(
+                    db,
+                    Column("status").set(to: status.rawValue),
+                    Column("errorMessage").set(to: errorMessage),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(id) }
+        }
+    }
+
+    /// Saves the user's free-form notes independently from transcript and
+    /// insight generation. Whitespace is preserved because notes are authored
+    /// content, including intentional indentation and blank lines.
+    public func updateMeetingNotes(
+        id: UUID,
+        notes: String,
+        at date: Date = Date()
+    ) throws {
+        try database.write { db in
+            let changed = try MeetingRecord
+                .filter(key: id.uuidString)
+                .updateAll(
+                    db,
+                    Column("notes").set(to: notes),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(id) }
+        }
+    }
+
+    public func saveAudioTrack(_ track: MeetingAudioTrack) throws {
+        try database.write { db in
+            guard try MeetingRecord.fetchOne(db, key: track.meetingID.uuidString) != nil else {
+                throw PersistenceError.meetingNotFound(track.meetingID)
+            }
+            var record = AudioTrackRecord(track)
+            if let existing = try AudioTrackRecord
+                .filter(Column("meetingID") == track.meetingID.uuidString)
+                .filter(Column("source") == track.source.rawValue)
+                .fetchOne(db) {
+                record.id = existing.id
+            }
+            try record.save(db)
+        }
+    }
+
+    public func audioTracks(meetingID: UUID) throws -> [MeetingAudioTrack] {
+        try database.read { db in
+            try AudioTrackRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("source"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func upsertSegments(_ segments: [TranscriptSegment]) throws {
+        guard !segments.isEmpty else { return }
+        let meetingID = segments[0].meetingID
+        guard segments.allSatisfy({ $0.meetingID == meetingID }) else {
+            throw PersistenceError.invalidSegment("one write cannot span multiple meetings")
+        }
+        try validate(segments)
+
+        try database.write { db in
+            guard try MeetingRecord.fetchOne(db, key: meetingID.uuidString) != nil else {
+                throw PersistenceError.meetingNotFound(meetingID)
+            }
+            for segment in segments {
+                let existing = try SegmentRecord.fetchOne(db, key: segment.id)
+                if let existing, existing.meetingID != meetingID.uuidString {
+                    throw PersistenceError.invalidSegment(
+                        "ID \(segment.id) already belongs to another meeting"
+                    )
+                }
+                if let existing, segment.revision < existing.revision {
+                    throw PersistenceError.invalidSegment(
+                        "revision for \(segment.id) moved backwards"
+                    )
+                }
+                var record = try SegmentRecord(
+                    segment,
+                    modelText: segment.text,
+                    isUserEdited: existing?.isUserEdited ?? false
+                )
+                if existing?.isUserEdited == true { record.text = existing!.text }
+                try record.save(db)
+            }
+        }
+    }
+
+    /// Atomically replaces one meeting's transcript after the final ASR pass.
+    public func replaceTranscript(_ snapshot: TranscriptSnapshot) throws {
+        try validate(snapshot.segments)
+        guard snapshot.segments.allSatisfy({ $0.meetingID == snapshot.meetingID }) else {
+            throw PersistenceError.invalidSegment("snapshot meeting IDs do not match")
+        }
+        try database.write { db in
+            guard try MeetingRecord.fetchOne(db, key: snapshot.meetingID.uuidString) != nil else {
+                throw PersistenceError.meetingNotFound(snapshot.meetingID)
+            }
+            let existingRecords = try SegmentRecord
+                .filter(Column("meetingID") == snapshot.meetingID.uuidString)
+                .fetchAll(db)
+            let existingByID = Dictionary(uniqueKeysWithValues: existingRecords.map { ($0.id, $0) })
+            try SegmentRecord.filter(Column("meetingID") == snapshot.meetingID.uuidString).deleteAll(db)
+            for segment in snapshot.segments {
+                let existing = existingByID[segment.id]
+                var record = try SegmentRecord(
+                    segment,
+                    modelText: segment.text,
+                    isUserEdited: existing?.isUserEdited ?? false
+                )
+                if existing?.isUserEdited == true { record.text = existing!.text }
+                try record.insert(db)
+            }
+        }
+    }
+
+    /// Stores a canonical correction without discarding the latest ASR text.
+    public func editSegmentText(id: String, text: String) throws {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            throw PersistenceError.invalidSegment("edited text must not be empty")
+        }
+        try database.write { db in
+            guard let existing = try SegmentRecord.fetchOne(db, key: id) else {
+                throw PersistenceError.invalidSegment("segment \(id) does not exist")
+            }
+            try SegmentRecord
+                .filter(key: id)
+                .updateAll(
+                    db,
+                    Column("text").set(to: cleaned),
+                    Column("modelText").set(to: existing.modelText ?? existing.text),
+                    Column("isUserEdited").set(to: true)
+                )
+        }
+    }
+
+    public func segment(id: String) throws -> TranscriptSegment? {
+        try database.read { db in
+            try SegmentRecord.fetchOne(db, key: id)?.model()
+        }
+    }
+
+    public func segments(meetingID: UUID) throws -> [TranscriptSegment] {
+        try database.read { db in
+            try SegmentRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("startMilliseconds"), Column("source"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    @discardableResult
+    public func renameSpeaker(
+        meetingID: UUID,
+        speakerID: String,
+        to speakerName: String?
+    ) throws -> Int {
+        let cleanedName = speakerName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try database.write { db in
+            try SegmentRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .filter(Column("speakerID") == speakerID)
+                .updateAll(db, Column("speakerName").set(to: cleanedName?.isEmpty == true ? nil : cleanedName))
+        }
+    }
+
+    public func searchSegments(
+        _ query: String,
+        meetingID: UUID? = nil,
+        limit: Int = 100
+    ) throws -> [TranscriptSegment] {
+        let matchQuery = try Self.ftsMatchQuery(query)
+        return try database.read { db in
+            var sql = """
+                SELECT s.*
+                FROM transcriptSegments AS s
+                JOIN transcriptSegmentFTS AS fts ON fts.segmentID = s.id
+                WHERE transcriptSegmentFTS MATCH ?
+                """
+            var arguments: StatementArguments = [matchQuery]
+            if let meetingID {
+                sql += " AND s.meetingID = ?"
+                arguments += [meetingID.uuidString]
+            }
+            sql += " ORDER BY bm25(transcriptSegmentFTS), s.startMilliseconds LIMIT ?"
+            arguments += [max(1, limit)]
+            return try SegmentRecord.fetchAll(db, sql: sql, arguments: arguments).map { try $0.model() }
+        }
+    }
+
+    @discardableResult
+    public func saveInsightSnapshot(
+        meetingID: UUID,
+        providerID: String,
+        output: ValidatedMeetingInsights,
+        createdAt: Date = Date()
+    ) throws -> UUID {
+        guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PersistenceError.invalidProviderRun("provider ID must not be empty")
+        }
+        let snapshot = StoredInsightSnapshot(
+            id: UUID(),
+            meetingID: meetingID,
+            providerID: providerID,
+            createdAt: createdAt,
+            output: output
+        )
+        try database.write { db in
+            guard try MeetingRecord.fetchOne(db, key: meetingID.uuidString) != nil else {
+                throw PersistenceError.meetingNotFound(meetingID)
+            }
+            try InsightSnapshotRecord(snapshot).insert(db)
+        }
+        return snapshot.id
+    }
+
+    public func insightSnapshots(meetingID: UUID) throws -> [StoredInsightSnapshot] {
+        try database.read { db in
+            try InsightSnapshotRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("createdAt").desc)
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    @discardableResult
+    public func beginProviderRun(
+        meetingID: UUID,
+        providerID: String,
+        purpose: String,
+        at date: Date = Date()
+    ) throws -> UUID {
+        guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !purpose.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PersistenceError.invalidProviderRun("provider ID and purpose must not be empty")
+        }
+        let run = StoredProviderRun(
+            id: UUID(),
+            meetingID: meetingID,
+            providerID: providerID,
+            purpose: purpose,
+            startedAt: date,
+            finishedAt: nil,
+            status: .running,
+            errorMessage: nil
+        )
+        try database.write { db in
+            guard try MeetingRecord.fetchOne(db, key: meetingID.uuidString) != nil else {
+                throw PersistenceError.meetingNotFound(meetingID)
+            }
+            try ProviderRunRecord(run).insert(db)
+        }
+        return run.id
+    }
+
+    public func finishProviderRun(
+        id: UUID,
+        status: ProviderRunStatus,
+        errorMessage: String? = nil,
+        at date: Date = Date()
+    ) throws {
+        guard status != .running else {
+            throw PersistenceError.invalidProviderRun("a finished run cannot remain running")
+        }
+        try database.write { db in
+            let changed = try ProviderRunRecord
+                .filter(key: id.uuidString)
+                .updateAll(
+                    db,
+                    Column("finishedAt").set(to: date),
+                    Column("status").set(to: status.rawValue),
+                    Column("errorMessage").set(to: errorMessage)
+                )
+            guard changed == 1 else {
+                throw PersistenceError.corruptRecord("missing provider run \(id)")
+            }
+        }
+    }
+
+    public func providerRuns(meetingID: UUID) throws -> [StoredProviderRun] {
+        try database.read { db in
+            try ProviderRunRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("startedAt").desc)
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    /// Marks sessions that could not have completed a clean shutdown. CAF
+    /// tracks remain referenced so the finalization pipeline can resume.
+    @discardableResult
+    public func recoverInterruptedMeetings(at date: Date = Date()) throws -> [Meeting] {
+        try database.write { db in
+            let activeStatuses = [MeetingStatus.recording.rawValue, MeetingStatus.finalizing.rawValue]
+            let active = try MeetingRecord
+                .filter(activeStatuses.contains(Column("status")))
+                .fetchAll(db)
+            guard !active.isEmpty else { return [] }
+            let ids = active.map(\.id)
+            try MeetingRecord
+                .filter(ids.contains(Column("id")))
+                .updateAll(
+                    db,
+                    Column("status").set(to: MeetingStatus.interrupted.rawValue),
+                    Column("errorMessage").set(to: "The app closed before this meeting was finalized."),
+                    Column("updatedAt").set(to: date)
+                )
+            return try MeetingRecord.filter(ids.contains(Column("id"))).fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    /// Deletes the relational meeting graph in one transaction. Audio removal
+    /// is explicit and happens first so a filesystem failure never loses the DB
+    /// pointers required for a retry.
+    public func deleteMeeting(id: UUID, deleteAudioFiles: Bool = true) throws {
+        let tracks = try audioTracks(meetingID: id)
+        if deleteAudioFiles {
+            try Self.removeFiles(for: tracks)
+        }
+        try database.write { db in
+            let deleted = try MeetingRecord.deleteOne(db, key: id.uuidString)
+            guard deleted else { throw PersistenceError.meetingNotFound(id) }
+        }
+    }
+
+    /// Removes retained/recovery audio and its metadata together. Call this
+    /// after successful finalization when the meeting does not retain audio.
+    public func deleteAudioFiles(meetingID: UUID) throws {
+        let tracks = try audioTracks(meetingID: meetingID)
+        try Self.removeFiles(for: tracks)
+        _ = try database.write { db in
+            try AudioTrackRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .deleteAll(db)
+        }
+    }
+
+    private func validate(_ segments: [TranscriptSegment]) throws {
+        var ids = Set<String>()
+        for segment in segments {
+            guard !segment.id.isEmpty else {
+                throw PersistenceError.invalidSegment("IDs must not be empty")
+            }
+            guard ids.insert(segment.id).inserted else {
+                throw PersistenceError.invalidSegment("duplicate ID \(segment.id)")
+            }
+            guard segment.startMilliseconds >= 0,
+                  segment.endMilliseconds >= segment.startMilliseconds,
+                  segment.revision >= 0
+            else {
+                throw PersistenceError.invalidSegment("invalid timing or revision for \(segment.id)")
+            }
+        }
+    }
+
+    private static func ftsMatchQuery(_ rawQuery: String) throws -> String {
+        let tokens = rawQuery
+            .split(whereSeparator: { $0.isWhitespace })
+            .map { $0.replacingOccurrences(of: "\"", with: "\"\"") }
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { throw PersistenceError.invalidSearchQuery }
+        return tokens.map { "\"\($0)\"*" }.joined(separator: " AND ")
+    }
+
+    private static func removeFiles(for tracks: [MeetingAudioTrack]) throws {
+        let manager = FileManager.default
+        for track in tracks where manager.fileExists(atPath: track.fileURL.path) {
+            try manager.removeItem(at: track.fileURL)
+        }
+        let directories = Set(tracks.map { $0.fileURL.deletingLastPathComponent() })
+        for directory in directories {
+            if (try? manager.contentsOfDirectory(atPath: directory.path).isEmpty) == true {
+                try? manager.removeItem(at: directory)
+            }
+        }
+    }
+}

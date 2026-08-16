@@ -1,0 +1,10 @@
+.DS_Store
+.build/
+.swiftpm/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.caf
+*.m4a
+*.gguf
+
