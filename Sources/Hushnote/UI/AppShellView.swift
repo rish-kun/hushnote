@@ -6,8 +6,11 @@ struct AppShellView: View {
 
     var body: some View {
         @Bindable var state = state
+        // `filteredMeetings` runs two localizedStandardContains per meeting and
+        // was read twice in this body alone. Bind it once.
+        let meetings = state.filteredMeetings
 
-        NavigationSplitView {
+        return NavigationSplitView {
             List(selection: $state.selection) {
                 Section {
                     Label("Meetings", systemImage: "text.book.closed")
@@ -18,9 +21,9 @@ struct AppShellView: View {
                         .tag(SidebarDestination.settings)
                 }
 
-                if !state.filteredMeetings.isEmpty {
+                if !meetings.isEmpty {
                     Section("Recent") {
-                        ForEach(state.filteredMeetings.prefix(8)) { meeting in
+                        ForEach(meetings.prefix(8)) { meeting in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(meeting.title)
                                     .lineLimit(1)
@@ -35,8 +38,14 @@ struct AppShellView: View {
             }
             .navigationSplitViewColumnWidth(min: 220, ideal: HushnoteTheme.sidebarWidth, max: 300)
             .searchable(text: $state.searchText, placement: .sidebar, prompt: "Search meetings")
-            .onChange(of: state.searchText) { _, query in
-                Task { await coordinator.searchMeetings(query) }
+            // `.task(id:)` cancels the previous run, so a keystroke replaces the
+            // pending query instead of racing it: one FTS5 query per pause, not
+            // one per character.
+            .task(id: state.searchText) {
+                let query = state.searchText
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                await coordinator.searchMeetings(query)
             }
             .safeAreaInset(edge: .bottom) {
                 recordingSidebarFooter
@@ -160,8 +169,10 @@ struct AppShellView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(state.recordingPhase == .paused ? "Recording paused" : "Recording")
                             .font(.callout.weight(.semibold))
-                        Text(DurationText.clock(state.elapsed))
-                            .font(.caption.monospacedDigit())
+                        // A leaf view: without it this whole shell body -- and
+                        // the O(n) meeting filter in it -- re-evaluated once a
+                        // second for the length of the meeting.
+                        ElapsedTimeLabel(font: .caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -200,7 +211,9 @@ struct MeetingsHomeView: View {
     @Environment(AppCoordinator.self) private var coordinator
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let meetings = state.filteredMeetings
+
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Meeting notebook")
@@ -220,10 +233,10 @@ struct MeetingsHomeView: View {
 
             Divider().opacity(0.55)
 
-            if state.filteredMeetings.isEmpty {
+            if meetings.isEmpty {
                 emptyState
             } else {
-                meetingList
+                meetingList(meetings)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -253,10 +266,10 @@ struct MeetingsHomeView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 
-    private var meetingList: some View {
+    private func meetingList(_ meetings: [MeetingListItem]) -> some View {
         ScrollView {
             LazyVStack(spacing: 0) {
-                ForEach(state.filteredMeetings) { meeting in
+                ForEach(meetings) { meeting in
                     Button {
                         state.selection = .meeting(meeting.id)
                     } label: {

@@ -512,14 +512,14 @@ final class AppCoordinator {
     func searchMeetings(_ query: String) async {
         let cleaned = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else {
-            state.searchMatchedMeetingIDs = nil
+            state.applySearchMatches(nil, for: cleaned)
             return
         }
         do {
             let matches = try await store.searchSegments(cleaned, limit: 200)
-            state.searchMatchedMeetingIDs = Set(matches.map(\.meetingID))
+            state.applySearchMatches(Set(matches.map(\.meetingID)), for: cleaned)
         } catch {
-            state.searchMatchedMeetingIDs = []
+            state.applySearchMatches([], for: cleaned)
         }
     }
 

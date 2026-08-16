@@ -272,6 +272,17 @@ final class AppViewState {
         alert = nil
     }
 
+    /// Accepts a search result only if it answers what is currently typed.
+    ///
+    /// Debouncing cancels the previous query, but cancellation is not
+    /// instantaneous: a query already in flight can still return, and without
+    /// this the last one to finish wins regardless of what it was asking.
+    func applySearchMatches(_ ids: Set<UUID>?, for query: String) {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed else { return }
+        searchMatchedMeetingIDs = ids
+    }
+
     var finalizationLabel: String {
         finalizationDetail ?? finalizationStage?.title ?? "Finalizing transcript…"
     }
