@@ -5,6 +5,7 @@ struct HushnoteApp: App {
     @State private var state: AppViewState
     @State private var coordinator: AppCoordinator
     @State private var recordingPanel: FloatingRecordingPanelController
+    @NSApplicationDelegateAdaptor(HushnoteAppDelegate.self) private var appDelegate
 
     init() {
         let state = AppViewState()
@@ -17,6 +18,10 @@ struct HushnoteApp: App {
                 coordinator: coordinator
             )
         )
+        // Published before any window exists so ⌘Q is guarded even when the app
+        // is running from the menu bar alone.
+        HushnoteAppDelegate.state = state
+        HushnoteAppDelegate.coordinator = coordinator
     }
 
     var body: some Scene {
