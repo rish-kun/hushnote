@@ -1,6 +1,29 @@
 import Foundation
 import WhisperKit
 
+/// The single WhisperKit entry point the live engine depends on. Naming it lets
+/// tests drive buffering, windowing, cancellation and identifier minting without
+/// downloading a Core ML model.
+protocol LiveSpeechDecoder: Sendable {
+    func decodeWindow(
+        samples: [Float],
+        options: DecodingOptions
+    ) async throws -> [TranscriptionResult]
+}
+
+/// `WhisperKit` is a non-Sendable class. The engine holds exactly one instance,
+/// keeps it actor-confined, and never hands it to another isolation domain.
+private struct WhisperKitDecoder: LiveSpeechDecoder, @unchecked Sendable {
+    let kit: WhisperKit
+
+    func decodeWindow(
+        samples: [Float],
+        options: DecodingOptions
+    ) async throws -> [TranscriptionResult] {
+        try await kit.transcribe(audioArray: samples, decodeOptions: options)
+    }
+}
+
 public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     private struct SourceBuffer: Sendable {
         var samples: [Float] = []
@@ -8,6 +31,8 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         var lastSequenceNumber: Int64?
         var lastDecodedSampleCount = 0
         var revision = 0
+        /// Monotonic within one session; see `TranscriptIdentifier`.
+        var nextSegmentOrdinal = 0
         var stablePrefixCount = 0
         var segments: [TranscriptSegment] = []
         var isDecoding = false
@@ -21,13 +46,17 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         supportedAccelerators: [.cpu, .gpu, .neuralEngine]
     )
 
-    private var whisperKit: WhisperKit?
-    private var selectedModel: SpeechModel?
+    private var decoder: (any LiveSpeechDecoder)?
     private var configuration: TranscriptionSessionConfiguration?
     private var buffers: [AudioSource: SourceBuffer] = [:]
     private var continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
 
     public init() {}
+
+    /// Test seam. Production code reaches the engine through `load(model:)`.
+    init(decoder: some LiveSpeechDecoder) {
+        self.decoder = decoder
+    }
 
     public func load(model: SpeechModel) async throws {
         guard configuration == nil else { throw SpeechPipelineError.sessionAlreadyRunning }
@@ -40,14 +69,13 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             load: true,
             download: true
         )
-        whisperKit = try await WhisperKit(config)
-        selectedModel = model
+        decoder = WhisperKitDecoder(kit: try await WhisperKit(config))
     }
 
     public func start(
         configuration: TranscriptionSessionConfiguration
     ) async throws -> AsyncThrowingStream<TranscriptDelta, Error> {
-        guard whisperKit != nil, selectedModel != nil else {
+        guard decoder != nil else {
             throw SpeechPipelineError.modelNotLoaded
         }
         guard self.configuration == nil else {
@@ -123,7 +151,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     }
 
     private func decode(source: AudioSource, final: Bool) async throws {
-        guard let whisperKit, let configuration, var buffer = buffers[source] else {
+        guard let decoder, let configuration, var buffer = buffers[source] else {
             throw SpeechPipelineError.sessionNotRunning
         }
         guard !buffer.samples.isEmpty else {
@@ -149,19 +177,29 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         // re-entered while Core ML is running, so later frames may already have
         // been appended to the live source buffer when this call returns.
         let decodedSamples = buffer.samples
-        let result = try await whisperKit.transcribe(
-            audioArray: decodedSamples,
-            decodeOptions: options
+        let result = try await decoder.decodeWindow(
+            samples: decodedSamples,
+            options: options
         )
         let origin = buffer.firstFrameStartMilliseconds ?? 0
+        // Every decoded segment consumes one ordinal whether or not it survives
+        // filtering, so an identifier is never handed out twice.
+        let decoded = result.flatMap(\.segments)
+        var nextOrdinal = buffer.nextSegmentOrdinal + decoded.count
         // Keep the dependency segment type inferred here because this target's
         // domain model intentionally has the same concise name.
-        let mapped: [TranscriptSegment] = result.flatMap(\.segments).map { segment in
+        let mapped: [TranscriptSegment] = decoded.enumerated().map { offset, segment in
             let start = origin + milliseconds(segment.start)
             let end = origin + milliseconds(segment.end)
+            let id = TranscriptIdentifier.segment(
+                meetingID: configuration.meetingID,
+                source: source,
+                pass: .live,
+                ordinal: buffer.nextSegmentOrdinal + offset
+            )
             let words = (segment.words ?? []).enumerated().map { index, word in
                 TranscriptWord(
-                    id: "\(source.rawValue)-\(milliseconds(word.start) + origin)-\(index)",
+                    id: TranscriptIdentifier.word(segmentID: id, index: index),
                     text: word.word,
                     startMilliseconds: origin + milliseconds(word.start),
                     endMilliseconds: origin + milliseconds(word.end),
@@ -169,7 +207,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
                 )
             }
             return TranscriptSegment(
-                id: "\(source.rawValue)-\(start)-\(end)",
+                id: id,
                 meetingID: configuration.meetingID,
                 source: source,
                 revision: buffer.revision + 1,
@@ -203,9 +241,16 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
                 .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         {
             let duration = Int64(Double(decodedSamples.count) / 16.0)
+            let id = TranscriptIdentifier.segment(
+                meetingID: configuration.meetingID,
+                source: source,
+                pass: .live,
+                ordinal: nextOrdinal
+            )
+            nextOrdinal += 1
             hypothesis = [
                 TranscriptSegment(
-                    id: "\(source.rawValue)-\(origin)-\(origin + duration)",
+                    id: id,
                     meetingID: configuration.meetingID,
                     source: source,
                     revision: buffer.revision + 1,
@@ -218,6 +263,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
 
         var updatedBuffer = buffers[source] ?? buffer
         updatedBuffer.revision = buffer.revision + 1
+        updatedBuffer.nextSegmentOrdinal = nextOrdinal
         updatedBuffer.lastDecodedSampleCount = decodedSamples.count
         updatedBuffer.segments = hypothesis
         updatedBuffer.stablePrefixCount = final

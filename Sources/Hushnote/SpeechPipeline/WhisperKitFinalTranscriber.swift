@@ -43,13 +43,23 @@ public actor WhisperKitFinalTranscriber {
             guard index < ordered.count else { continue }
             let source = ordered[index].source
             let transcription = try result.get()
+            // One counter per source. Whisper's `(start, end)` is not unique, so
+            // identifiers must not be derived from it.
+            var ordinal = 0
             for item in transcription {
                 segments.append(contentsOf: item.segments.map { segment in
                     let start = milliseconds(segment.start)
                     let end = milliseconds(segment.end)
+                    let id = TranscriptIdentifier.segment(
+                        meetingID: meetingID,
+                        source: source,
+                        pass: .final,
+                        ordinal: ordinal
+                    )
+                    ordinal += 1
                     let words = (segment.words ?? []).enumerated().map { wordIndex, word in
                         TranscriptWord(
-                            id: "final-\(source.rawValue)-\(milliseconds(word.start))-\(wordIndex)",
+                            id: TranscriptIdentifier.word(segmentID: id, index: wordIndex),
                             text: word.word,
                             startMilliseconds: milliseconds(word.start),
                             endMilliseconds: milliseconds(word.end),
@@ -57,7 +67,7 @@ public actor WhisperKitFinalTranscriber {
                         )
                     }
                     return TranscriptSegment(
-                        id: "final-\(source.rawValue)-\(start)-\(end)",
+                        id: id,
                         meetingID: meetingID,
                         source: source,
                         revision: revision,
