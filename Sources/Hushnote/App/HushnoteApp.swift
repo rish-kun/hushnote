@@ -69,14 +69,14 @@ private struct MenuBarMeetingView: View {
 
     var body: some View {
         if state.recordingPhase.isCapturing {
-            Text(state.recordingPhase == .paused ? "Paused · \(DurationText.clock(state.elapsed))" : "Recording · \(DurationText.clock(state.elapsed))")
+            Text("\(RecordingStatusText.label(for: state.recordingPhase)) · \(DurationText.clock(state.elapsed))")
             Divider()
             Button(state.recordingPhase == .paused ? "Resume" : "Pause") {
                 Task { await coordinator.togglePause() }
             }
             Button("Stop and finalize") { Task { await coordinator.stopMeeting() } }
         } else if state.recordingPhase == .preparing {
-            Text("Starting recording…")
+            Text(RecordingStatusText.label(for: .preparing))
         } else if case .finalizing = state.recordingPhase {
             Text(state.finalizationLabel)
         } else {

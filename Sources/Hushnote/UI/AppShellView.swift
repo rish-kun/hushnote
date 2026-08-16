@@ -167,7 +167,7 @@ struct AppShellView: View {
                 HStack(spacing: 10) {
                     RecordingPulse(isActive: state.recordingPhase == .recording)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(state.recordingPhase == .paused ? "Recording paused" : "Recording")
+                        Text(RecordingStatusText.label(for: state.recordingPhase))
                             .font(.callout.weight(.semibold))
                         // A leaf view: without it this whole shell body -- and
                         // the O(n) meeting filter in it -- re-evaluated once a
@@ -189,7 +189,7 @@ struct AppShellView: View {
         } else if state.recordingPhase == .preparing {
             HStack(spacing: 10) {
                 ProgressView().controlSize(.small)
-                Text("Starting recording…").font(.callout.weight(.medium))
+                Text(RecordingStatusText.label(for: .preparing)).font(.callout.weight(.medium))
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -217,7 +217,7 @@ struct MeetingsHomeView: View {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Meeting notebook")
-                        .font(.system(size: 32, weight: .semibold, design: .serif))
+                        .font(HushnoteTheme.Font.pageTitle)
                     Text("Private recordings, accurate transcripts, useful follow-through.")
                         .foregroundStyle(.secondary)
                 }
@@ -247,7 +247,7 @@ struct MeetingsHomeView: View {
             EmptyMeetingIllustration()
             VStack(alignment: .leading, spacing: 14) {
                 Text(state.searchText.isEmpty ? "Nothing recorded yet" : "No matching notes")
-                    .font(.system(size: 24, weight: .semibold, design: .serif))
+                    .font(HushnoteTheme.Font.sectionTitle)
                 Text(state.searchText.isEmpty
                      ? "Start with your next call. Hushnote captures system audio locally, then turns the conversation into a cited working note."
                      : "Try a title, speaker, decision, or phrase from the transcript.")

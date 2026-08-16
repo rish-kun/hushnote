@@ -199,7 +199,7 @@ struct ModelManagerView: View {
             VStack(alignment: .leading, spacing: 30) {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("Speech models")
-                        .font(.system(size: 31, weight: .semibold, design: .serif))
+                        .font(HushnoteTheme.Font.pageTitle)
                     Text("Models are verified before they are loaded and never substituted silently.")
                         .foregroundStyle(.secondary)
                 }
@@ -227,8 +227,7 @@ struct ModelManagerView: View {
                 }
                 .padding(.top, 10)
             }
-            .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
-            .padding(38)
+            .pageChrome()
         }
     }
 
@@ -298,7 +297,7 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 36) {
                 Text("Settings")
-                    .font(.system(size: 31, weight: .semibold, design: .serif))
+                    .font(HushnoteTheme.Font.pageTitle)
 
                 settingsSection("PRIVACY") {
                     Toggle("Keep audio after finalization", isOn: $state.retainAudio)
@@ -361,8 +360,7 @@ struct SettingsView: View {
                         .buttonStyle(.bordered)
                 }
             }
-            .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
-            .padding(38)
+            .pageChrome()
         }
     }
 

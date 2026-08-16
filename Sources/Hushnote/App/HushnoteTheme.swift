@@ -126,8 +126,36 @@ enum HushnoteTheme {
     static let rule = color(.rule)
     static let inkFill = color(.inkFill)
 
+    /// The typographic scale. Every one of these was an inline literal, and the
+    /// same serif heading was written out three times at two different sizes.
+    enum Font {
+        /// The name of a screen.
+        static let pageTitle = SwiftUI.Font.system(size: 31, weight: .semibold, design: .serif)
+        /// The name of a meeting inside its live workspace, where the chrome
+        /// above it is already doing some of the work.
+        static let workspaceTitle = SwiftUI.Font.system(size: 21, weight: .semibold, design: .serif)
+        /// A section within a page.
+        static let sectionTitle = SwiftUI.Font.system(size: 24, weight: .semibold, design: .serif)
+        /// A heading inside a section.
+        static let subsectionTitle = SwiftUI.Font.system(size: 19, weight: .semibold, design: .serif)
+        /// Prose the user reads at length: notes, transcript, summary.
+        static let reading = SwiftUI.Font.system(size: 17, design: .serif)
+        static let readingLarge = SwiftUI.Font.system(size: 18, design: .serif)
+        /// An empty state's headline.
+        static let emptyStateTitle = SwiftUI.Font.system(size: 20, weight: .medium, design: .serif)
+    }
+
     static let sidebarWidth: CGFloat = 248
     static let contentMaxWidth: CGFloat = 940
+}
+
+extension View {
+    /// The standard page measure and margin. Repeated five times by hand, with
+    /// one page silently using a different width.
+    func pageChrome() -> some View {
+        frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
+            .padding(38)
+    }
 }
 
 struct PaperBackground: ViewModifier {

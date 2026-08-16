@@ -62,8 +62,8 @@ struct ActiveMeetingView: View {
                 RecordingPulse(isActive: state.recordingPhase == .recording)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(state.activeMeeting?.title ?? "Untitled meeting")
-                        .font(.system(size: 21, weight: .semibold, design: .serif))
-                    Text(state.recordingPhase == .paused ? "Capture paused" : "Recording locally")
+                        .font(HushnoteTheme.Font.workspaceTitle)
+                    Text(RecordingStatusText.detail(for: state.recordingPhase))
                         .font(.caption)
                         .foregroundStyle(state.recordingPhase == .paused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilionInk))
                 }
@@ -118,7 +118,7 @@ struct ActiveMeetingView: View {
                         .font(.system(size: 28, weight: .light))
                         .foregroundStyle(HushnoteTheme.vermilionInk)
                     Text("Listening for the conversation…")
-                        .font(.system(size: 20, weight: .medium, design: .serif))
+                        .font(HushnoteTheme.Font.emptyStateTitle)
                     Text("The source tracks are already being written to disk.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -145,7 +145,7 @@ struct CompletedMeetingView: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(meeting?.title ?? "Meeting")
-                        .font(.system(size: 31, weight: .semibold, design: .serif))
+                        .font(HushnoteTheme.Font.pageTitle)
                     HStack(spacing: 8) {
                         if let meeting {
                             Text(meeting.startedAt, format: .dateTime.weekday(.wide).month(.wide).day().hour().minute())
@@ -242,7 +242,7 @@ struct CompletedMeetingView: View {
             VStack(alignment: .leading, spacing: 30) {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Meeting summary")
-                        .font(.system(size: 24, weight: .semibold, design: .serif))
+                        .font(HushnoteTheme.Font.sectionTitle)
                     Spacer()
                     ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
                     Button(state.insights.isGenerating ? "Generating…" : (state.insights.summary.isEmpty ? "Generate summary" : "Regenerate")) {
@@ -271,7 +271,7 @@ struct CompletedMeetingView: View {
                     .padding(.vertical, 28)
                 } else {
                     Text(state.insights.summary)
-                        .font(.system(size: 18, design: .serif))
+                        .font(HushnoteTheme.Font.readingLarge)
                         .lineSpacing(6)
                         .textSelection(.enabled)
                     summaryList("Decisions", items: state.insights.decisions, symbol: "checkmark.seal")
@@ -279,8 +279,7 @@ struct CompletedMeetingView: View {
                     summaryList("Open questions", items: state.insights.openQuestions, symbol: "questionmark.circle")
                 }
             }
-            .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
-            .padding(38)
+            .pageChrome()
         }
     }
 
@@ -289,7 +288,7 @@ struct CompletedMeetingView: View {
         if !items.isEmpty {
             VStack(alignment: .leading, spacing: 13) {
                 Text(title)
-                    .font(.system(size: 19, weight: .semibold, design: .serif))
+                    .font(HushnoteTheme.Font.subsectionTitle)
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     Label {
                         Text(item).textSelection(.enabled)
@@ -314,7 +313,7 @@ struct MeetingNotesView: View {
             get: { state.meetingNotes[meetingID, default: ""] },
             set: { coordinator.queueMeetingNotes(meetingID: meetingID, text: $0) }
         ))
-        .font(.system(size: 17, design: .serif))
+        .font(HushnoteTheme.Font.reading)
         .lineSpacing(6)
         .scrollContentBackground(.hidden)
         .padding(.horizontal, 38)
@@ -322,7 +321,7 @@ struct MeetingNotesView: View {
         .overlay(alignment: .topLeading) {
             if state.meetingNotes[meetingID, default: ""].isEmpty {
                 Text("Write notes while the meeting runs…")
-                    .font(.system(size: 17, design: .serif))
+                    .font(HushnoteTheme.Font.reading)
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 43)
                     .padding(.vertical, 36)
@@ -487,7 +486,7 @@ struct AskMeetingView: View {
 
         VStack(alignment: .leading, spacing: 24) {
             Text("Ask the meeting")
-                .font(.system(size: 24, weight: .semibold, design: .serif))
+                .font(HushnoteTheme.Font.sectionTitle)
             ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
 
             HStack(alignment: .bottom, spacing: 10) {
@@ -536,7 +535,6 @@ struct AskMeetingView: View {
 
             Spacer()
         }
-        .frame(maxWidth: 760, alignment: .leading)
-        .padding(38)
+        .pageChrome()
     }
 }

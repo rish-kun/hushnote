@@ -1,5 +1,54 @@
 import SwiftUI
 
+/// The one wording for each recording state.
+///
+/// This row is drawn in four places -- the floating pill, the sidebar footer,
+/// the workspace header and the menu bar -- and they used to disagree about
+/// what to call the same state.
+enum RecordingStatusText {
+    /// The compact form, for a pill or a menu item.
+    nonisolated static func label(for phase: RecordingPhase) -> String {
+        switch phase {
+        case .idle: ""
+        case .preparing: "Starting recording…"
+        case .recording: "Recording"
+        case .paused: "Recording paused"
+        case .finalizing: "Finalizing"
+        case .failed: "Recording stopped"
+        }
+    }
+
+    /// The roomy form, for a workspace header that has space to keep the
+    /// promise the app is built on.
+    nonisolated static func detail(for phase: RecordingPhase) -> String {
+        switch phase {
+        case .recording: "Recording locally to this Mac"
+        case .paused: "Capture paused. Audio already recorded is safe."
+        default: label(for: phase)
+        }
+    }
+}
+
+/// How full a level meter is. Shared, because the two meters disagreed about
+/// their own thresholds and only one of them clamped.
+enum LevelMeterModel {
+    nonisolated static func activeBars(level: Double, count: Int) -> Int {
+        Int((clamp(level) * Double(count)).rounded(.down))
+    }
+
+    nonisolated static func isBarActive(_ index: Int, level: Double, count: Int) -> Bool {
+        index < activeBars(level: level, count: count)
+    }
+
+    nonisolated static func percentage(_ level: Double) -> Int {
+        Int((clamp(level) * 100).rounded())
+    }
+
+    private nonisolated static func clamp(_ level: Double) -> Double {
+        min(max(level, 0), 1)
+    }
+}
+
 /// A compact, application-wide recording controller hosted in the floating panel.
 /// The pill owns its phase visibility so its host only needs to supply the app
 /// environment.
@@ -11,7 +60,7 @@ struct RecordingPill: View {
         Group {
             switch state.recordingPhase {
             case .preparing:
-                progressPill(title: "Starting recording…", accessibilityLabel: "Starting recording")
+                progressPill(title: RecordingStatusText.label(for: .preparing), accessibilityLabel: "Starting recording")
             case .recording, .paused:
                 capturePill
             case .finalizing:
@@ -31,7 +80,7 @@ struct RecordingPill: View {
         return HStack(spacing: 10) {
             RecordingPulse(isActive: !isPaused)
 
-            Text(isPaused ? "Paused" : "Recording")
+            Text(RecordingStatusText.label(for: state.recordingPhase))
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(isPaused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilionInk))
 
@@ -121,15 +170,11 @@ private struct MiniAudioLevel: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label) level")
-        .accessibilityValue("\(Int(clampedLevel * 100)) percent")
-    }
-
-    private var clampedLevel: Double {
-        min(max(level, 0), 1)
+        .accessibilityValue("\(LevelMeterModel.percentage(level)) percent")
     }
 
     private func isActive(_ index: Int) -> Bool {
-        clampedLevel >= Double(index + 1) / Double(barCount)
+        LevelMeterModel.isBarActive(index, level: level, count: barCount)
     }
 }
 
@@ -196,14 +241,14 @@ struct LevelMeter: View {
             HStack(alignment: .center, spacing: 3) {
                 ForEach(0..<bars, id: \.self) { index in
                     Capsule(style: .continuous)
-                        .fill(Double(index) / Double(bars) < level ? tint : Color.secondary.opacity(0.15))
+                        .fill(LevelMeterModel.isBarActive(index, level: level, count: bars) ? tint : Color.secondary.opacity(0.15))
                         .frame(width: 3, height: CGFloat(5 + (index % 4) * 3))
                 }
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label) audio level")
-        .accessibilityValue("\(Int(level * 100)) percent")
+        .accessibilityValue("\(LevelMeterModel.percentage(level)) percent")
     }
 }
 
@@ -379,4 +424,70 @@ struct ProviderDisclosure: View {
         .font(.caption)
         .foregroundStyle(isLocal ? HushnoteTheme.moss : .secondary)
     }
+}
+
+// MARK: - Previews
+
+/// Four values across the boundary that had no hours field. Seeing them side by
+/// side is how `135:00` would have been caught on sight.
+#Preview("Timestamps") {
+    VStack(alignment: .leading, spacing: 14) {
+        ForEach([0, 59, 3_912, 8_100] as [TimeInterval], id: \.self) { seconds in
+            HStack(spacing: 16) {
+                TimestampButton(seconds: seconds)
+                TimestampButton(seconds: seconds) {}
+                Text(DurationText.spoken(seconds))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+    .padding(28)
+}
+
+#Preview("Level meters") {
+    VStack(alignment: .leading, spacing: 18) {
+        ForEach([0, 0.25, 0.5, 1.0, 1.6] as [Double], id: \.self) { level in
+            HStack(spacing: 20) {
+                LevelMeter(level: level, label: "System", tint: HushnoteTheme.vermilion)
+                Text("\(LevelMeterModel.percentage(level))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+    .padding(28)
+}
+
+#Preview("Recording states") {
+    VStack(alignment: .leading, spacing: 16) {
+        let phases: [RecordingPhase] = [
+            .preparing, .recording, .paused, .finalizing(0.6), .failed("Capture stopped")
+        ]
+        ForEach(Array(phases.enumerated()), id: \.offset) { _, phase in
+            HStack(spacing: 12) {
+                RecordingPulse(isActive: phase == .recording)
+                Text(RecordingStatusText.label(for: phase))
+                    .font(.callout.weight(.semibold))
+                Text(RecordingStatusText.detail(for: phase))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+    .padding(28)
+}
+
+#Preview("Provider disclosure") {
+    VStack(alignment: .leading, spacing: 14) {
+        ProviderDisclosure(isLocal: true)
+        ProviderDisclosure(isLocal: false)
+    }
+    .padding(28)
+}
+
+#Preview("Empty meeting") {
+    EmptyMeetingIllustration()
+        .padding(40)
+        .paperBackground()
 }
