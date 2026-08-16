@@ -232,6 +232,25 @@ enum FailureRoute: Equatable {
     }
 }
 
+/// Whether a reload of a meeting may replace the notes buffer on screen.
+///
+/// A note is edited into memory and written to the database on a debounce, so
+/// between the keystroke and the write the buffer is newer than the row. A
+/// reload during that window must not read the row back over it.
+enum NoteReloadPolicy {
+    nonisolated static func shouldAdopt(
+        stored: String,
+        current: String?,
+        hasPendingSave: Bool
+    ) -> Bool {
+        // An unsaved edit always outranks the row it has not reached yet.
+        guard !hasPendingSave else { return false }
+        // Nothing loaded yet is different from a note deliberately emptied.
+        guard let current else { return true }
+        return stored != current
+    }
+}
+
 @MainActor
 @Observable
 final class AppViewState {

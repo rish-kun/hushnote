@@ -398,7 +398,12 @@ final class AppCoordinator {
         do {
             let segments = try await store.segments(meetingID: id)
             let snapshots = try await store.insightSnapshots(meetingID: id)
-            if let meeting = try await store.meeting(id: id) {
+            if let meeting = try await store.meeting(id: id),
+               NoteReloadPolicy.shouldAdopt(
+                   stored: meeting.notes,
+                   current: state.meetingNotes[id],
+                   hasPendingSave: pendingNoteTasks[id] != nil
+               ) {
                 state.meetingNotes[id] = meeting.notes
             }
             if let latest = snapshots.first {
