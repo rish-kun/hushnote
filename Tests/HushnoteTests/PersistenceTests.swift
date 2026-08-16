@@ -315,8 +315,14 @@ final class PersistenceTests: XCTestCase {
         let store = try MeetingStore(inMemory: ())
         let meeting = Meeting(title: "Editing")
         try await store.saveMeeting(meeting)
+        let liveID = TranscriptIdentifier.segment(
+            meetingID: meeting.id,
+            source: .microphone,
+            pass: .live,
+            ordinal: 0
+        )
         var segment = TranscriptSegment(
-            id: "edited-segment",
+            id: liveID,
             meetingID: meeting.id,
             source: .microphone,
             revision: 1,
@@ -334,16 +340,146 @@ final class PersistenceTests: XCTestCase {
         let afterUpsert = try await store.segment(id: segment.id)
         XCTAssertEqual(afterUpsert?.text, "User correction")
 
-        segment.revision = 3
-        segment.text = "final machine text"
-        segment.stability = .final
-        try await store.replaceTranscript(TranscriptSnapshot(
+        // The final pass mints its own identifiers and re-runs VAD, so neither
+        // the ID nor the segment boundaries line up with the live transcript.
+        let finalID = TranscriptIdentifier.segment(
+            meetingID: meeting.id,
+            source: .microphone,
+            pass: .final,
+            ordinal: 0
+        )
+        var finalSegment = segment
+        finalSegment.id = finalID
+        finalSegment.revision = 3
+        finalSegment.startMilliseconds = 40
+        finalSegment.endMilliseconds = 560
+        finalSegment.text = "final machine text"
+        finalSegment.stability = .final
+        let report = try await store.replaceTranscript(TranscriptSnapshot(
             meetingID: meeting.id,
             revision: 3,
-            segments: [segment]
+            segments: [finalSegment]
         ))
-        let afterFinal = try await store.segment(id: segment.id)
+
+        let afterFinal = try await store.segment(id: finalID)
         XCTAssertEqual(afterFinal?.text, "User correction")
+        XCTAssertEqual(afterFinal?.startMilliseconds, 40)
+        XCTAssertEqual(report.preserved.map(\.segmentID), [finalID])
+        XCTAssertEqual(report.preserved.map(\.previousSegmentID), [liveID])
+        XCTAssertTrue(report.orphaned.isEmpty)
+        let staleLiveRow = try await store.segment(id: liveID)
+        XCTAssertNil(staleLiveRow)
+
+        // The edit flag must travel with the text, or the next automated write
+        // silently reverts the correction.
+        finalSegment.revision = 4
+        finalSegment.text = "another machine pass"
+        try await store.upsertSegments([finalSegment])
+        let afterReupsert = try await store.segment(id: finalID)
+        XCTAssertEqual(afterReupsert?.text, "User correction")
+    }
+
+    func testUnmatchedUserEditIsKeptRatherThanDeleted() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let meeting = Meeting(title: "Orphaned edit")
+        try await store.saveMeeting(meeting)
+        let liveID = TranscriptIdentifier.segment(
+            meetingID: meeting.id,
+            source: .system,
+            pass: .live,
+            ordinal: 7
+        )
+        try await store.upsertSegments([TranscriptSegment(
+            id: liveID,
+            meetingID: meeting.id,
+            source: .system,
+            revision: 1,
+            startMilliseconds: 60_000,
+            endMilliseconds: 62_000,
+            text: "machine draft",
+            stability: .stable
+        )])
+        try await store.editSegmentText(id: liveID, text: "Ship on the fourteenth")
+
+        // The final pass found no speech anywhere near the corrected range.
+        let finalID = TranscriptIdentifier.segment(
+            meetingID: meeting.id,
+            source: .system,
+            pass: .final,
+            ordinal: 0
+        )
+        let report = try await store.replaceTranscript(TranscriptSnapshot(
+            meetingID: meeting.id,
+            revision: 2,
+            segments: [TranscriptSegment(
+                id: finalID,
+                meetingID: meeting.id,
+                source: .system,
+                revision: 2,
+                startMilliseconds: 0,
+                endMilliseconds: 4_000,
+                text: "unrelated opening remarks",
+                stability: .final
+            )]
+        ))
+
+        let stored = try await store.segments(meetingID: meeting.id)
+        XCTAssertEqual(stored.map(\.text), ["unrelated opening remarks", "Ship on the fourteenth"])
+        XCTAssertEqual(report.orphaned.map(\.text), ["Ship on the fourteenth"])
+        XCTAssertTrue(report.preserved.isEmpty)
+    }
+
+    func testUserEditLandsOnOneSegmentOnly() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let meeting = Meeting(title: "Split segment")
+        try await store.saveMeeting(meeting)
+        let liveID = TranscriptIdentifier.segment(
+            meetingID: meeting.id,
+            source: .system,
+            pass: .live,
+            ordinal: 0
+        )
+        try await store.upsertSegments([TranscriptSegment(
+            id: liveID,
+            meetingID: meeting.id,
+            source: .system,
+            revision: 1,
+            startMilliseconds: 0,
+            endMilliseconds: 2_000,
+            text: "machine draft",
+            stability: .stable
+        )])
+        try await store.editSegmentText(id: liveID, text: "Corrected line")
+
+        // The final pass splits the same audio into two segments. Only the one
+        // that actually covers the correction may inherit it.
+        let segments = (0..<2).map { index in
+            TranscriptSegment(
+                id: TranscriptIdentifier.segment(
+                    meetingID: meeting.id,
+                    source: .system,
+                    pass: .final,
+                    ordinal: index
+                ),
+                meetingID: meeting.id,
+                source: .system,
+                revision: 2,
+                startMilliseconds: Int64(index) * 1_800,
+                endMilliseconds: Int64(index) * 1_800 + 1_800,
+                text: "final part \(index)",
+                stability: .final
+            )
+        }
+        let report = try await store.replaceTranscript(TranscriptSnapshot(
+            meetingID: meeting.id,
+            revision: 2,
+            segments: segments
+        ))
+
+        let stored = try await store.segments(meetingID: meeting.id)
+        XCTAssertEqual(stored.map(\.text), ["Corrected line", "final part 1"])
+        XCTAssertEqual(report.preserved.count, 1)
+        XCTAssertTrue(report.orphaned.isEmpty)
     }
 
     func testSegmentIDCannotMoveAcrossMeetings() async throws {

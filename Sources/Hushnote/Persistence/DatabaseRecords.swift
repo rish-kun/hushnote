@@ -253,6 +253,35 @@ struct ProviderRunRecord: Codable, FetchableRecord, PersistableRecord, TableReco
     }
 }
 
+/// One correction carried from the previous transcript onto the new one.
+public struct PreservedUserEdit: Equatable, Sendable {
+    /// The segment the user actually edited, which no longer exists.
+    public var previousSegmentID: String
+    /// The segment in the new transcript that inherited the correction.
+    public var segmentID: String
+    public var text: String
+
+    public init(previousSegmentID: String, segmentID: String, text: String) {
+        self.previousSegmentID = previousSegmentID
+        self.segmentID = segmentID
+        self.text = text
+    }
+}
+
+/// What `MeetingStore.replaceTranscript` did with the user's corrections.
+public struct TranscriptReplacementReport: Equatable, Sendable {
+    public var preserved: [PreservedUserEdit]
+    /// Corrections that overlap nothing in the new transcript. Their rows are
+    /// kept verbatim instead of being deleted, and are reported here so a caller
+    /// can tell the user the newest ASR pass disagrees with them.
+    public var orphaned: [TranscriptSegment]
+
+    public init(preserved: [PreservedUserEdit] = [], orphaned: [TranscriptSegment] = []) {
+        self.preserved = preserved
+        self.orphaned = orphaned
+    }
+}
+
 public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     case meetingNotFound(UUID)
     case invalidSegment(String)

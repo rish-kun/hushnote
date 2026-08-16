@@ -154,32 +154,152 @@ public actor MeetingStore {
     }
 
     /// Atomically replaces one meeting's transcript after the final ASR pass.
-    public func replaceTranscript(_ snapshot: TranscriptSnapshot) throws {
+    ///
+    /// User corrections cannot be carried over by segment ID. The final pass
+    /// mints its own identifiers and re-runs VAD, so neither the ID nor the
+    /// segment boundaries match the live transcript the user was editing. Each
+    /// correction is therefore re-keyed onto the incoming segment it overlaps
+    /// most, and an edit that matches nothing is kept rather than deleted.
+    @discardableResult
+    public func replaceTranscript(_ snapshot: TranscriptSnapshot) throws -> TranscriptReplacementReport {
         try validate(snapshot.segments)
         guard snapshot.segments.allSatisfy({ $0.meetingID == snapshot.meetingID }) else {
             throw PersistenceError.invalidSegment("snapshot meeting IDs do not match")
         }
-        try database.write { db in
+        return try database.write { db in
             guard try MeetingRecord.fetchOne(db, key: snapshot.meetingID.uuidString) != nil else {
                 throw PersistenceError.meetingNotFound(snapshot.meetingID)
             }
             let existingRecords = try SegmentRecord
                 .filter(Column("meetingID") == snapshot.meetingID.uuidString)
                 .fetchAll(db)
-            let existingByID = Dictionary(uniqueKeysWithValues: existingRecords.map { ($0.id, $0) })
+            let edits = existingRecords.filter(\.isUserEdited)
+            let matches = Self.matchEdits(edits, to: snapshot.segments)
             try SegmentRecord.filter(Column("meetingID") == snapshot.meetingID.uuidString).deleteAll(db)
+
+            var preserved: [PreservedUserEdit] = []
+            var usedIDs = Set(snapshot.segments.map(\.id))
             for segment in snapshot.segments {
-                let existing = existingByID[segment.id]
+                let edit = matches[segment.id]
                 var record = try SegmentRecord(
                     segment,
                     modelText: segment.text,
-                    isUserEdited: existing?.isUserEdited ?? false
+                    isUserEdited: edit != nil
                 )
-                if existing?.isUserEdited == true { record.text = existing!.text }
+                if let edit {
+                    record.text = edit.text
+                    preserved.append(PreservedUserEdit(
+                        previousSegmentID: edit.id,
+                        segmentID: segment.id,
+                        text: edit.text
+                    ))
+                }
                 try record.insert(db)
             }
+
+            // An edit with nowhere to go is authored content, so the row stays.
+            // Losing it silently is worse than a transcript that briefly holds
+            // one segment the newest ASR pass no longer agrees with.
+            let matchedEditIDs = Set(matches.values.map(\.id))
+            var orphaned: [TranscriptSegment] = []
+            for edit in edits where !matchedEditIDs.contains(edit.id) {
+                var record = edit
+                record.revision = max(record.revision, snapshot.revision)
+                record.id = Self.availableID(basedOn: edit.id, taken: &usedIDs)
+                try record.insert(db)
+                orphaned.append(try record.model())
+            }
+            return TranscriptReplacementReport(preserved: preserved, orphaned: orphaned)
         }
     }
+
+    /// Greedy one-to-one assignment of corrections to incoming segments, best
+    /// overlap first, so a correction is never duplicated across a split.
+    private static func matchEdits(
+        _ edits: [SegmentRecord],
+        to segments: [TranscriptSegment]
+    ) -> [String: SegmentRecord] {
+        struct Candidate {
+            let editIndex: Int
+            let segmentIndex: Int
+            let ratio: Double
+            let overlap: Int64
+            let centerDistance: Int64
+        }
+
+        var candidates: [Candidate] = []
+        for (editIndex, edit) in edits.enumerated() {
+            for (segmentIndex, segment) in segments.enumerated()
+            where edit.source == segment.source.rawValue {
+                let overlap = max(
+                    0,
+                    min(edit.endMilliseconds, segment.endMilliseconds)
+                        - max(edit.startMilliseconds, segment.startMilliseconds)
+                )
+                let editDuration = edit.endMilliseconds - edit.startMilliseconds
+                let segmentDuration = segment.endMilliseconds - segment.startMilliseconds
+                let shortest = min(editDuration, segmentDuration)
+                let ratio: Double
+                if shortest <= 0 {
+                    // Zero-duration segments are legal, so fall back to
+                    // containment: a point inside the range still matches.
+                    let contained = edit.startMilliseconds >= segment.startMilliseconds
+                        && edit.startMilliseconds <= segment.endMilliseconds
+                    ratio = contained ? 1 : 0
+                } else {
+                    ratio = Double(overlap) / Double(shortest)
+                }
+                guard ratio >= minimumEditOverlapRatio else { continue }
+                let editCenter = edit.startMilliseconds + editDuration / 2
+                let segmentCenter = segment.startMilliseconds + segmentDuration / 2
+                candidates.append(Candidate(
+                    editIndex: editIndex,
+                    segmentIndex: segmentIndex,
+                    ratio: ratio,
+                    overlap: overlap,
+                    centerDistance: abs(editCenter - segmentCenter)
+                ))
+            }
+        }
+
+        candidates.sort { lhs, rhs in
+            if lhs.ratio != rhs.ratio { return lhs.ratio > rhs.ratio }
+            if lhs.overlap != rhs.overlap { return lhs.overlap > rhs.overlap }
+            if lhs.centerDistance != rhs.centerDistance {
+                return lhs.centerDistance < rhs.centerDistance
+            }
+            if lhs.segmentIndex != rhs.segmentIndex { return lhs.segmentIndex < rhs.segmentIndex }
+            return lhs.editIndex < rhs.editIndex
+        }
+
+        var matches: [String: SegmentRecord] = [:]
+        var claimedEdits = Set<Int>()
+        for candidate in candidates {
+            guard !claimedEdits.contains(candidate.editIndex) else { continue }
+            let segment = segments[candidate.segmentIndex]
+            guard matches[segment.id] == nil else { continue }
+            matches[segment.id] = edits[candidate.editIndex]
+            claimedEdits.insert(candidate.editIndex)
+        }
+        return matches
+    }
+
+    /// A retained edit must not collide with the incoming transcript, whose
+    /// identifiers are deterministic and can repeat across finalization attempts.
+    private static func availableID(basedOn id: String, taken: inout Set<String>) -> String {
+        var candidate = id
+        var suffix = 1
+        while taken.contains(candidate) {
+            candidate = "\(id)-kept-\(suffix)"
+            suffix += 1
+        }
+        taken.insert(candidate)
+        return candidate
+    }
+
+    /// A correction is re-keyed only when it covers at least half of the shorter
+    /// of the two ranges. Below that the two segments are different utterances.
+    private static let minimumEditOverlapRatio = 0.5
 
     /// Stores a canonical correction without discarding the latest ASR text.
     public func editSegmentText(id: String, text: String) throws {
