@@ -6,10 +6,55 @@ public enum FinalTranscriptionProgress: Sendable {
     case transcribing
 }
 
+/// The single WhisperKit entry point the final pass depends on. It deliberately
+/// keeps the per-path `Result`, because partial success is the whole point when
+/// recovering a damaged recording.
+protocol FinalSpeechDecoder: Sendable {
+    func decodeFiles(
+        paths: [String],
+        options: DecodingOptions
+    ) async -> [Result<[TranscriptionResult], any Error>]
+}
+
+/// `WhisperKit` is a non-Sendable class. The transcriber builds one, keeps it
+/// actor-confined for the length of one pass, and then releases it.
+private struct WhisperKitFileDecoder: FinalSpeechDecoder, @unchecked Sendable {
+    let kit: WhisperKit
+
+    func decodeFiles(
+        paths: [String],
+        options: DecodingOptions
+    ) async -> [Result<[TranscriptionResult], any Error>] {
+        await kit.transcribeWithResults(audioPaths: paths, decodeOptions: options)
+    }
+}
+
 /// Accuracy-first full-file ASR used after capture stops. It owns its model so
 /// the live engine can be released before finalization begins.
 public actor WhisperKitFinalTranscriber {
-    public init() {}
+    private let injectedDecoder: (any FinalSpeechDecoder)?
+
+    public init() {
+        injectedDecoder = nil
+    }
+
+    /// Test seam. Production code always loads a real model.
+    init(decoder: some FinalSpeechDecoder) {
+        injectedDecoder = decoder
+    }
+
+    static func modelConfiguration(for model: SpeechModel) -> WhisperKitConfig {
+        WhisperKitConfig(
+            model: model.runtimeIdentifier,
+            verbose: false,
+            // Prewarming halves peak compilation memory at the cost of doubling
+            // load time. This model is loaded, used for one pass and released,
+            // so the user only ever sees the cost.
+            prewarm: false,
+            load: true,
+            download: true
+        )
+    }
 
     public func transcribe(
         meetingID: UUID,
@@ -20,18 +65,19 @@ public actor WhisperKitFinalTranscriber {
         progress: (@Sendable (FinalTranscriptionProgress) async -> Void)? = nil
     ) async throws -> TranscriptSnapshot {
         await progress?(.loadingModel)
-        let kit = try await WhisperKit(WhisperKitConfig(
-            model: model.runtimeIdentifier,
-            verbose: false,
-            prewarm: true,
-            load: true,
-            download: true
-        ))
+        let decoder: any FinalSpeechDecoder
+        if let injectedDecoder {
+            decoder = injectedDecoder
+        } else {
+            decoder = WhisperKitFileDecoder(
+                kit: try await WhisperKit(Self.modelConfiguration(for: model))
+            )
+        }
         await progress?(.transcribing)
         let ordered = tracks.sorted { $0.source.rawValue < $1.source.rawValue }
-        let results = await kit.transcribeWithResults(
-            audioPaths: ordered.map { $0.fileURL.path },
-            decodeOptions: DecodingOptions(
+        let results = await decoder.decodeFiles(
+            paths: ordered.map { $0.fileURL.path },
+            options: DecodingOptions(
                 language: languageCode,
                 wordTimestamps: true,
                 chunkingStrategy: .vad
@@ -39,10 +85,22 @@ public actor WhisperKitFinalTranscriber {
         )
 
         var segments: [TranscriptSegment] = []
+        var failures: [any Error] = []
         for (index, result) in results.enumerated() {
             guard index < ordered.count else { continue }
             let source = ordered[index].source
-            let transcription = try result.get()
+            let transcription: [TranscriptionResult]
+            switch result {
+            case .success(let value):
+                transcription = value
+            case .failure(let error):
+                // WhisperKit reports one result per path so a partially damaged
+                // recording can still be salvaged. Throwing on the first failure
+                // discarded every track that had decoded successfully, which is
+                // total data loss on exactly the recordings that need recovery.
+                failures.append(error)
+                continue
+            }
             // One counter per source. Whisper's `(start, end)` is not unique, so
             // identifiers must not be derived from it.
             var ordinal = 0
@@ -82,7 +140,10 @@ public actor WhisperKitFinalTranscriber {
             }
         }
 
-        guard !segments.isEmpty else { throw SpeechPipelineError.noTranscriptionResult }
+        guard !segments.isEmpty else {
+            if let failure = failures.first { throw failure }
+            throw SpeechPipelineError.noTranscriptionResult
+        }
         return TranscriptSnapshot(
             meetingID: meetingID,
             revision: revision,
