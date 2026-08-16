@@ -838,8 +838,9 @@ final class AppCoordinator {
         let directory = applicationDataURL
             .appending(path: "RecoveryAudio", directoryHint: .isDirectory)
             .appending(path: meetingID.uuidString, directoryHint: .isDirectory)
-        let url = directory.appending(path: "system.caf")
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        // A meeting may hold several takes if capture was retried; recover the
+        // longest one. Pre-take `system.caf` recordings are still found.
+        guard let url = AudioPipeline.longestTake(in: directory) else { return }
         let file = try AVAudioFile(forReading: url)
         let milliseconds = Int64((Double(file.length) / file.processingFormat.sampleRate * 1_000).rounded())
         try await store.saveAudioTrack(.init(

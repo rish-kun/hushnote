@@ -35,13 +35,17 @@ public actor AudioPipeline {
         updateStatus(.preparing)
 
         let directory = rootDirectory.appending(path: id.uuidString, directoryHint: .isDirectory)
-        let systemURL = directory.appending(path: "system.caf")
 
         do {
             try FileManager.default.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true
             )
+
+            // A meeting can be started more than once — the failure banner offers
+            // "Try Again" against the same meeting ID. Each attempt gets its own
+            // take so a retry can never destroy the audio of the attempt before it.
+            let systemURL = try Self.allocateTakeURL(in: directory)
 
             let output = try CaptureOutputBridge(
                 systemAudioURL: systemURL,
@@ -119,6 +123,44 @@ public actor AudioPipeline {
         resetSession()
         updateStatus(.stopped)
         return artifacts
+    }
+
+    /// Reserves the next unused take inside a meeting's recovery directory.
+    ///
+    /// `AVAudioFile(forWriting:)` truncates on open, so reusing one filename would
+    /// destroy the previous attempt's audio the instant a retry began — before
+    /// capture had even restarted, and even if the retry then failed.
+    static func allocateTakeURL(in directory: URL, fileManager: FileManager = .default) throws -> URL {
+        for index in 0..<10_000 {
+            let candidate = directory.appending(path: "system-\(index).caf")
+            if !fileManager.fileExists(atPath: candidate.path) { return candidate }
+        }
+        throw AudioPipelineError.writerFailed(
+            "no unused recovery take remains in \(directory.lastPathComponent)"
+        )
+    }
+
+    /// The take holding the most audio, which is the one worth recovering.
+    ///
+    /// The pre-take filename `system.caf` is still honoured so meetings recorded
+    /// before takes existed remain recoverable.
+    static func longestTake(in directory: URL, fileManager: FileManager = .default) -> URL? {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else {
+            return nil
+        }
+        return names
+            .filter { $0 == "system.caf" || ($0.hasPrefix("system-") && $0.hasSuffix(".caf")) }
+            .compactMap { name -> (url: URL, frames: AVAudioFramePosition)? in
+                let url = directory.appending(path: name)
+                guard let file = try? AVAudioFile(forReading: url), file.length > 0 else {
+                    return nil
+                }
+                return (url, file.length)
+            }
+            // Ties resolve by name so the choice is stable across directory reads.
+            .sorted { ($0.frames, $0.url.lastPathComponent) < ($1.frames, $1.url.lastPathComponent) }
+            .last?
+            .url
     }
 
     private func updateStatus(_ status: AudioCaptureStatus) {

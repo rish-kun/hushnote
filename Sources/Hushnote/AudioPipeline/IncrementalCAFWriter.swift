@@ -39,6 +39,17 @@ final class IncrementalCAFWriter {
 
     init(url: URL) throws {
         self.url = url
+
+        // AVAudioFile(forWriting:) truncates at open time, before a single frame
+        // is written. A take that already holds audio is the only copy of a
+        // meeting, so refuse rather than clobber it. A zero-frame file left by an
+        // aborted start carries nothing and may be reused.
+        if let existing = try? AVAudioFile(forReading: url), existing.length > 0 {
+            throw AudioPipelineError.writerFailed(
+                "\(url.lastPathComponent) already holds \(existing.length) frames of recorded audio"
+            )
+        }
+
         do {
             // Open eagerly so even a silent or abruptly interrupted meeting
             // leaves a valid, inspectable 48 kHz mono LPCM CAF artifact.
