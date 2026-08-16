@@ -13,6 +13,9 @@ final class CaptureOutputBridge: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.hushnote.audio-capture-state")
     private let systemWriter: IncrementalCAFWriter
+    // One resampler for the whole session: its polyphase filter state has to
+    // stay continuous across tap callbacks.
+    private let resampler = SpeechFeedResampler(targetSampleRate: 16_000)
     private let eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
 
     private var startInstant: ContinuousClock.Instant?
@@ -81,16 +84,18 @@ final class CaptureOutputBridge: @unchecked Sendable {
                 // This write is deliberately first. AsyncStream never receives
                 // a chunk that is absent from the crash-recovery track.
                 let pcmBuffer = try systemWriter.append(inputBuffer)
-                let nativeSamples = pcmBuffer.monoFloatSamples()
-                guard !nativeSamples.isEmpty else { return }
+                guard pcmBuffer.frameLength > 0, pcmBuffer.format.sampleRate > 0 else { return }
 
-                let sampleRate = 16_000.0
-                let samples = Self.resample(
-                    nativeSamples,
-                    from: pcmBuffer.format.sampleRate,
-                    to: sampleRate
+                // Duration is taken from the 48 kHz frames handed to the
+                // converter, never from the converted count: a rate converter's
+                // output lags its input by its own filter latency, so a
+                // per-callback output count is not a duration.
+                let chunkDuration = Int64(
+                    (Double(pcmBuffer.frameLength) / pcmBuffer.format.sampleRate * 1_000).rounded()
                 )
-                let chunkDuration = Int64((Double(samples.count) / sampleRate * 1_000).rounded())
+                let sampleRate = resampler.targetSampleRate
+                let samples = try resampler.resample(pcmBuffer)
+                guard !samples.isEmpty else { return }
                 if timelineOriginSeconds == nil, presentationSeconds.isFinite {
                     timelineOriginSeconds = presentationSeconds
                 }
@@ -153,22 +158,4 @@ final class CaptureOutputBridge: @unchecked Sendable {
         return AudioLevel(source: source, rms: rms, peak: peak)
     }
 
-    /// A lightweight streaming-safe conversion for short Core Audio tap
-    /// buffers. The native samples are preserved in CAF; only the model feed is
-    /// converted to WhisperKit's required 16 kHz rate.
-    static func resample(_ input: [Float], from sourceRate: Double, to targetRate: Double) -> [Float] {
-        guard !input.isEmpty, sourceRate > 0, targetRate > 0 else { return [] }
-        guard abs(sourceRate - targetRate) > 0.5 else { return input }
-        let outputCount = max(1, Int((Double(input.count) * targetRate / sourceRate).rounded()))
-        guard input.count > 1, outputCount > 1 else { return [input[0]] }
-
-        let scale = Double(input.count - 1) / Double(outputCount - 1)
-        return (0..<outputCount).map { outputIndex in
-            let position = Double(outputIndex) * scale
-            let lower = Int(position.rounded(.down))
-            let upper = min(lower + 1, input.count - 1)
-            let fraction = Float(position - Double(lower))
-            return input[lower] + (input[upper] - input[lower]) * fraction
-        }
-    }
 }
