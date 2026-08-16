@@ -127,6 +127,26 @@ enum HushnoteDatabaseMigrations {
                 table.add(column: "notes", .text).notNull().defaults(to: "")
             }
         }
+        migrator.registerMigration("v5_scope_fts_update_trigger") { db in
+            // The original trigger fired AFTER UPDATE on *any* column, including
+            // modelText, isUserEdited, revision and confidence — none of which the
+            // FTS index holds. Because `segmentID` is UNINDEXED, the trigger's
+            // `DELETE ... WHERE segmentID = old.id` is a full scan of every segment
+            // ever recorded, and each firing rewrites all four FTS5 shadow tables
+            // (11 row writes for one logical update). The live loop re-upserts the
+            // whole stable prefix roughly once per second, so this dominated write
+            // cost during a meeting and made the v2 backfill quadratic.
+            try db.execute(sql: """
+                DROP TRIGGER IF EXISTS transcriptSegments_fts_update;
+
+                CREATE TRIGGER transcriptSegments_fts_update
+                AFTER UPDATE OF id, meetingID, text, speakerName ON transcriptSegments BEGIN
+                    DELETE FROM transcriptSegmentFTS WHERE segmentID = old.id;
+                    INSERT INTO transcriptSegmentFTS(segmentID, meetingID, text, speakerName)
+                    VALUES (new.id, new.meetingID, new.text, coalesce(new.speakerName, ''));
+                END;
+                """)
+        }
         return migrator
     }
 }

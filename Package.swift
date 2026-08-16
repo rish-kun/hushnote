@@ -29,7 +29,12 @@ let package = Package(
         ),
         .testTarget(
             name: "HushnoteTests",
-            dependencies: ["Hushnote"],
+            dependencies: [
+                "Hushnote",
+                // Lets tests drive the migrator directly and inspect schema
+                // objects such as the FTS triggers.
+                .product(name: "GRDB", package: "GRDB.swift")
+            ],
             path: "Tests/HushnoteTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         )
