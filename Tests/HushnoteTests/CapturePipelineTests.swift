@@ -15,7 +15,7 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
 
     private let lock = NSLock()
     private var handler: (@Sendable (AVAudioPCMBuffer, Double) -> Void)?
-    private var failure: (@Sendable (String) -> Void)?
+    private var notice: (@Sendable (CaptureNotice) -> Void)?
     private var _calls: [Call] = []
     private var _isRunning = false
 
@@ -30,18 +30,19 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
 
     func install(
         _ handler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void,
-        failure: @escaping @Sendable (String) -> Void
+        notice: @escaping @Sendable (CaptureNotice) -> Void
     ) {
         lock.withLock {
             self.handler = handler
-            self.failure = failure
+            self.notice = notice
         }
     }
 
-    /// Fires the same channel the stall watchdog and the format listener use.
-    func reportFailure(_ message: String) {
-        let failure = lock.withLock { self.failure }
-        failure?(message)
+    /// Fires the same channel the stall watchdog, the format listener and the
+    /// drop accountant use.
+    func report(_ notice: CaptureNotice) {
+        let handler = lock.withLock { self.notice }
+        handler?(notice)
     }
 
     func start() throws {
@@ -113,6 +114,24 @@ final class FakeSystemAudioCapture: SystemAudioCapturing, @unchecked Sendable {
     }
 }
 
+final class EventCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [AudioCaptureEvent] = []
+
+    func record(_ event: AudioCaptureEvent) {
+        lock.withLock { events.append(event) }
+    }
+
+    var drops: [AudioDropReport] {
+        lock.withLock {
+            events.compactMap { event in
+                if case .dropped(let report) = event { return report }
+                return nil
+            }
+        }
+    }
+}
+
 @Suite("Recorded duration")
 struct CaptureDurationTests {
     /// A meeting's stored duration is what the recovery file will report if the
@@ -123,8 +142,8 @@ struct CaptureDurationTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fake = FakeSystemAudioCapture()
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
-            fake.install(handler, failure: failure)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
             return fake
         }
 
@@ -156,8 +175,8 @@ struct CaptureDurationTests {
 
         let fake = FakeSystemAudioCapture()
         fake.stopCost = 0.4
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
-            fake.install(handler, failure: failure)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
             return fake
         }
 
@@ -178,8 +197,8 @@ struct CaptureDurationTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fake = FakeSystemAudioCapture()
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
-            fake.install(handler, failure: failure)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
             return fake
         }
 
@@ -205,19 +224,55 @@ struct CaptureDurationTests {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fake = FakeSystemAudioCapture()
-        let pipeline = AudioPipeline(rootDirectory: directory) { handler, failure in
-            fake.install(handler, failure: failure)
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
             return fake
         }
 
         _ = try await pipeline.start(sessionID: UUID())
         fake.emit(milliseconds: 200)
-        fake.reportFailure("System audio stopped reaching Hushnote 3.2 s ago.")
+        fake.report(.failure("System audio stopped reaching Hushnote 3.2 s ago."))
 
         try await Self.until { await pipeline.status != .recording }
 
         #expect(await pipeline.status == .failed("System audio stopped reaching Hushnote 3.2 s ago."))
         #expect(fake.calls.contains(.stop), "a dead device must not be left running")
+    }
+
+    /// Lost audio has to reach the meeting as an event. It cannot stop the
+    /// recording — the rest of the meeting is still worth keeping — but it must
+    /// not pass silently either.
+    @Test("Dropped buffers reach the meeting as an event without stopping it")
+    func dropsAreSurfaced() async throws {
+        let directory = Self.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fake = FakeSystemAudioCapture()
+        let pipeline = AudioPipeline(rootDirectory: directory) { handler, notice in
+            fake.install(handler, notice: notice)
+            return fake
+        }
+
+        let collector = EventCollector()
+        let events = pipeline.events
+        let watcher = Task { for await event in events { collector.record(event) } }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fake.emit(milliseconds: 100)
+        fake.report(.dropped(AudioDropReport(
+            backpressureBuffers: 4,
+            formatMismatchBuffers: 0,
+            droppedFrames: 4_096,
+            totalDroppedBuffers: 4
+        )))
+
+        try await Self.until { collector.drops.isEmpty == false }
+
+        #expect(collector.drops.first?.backpressureBuffers == 4)
+        #expect(collector.drops.first?.droppedFrames == 4_096)
+        #expect(await pipeline.status == .recording, "a drop is not a reason to end the meeting")
+        _ = try await pipeline.stop()
     }
 
     static func until(

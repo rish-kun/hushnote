@@ -17,9 +17,17 @@ protocol SystemAudioCapturing: AnyObject, Sendable {
 
 extension SystemAudioTapCapture: SystemAudioCapturing {}
 
+/// Everything the capture device has to say that is not audio.
+enum CaptureNotice: Sendable {
+    /// Capture cannot continue; the session has to be torn down.
+    case failure(String)
+    /// Audio was lost, but capture continues.
+    case dropped(AudioDropReport)
+}
+
 typealias SystemAudioCaptureFactory = @Sendable (
     _ sampleHandler: @escaping @Sendable (AVAudioPCMBuffer, Double) -> Void,
-    _ failureHandler: @escaping @Sendable (String) -> Void
+    _ noticeHandler: @escaping @Sendable (CaptureNotice) -> Void
 ) -> any SystemAudioCapturing
 
 /// Owns one meeting capture using macOS's system-audio-only Core Audio tap.
@@ -37,8 +45,8 @@ public actor AudioPipeline {
     private var systemAudioURL: URL?
 
     public init(rootDirectory: URL? = nil) {
-        self.init(rootDirectory: rootDirectory) { sampleHandler, failureHandler in
-            SystemAudioTapCapture(sampleHandler: sampleHandler, failureHandler: failureHandler)
+        self.init(rootDirectory: rootDirectory) { sampleHandler, noticeHandler in
+            SystemAudioTapCapture(sampleHandler: sampleHandler, noticeHandler: noticeHandler)
         }
     }
 
@@ -83,10 +91,19 @@ public actor AudioPipeline {
             output.failureHandler = { [weak self] message in
                 Task { await self?.captureDidFail(message) }
             }
+            let continuation = eventContinuation
             let capture = captureFactory({ [weak output] buffer, presentationSeconds in
                 output?.consume(buffer, presentationSeconds: presentationSeconds)
-            }, { [weak self] message in
-                Task { await self?.captureDidFail(message) }
+            }, { [weak self] notice in
+                switch notice {
+                case .failure(let message):
+                    Task { await self?.captureDidFail(message) }
+                case .dropped(let report):
+                    // Lost audio does not stop the meeting, but it must never
+                    // pass silently: the CAF has no gaps, so everything after a
+                    // drop shifts earlier against the transcript.
+                    continuation.yield(.dropped(report))
+                }
             })
 
             self.sessionID = id

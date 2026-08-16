@@ -19,6 +19,14 @@ final class CaptureStallWatchdog: @unchecked Sendable {
         set { state.withLock { $0.onStall = newValue } }
     }
 
+    /// Runs on every timer tick, before the stall check. Capture health that
+    /// has to be pulled off the real-time thread rides along here rather than
+    /// starting a second timer.
+    var onTick: (@Sendable () -> Void)? {
+        get { state.withLock { $0.onTick } }
+        set { state.withLock { $0.onTick = newValue } }
+    }
+
     let threshold: TimeInterval
 
     private struct State {
@@ -26,6 +34,7 @@ final class CaptureStallWatchdog: @unchecked Sendable {
         var isArmed = false
         var hasReported = false
         var onStall: (@Sendable (TimeInterval) -> Void)?
+        var onTick: (@Sendable () -> Void)?
     }
 
     // An unfair lock, because `noteActivity` is called from the HAL's
@@ -105,6 +114,7 @@ final class CaptureStallWatchdog: @unchecked Sendable {
             created.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(100))
             created.setEventHandler { [weak self] in
                 guard let self else { return }
+                self.state.withLock { $0.onTick }?()
                 self.check(at: self.clock())
             }
             created.resume()

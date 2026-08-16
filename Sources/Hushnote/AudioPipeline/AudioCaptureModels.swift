@@ -57,10 +57,41 @@ public struct AudioLevel: Equatable, Sendable {
     }
 }
 
+/// Audio that never reached the recovery file.
+///
+/// The CAF is bare continuous PCM with no timestamps, so a dropped buffer
+/// shortens the recording rather than leaving a gap: everything after it shifts
+/// earlier relative to the live transcript and the diarization.
+public struct AudioDropReport: Equatable, Sendable {
+    /// Buffers lost since the previous report because the writer could not keep
+    /// up — a disk stall longer than the queue's roughly one second of headroom.
+    public let backpressureBuffers: Int
+    /// Buffers lost since the previous report because the tap's buffer list no
+    /// longer matched the format capture was started with.
+    public let formatMismatchBuffers: Int
+    /// Frames lost since the previous report, at the tap's own sample rate.
+    public let droppedFrames: Int64
+    /// Buffers lost over the whole session so far.
+    public let totalDroppedBuffers: Int
+
+    public init(
+        backpressureBuffers: Int,
+        formatMismatchBuffers: Int,
+        droppedFrames: Int64,
+        totalDroppedBuffers: Int
+    ) {
+        self.backpressureBuffers = backpressureBuffers
+        self.formatMismatchBuffers = formatMismatchBuffers
+        self.droppedFrames = droppedFrames
+        self.totalDroppedBuffers = totalDroppedBuffers
+    }
+}
+
 public enum AudioCaptureEvent: Sendable {
     case status(AudioCaptureStatus)
     case chunk(CapturedAudioChunk)
     case level(AudioLevel)
+    case dropped(AudioDropReport)
 }
 
 public struct AudioCaptureArtifacts: Equatable, Sendable {

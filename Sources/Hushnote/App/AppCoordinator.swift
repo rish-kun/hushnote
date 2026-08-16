@@ -675,6 +675,13 @@ final class AppCoordinator {
                     let sequence = self.sequenceNumbers[chunk.source, default: 0] + 1
                     self.sequenceNumbers[chunk.source] = sequence
                     try? await speechEngine.push(chunk.audioFrame(meetingID: meetingID, sequenceNumber: sequence))
+                case .dropped(let report):
+                    self.logger.warning("""
+                        Audio buffers dropped: \(report.backpressureBuffers, privacy: .public) to \
+                        backpressure, \(report.formatMismatchBuffers, privacy: .public) to format \
+                        mismatch, \(report.droppedFrames, privacy: .public) frames; \
+                        \(report.totalDroppedBuffers, privacy: .public) this session
+                        """)
                 case .status(let status):
                     if case .failed(let message) = status { self.state.markFailed(message) }
                 }

@@ -10,7 +10,7 @@ import os
 /// for access to screen pixels.
 final class SystemAudioTapCapture: @unchecked Sendable {
     typealias SampleHandler = @Sendable (AVAudioPCMBuffer, Double) -> Void
-    typealias FailureHandler = @Sendable (String) -> Void
+    typealias NoticeHandler = @Sendable (CaptureNotice) -> Void
 
     private let callbackQueue = DispatchQueue(
         label: "com.hushnote.system-audio-tap",
@@ -23,8 +23,9 @@ final class SystemAudioTapCapture: @unchecked Sendable {
     private let listenerQueue = DispatchQueue(label: "com.hushnote.system-audio-listener")
     private let availableQueueSlots = DispatchSemaphore(value: 64)
     private let sampleHandler: SampleHandler
-    private let failureHandler: FailureHandler?
+    private let noticeHandler: NoticeHandler?
     private let watchdog: CaptureStallWatchdog
+    private let drops: CaptureDropAccountant
     private let hasReportedFailure = OSAllocatedUnfairLock(initialState: false)
 
     private var tapID = kAudioObjectUnknown
@@ -37,11 +38,13 @@ final class SystemAudioTapCapture: @unchecked Sendable {
 
     init(
         sampleHandler: @escaping SampleHandler,
-        failureHandler: FailureHandler? = nil,
-        stallThreshold: TimeInterval = 3
+        noticeHandler: NoticeHandler? = nil,
+        stallThreshold: TimeInterval = 3,
+        consecutiveCopyFailureLimit: Int = 10
     ) {
         self.sampleHandler = sampleHandler
-        self.failureHandler = failureHandler
+        self.noticeHandler = noticeHandler
+        drops = CaptureDropAccountant(consecutiveFailureLimit: consecutiveCopyFailureLimit)
         watchdog = CaptureStallWatchdog(threshold: stallThreshold)
         watchdog.onStall = { [weak self] silence in
             let seconds = String(format: "%.1f", silence)
@@ -50,6 +53,23 @@ final class SystemAudioTapCapture: @unchecked Sendable {
                     + "the audio device may have changed, or System Audio Recording access may have "
                     + "been revoked. Stop and start the meeting to resume recording."
             )
+        }
+        // Drops are counted on the real-time thread and reported from here, off
+        // it. Pulling on a timer also keeps one stalled disk from producing a
+        // storm of events.
+        watchdog.onTick = { [weak self] in
+            guard let self else { return }
+            if let report = self.drops.flush() {
+                self.noticeHandler?(.dropped(report))
+            }
+            if self.drops.isPermanentlyFailing {
+                self.reportFailure(
+                    "Hushnote could not read \(self.drops.consecutiveFailureLimit) system-audio "
+                        + "buffers in a row, which means the device's format no longer matches the "
+                        + "one this recording started with. Stop and start the meeting to record "
+                        + "with the current device."
+                )
+            }
         }
     }
 
@@ -60,6 +80,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
     func start() throws {
         guard !running else { throw AudioPipelineError.alreadyRunning }
         hasReportedFailure.withLock { $0 = false }
+        drops.reset()
 
         let ownProcess = try Self.audioProcessObject(for: getpid())
         let exclusions = ownProcess == kAudioObjectUnknown ? [] : [ownProcess]
@@ -116,6 +137,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             let processingQueue = processingQueue
             let availableQueueSlots = availableQueueSlots
             let watchdog = watchdog
+            let drops = drops
             try Self.check(
                 AudioDeviceCreateIOProcIDWithBlock(
                     &createdIOProc,
@@ -125,11 +147,17 @@ final class SystemAudioTapCapture: @unchecked Sendable {
                     // Noted before any early return: a buffer that is dropped
                     // still proves the device is alive.
                     watchdog.noteActivity(at: watchdog.now())
-                    guard availableQueueSlots.wait(timeout: .now()) == .success else { return }
-                    guard let buffer = Self.ownedCopy(of: inputData, format: format) else {
-                        availableQueueSlots.signal()
+                    let offeredFrames = Self.frameCount(of: inputData, format: format)
+                    guard availableQueueSlots.wait(timeout: .now()) == .success else {
+                        drops.noteBackpressureDrop(frames: offeredFrames)
                         return
                     }
+                    guard let buffer = Self.ownedCopy(of: inputData, format: format) else {
+                        availableQueueSlots.signal()
+                        drops.noteCopyFailure(frames: offeredFrames)
+                        return
+                    }
+                    drops.noteCopySuccess()
 
                     let presentationSeconds: Double
                     if inputTime.pointee.mFlags.contains(.hostTimeValid) {
@@ -218,7 +246,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             return true
         }
         guard isFirst else { return }
-        failureHandler?(message)
+        noticeHandler?(.failure(message))
     }
 
     /// Watches the one property the whole capture path is pinned to.
@@ -342,6 +370,21 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             AudioObjectSetPropertyData(aggregateID, &address, 0, nil, updatedSize, pointer)
         }
         try check(status, operation: "attach the system-audio tap")
+    }
+
+    /// Frames in a HAL buffer list, by arithmetic.
+    ///
+    /// The alternative is allocating a throwaway `AVAudioPCMBuffer` purely to
+    /// read `frameLength` off it, on the HAL's real-time thread.
+    static func frameCount(
+        of inputData: UnsafePointer<AudioBufferList>,
+        format: AVAudioFormat
+    ) -> Int64 {
+        let bytesPerFrame = Int64(format.streamDescription.pointee.mBytesPerFrame)
+        guard bytesPerFrame > 0 else { return 0 }
+        let list = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
+        guard let first = list.first else { return 0 }
+        return Int64(first.mDataByteSize) / bytesPerFrame
     }
 
     private static func ownedCopy(
