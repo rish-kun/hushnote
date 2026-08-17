@@ -18,7 +18,11 @@ struct ModelCatalogTests {
         #expect(SpeechModelCatalog.recommended == SpeechModelCatalog.whisperLargeV3Turbo)
         #expect(SpeechModelCatalog.whisperLargeV3Turbo.runtimeIdentifier.contains("turbo"))
         #expect(SpeechModelCatalog.whisperLargeV3.tier == .accurate)
-        #expect(SpeechModelCatalog.all.allSatisfy { $0.isMultilingual })
+        // The catalog is no longer multilingual-only: the English-only and
+        // distilled builds are the cheapest accuracy win for an English
+        // meeting, and are marked so the screen can say so.
+        #expect(SpeechModelCatalog.recommended.isMultilingual)
+        #expect(SpeechModelCatalog.all.contains { !$0.isMultilingual })
         #expect(SpeechModelCatalog.all.allSatisfy { $0.approximateDownloadBytes > 0 })
         #expect(SpeechModelCatalog.all.allSatisfy { $0.minimumMemoryBytes > 0 })
     }
