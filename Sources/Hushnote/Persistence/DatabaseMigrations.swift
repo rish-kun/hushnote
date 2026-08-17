@@ -147,6 +147,150 @@ enum HushnoteDatabaseMigrations {
                 END;
                 """)
         }
+        migrator.registerMigration("v6_repair_transcript_pollution") { db in
+            try repairTranscriptSegments(db)
+        }
         return migrator
+    }
+
+    /// Whisper's control vocabulary leaked into stored transcripts until
+    /// `skipSpecialTokens` was set on both `DecodingOptions`. The leak is closed
+    /// at the source, but every meeting recorded before then still holds
+    /// `<|startoftranscript|>` and the timestamp tokens in `text`, in the
+    /// `modelText` the v2 migration backfilled from it, and in the word timings.
+    ///
+    /// Three things shape this repair.
+    ///
+    /// Cleaning runs through `WhisperSpecialToken`, never SQL `replace()`:
+    /// legitimate speech and dictated code contain `<` and `|`, and only the
+    /// real tokeniser rule — an unbroken run of `[A-Za-z0-9._-]` between the
+    /// delimiters — tells `<|en|>` apart from "a <| b |> c".
+    ///
+    /// Rows are selected before they are written, and a row whose repair is a
+    /// no-op is never written at all. The v5 FTS trigger's
+    /// `DELETE ... WHERE segmentID = old.id` is a full scan of the shadow
+    /// tables, so an UPDATE that sweeps the whole table would cost roughly
+    /// n² row writes on a long history.
+    ///
+    /// Each UPDATE names only the columns that actually changed. The v5 trigger
+    /// is `AFTER UPDATE OF id, meetingID, text, speakerName`, and SQLite fires
+    /// on a column's presence in the SET list rather than on its value changing,
+    /// so listing an unchanged `text` beside a repaired `modelText` would
+    /// reindex for nothing. `transcriptSegmentFTS` is never touched by hand;
+    /// the trigger is what keeps it in step.
+    ///
+    /// `insightSnapshots.payloadJSON` is deliberately left alone. A summary
+    /// built from a polluted transcript is wrong in ways no string edit fixes;
+    /// those should be regenerated.
+    private static func repairTranscriptSegments(_ db: Database) throws {
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT id, text, modelText, wordsJSON, speakerID, speakerName
+                FROM transcriptSegments
+                WHERE text LIKE '%<|%'
+                    OR modelText LIKE '%<|%'
+                    OR CAST(wordsJSON AS TEXT) LIKE '%<|%'
+                    OR (speakerID IS NOT NULL AND speakerName = 'Speaker ' || speakerID)
+                """
+        )
+
+        for row in rows {
+            var assignments: [String] = []
+            var arguments: [(any DatabaseValueConvertible)?] = []
+
+            let text: String = row["text"]
+            let cleanedText = WhisperSpecialToken.cleanedSegmentText(text)
+            if cleanedText != text {
+                // A segment that was nothing but control tokens is emptied, not
+                // deleted: a migration repairs a user's transcript, it does not
+                // decide rows out of it.
+                assignments.append("text = ?")
+                arguments.append(cleanedText)
+            }
+
+            if let modelText: String = row["modelText"] {
+                let cleanedModelText = WhisperSpecialToken.cleanedSegmentText(modelText)
+                if cleanedModelText != modelText {
+                    assignments.append("modelText = ?")
+                    arguments.append(cleanedModelText)
+                }
+            }
+
+            if let repairedWords = repairedWordTimings(row["wordsJSON"]) {
+                assignments.append("wordsJSON = ?")
+                arguments.append(repairedWords)
+            }
+
+            if let repairedName = repairedSpeakerName(
+                speakerID: row["speakerID"],
+                speakerName: row["speakerName"]
+            ) {
+                assignments.append("speakerName = ?")
+                arguments.append(repairedName)
+            }
+
+            guard !assignments.isEmpty else { continue }
+            arguments.append(row["id"] as String)
+            try db.execute(
+                sql: """
+                    UPDATE transcriptSegments
+                    SET \(assignments.joined(separator: ", "))
+                    WHERE id = ?
+                    """,
+                arguments: StatementArguments(arguments)
+            )
+        }
+    }
+
+    /// Word text keeps its leading space, which is how Whisper marks a word
+    /// boundary. A word that was nothing but a control token is dropped, matching
+    /// what the live and final passes do today — keeping it would leave an empty
+    /// row that scrubbing can seek to.
+    ///
+    /// Returns nil when there is nothing to repair, and also when the payload
+    /// cannot be decoded: a migration that throws leaves the app unable to open
+    /// its own database, which is far worse than one stale word list.
+    private static func repairedWordTimings(_ data: Data) -> Data? {
+        guard let words = try? JSONDecoder().decode([TranscriptWord].self, from: data) else {
+            return nil
+        }
+
+        var repaired: [TranscriptWord] = []
+        repaired.reserveCapacity(words.count)
+        var changed = false
+        for word in words {
+            let text = WhisperSpecialToken.cleanedWordText(word.text)
+            guard text != word.text else {
+                repaired.append(word)
+                continue
+            }
+            changed = true
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            var word = word
+            word.text = text
+            repaired.append(word)
+        }
+
+        guard changed else { return nil }
+        return try? JSONEncoder().encode(repaired)
+    }
+
+    /// Diarization labels clusters, not people: FluidAudio emits "S1", "S2"…,
+    /// and the display name interpolated that identifier raw until commit
+    /// c7a9e23, so older rows read "Speaker S1".
+    ///
+    /// The repair is the very function the app applies today, and it only runs
+    /// where the stored name is still exactly what the old code produced —
+    /// `"Speaker " + speakerID`. Any other name is either the user's own or one
+    /// this rule has nothing to say about, and both are left alone. An
+    /// identifier that is not a cluster ("local-user") maps to itself, so those
+    /// rows fall out on their own.
+    private static func repairedSpeakerName(speakerID: String?, speakerName: String?) -> String? {
+        guard let speakerID, let speakerName, speakerName == "Speaker \(speakerID)" else {
+            return nil
+        }
+        let display = SpeakerAttributor.displayName(forSpeakerID: speakerID)
+        return display == speakerName ? nil : display
     }
 }
