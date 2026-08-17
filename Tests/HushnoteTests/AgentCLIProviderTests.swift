@@ -197,6 +197,63 @@ struct AgentCLIProviderTests {
         #expect(reason.contains("--safe-mode"))
     }
 
+    @Test("opencode's tool lockdown is confirmed to still take effect, not assumed")
+    func confirmsTheOpencodeAgentIsHonoured() async throws {
+        let bin = try makeTemporaryBin()
+        defer { try? FileManager.default.removeItem(at: bin) }
+        try makeExecutable(named: "opencode", in: bin, mode: 0o755)
+        let help = AgentCLITool.opencode.requiredHelpFlags.joined(separator: "\n")
+        // opencode switches its tools off through OPENCODE_CONFIG_CONTENT,
+        // which is undocumented and appears in no --help output. `agent list`
+        // is where its effect becomes visible.
+        let withoutTheAgent = """
+        build (primary)
+        plan (primary)
+        """
+        let provider = AgentCLIProvider(
+            tool: .opencode,
+            resolver: AgentExecutableResolver(searchPaths: [bin]),
+            runner: FakeAgentProcessRunner(results: [
+                .init(standardOutput: help, standardError: "", exitCode: 0),
+                .init(standardOutput: withoutTheAgent, standardError: "", exitCode: 0)
+            ])
+        )
+
+        guard case .unavailable(let reason) = await provider.healthCheck() else {
+            Issue.record("opencode was reported as available with its tools still on")
+            return
+        }
+        #expect(reason.contains("OPENCODE_CONFIG_CONTENT"))
+    }
+
+    @Test("opencode is available once its agent definition does take effect")
+    func acceptsOpencodeWhenTheAgentAppears() async throws {
+        let bin = try makeTemporaryBin()
+        defer { try? FileManager.default.removeItem(at: bin) }
+        try makeExecutable(named: "opencode", in: bin, mode: 0o755)
+        let runner = FakeAgentProcessRunner(results: [
+            .init(
+                standardOutput: AgentCLITool.opencode.requiredHelpFlags.joined(separator: "\n"),
+                standardError: "",
+                exitCode: 0
+            ),
+            .init(standardOutput: "build (primary)\nhushnote (primary)", standardError: "", exitCode: 0),
+            .init(standardOutput: "anthropic\n", standardError: "", exitCode: 0)
+        ])
+        let provider = AgentCLIProvider(
+            tool: .opencode,
+            resolver: AgentExecutableResolver(searchPaths: [bin]),
+            runner: runner
+        )
+
+        #expect(await provider.healthCheck() == .available)
+        // The probe has to run with the very environment the real run uses,
+        // or it proves nothing about the real run.
+        let probe = try #require(await runner.recorded().dropFirst().first)
+        #expect(probe.environment["OPENCODE_CONFIG_CONTENT"] != nil)
+        #expect(probe.environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1")
+    }
+
     @Test("A signed-out CLI says so instead of failing mid-summary")
     func reportsSignedOut() async throws {
         let bin = try makeTemporaryBin()

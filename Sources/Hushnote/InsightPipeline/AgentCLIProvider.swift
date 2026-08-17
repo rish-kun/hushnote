@@ -67,6 +67,29 @@ public actor AgentCLIProvider: InsightProvider {
             return .unavailable("\(tool.executableName) did not respond to --help.")
         }
 
+        if let check = tool.configurationProbe {
+            do {
+                let result = try await probe(
+                    executable,
+                    arguments: check.arguments,
+                    environment: nil
+                )
+                guard result.standardOutput.contains(check.expecting) else {
+                    return .unavailable(
+                        """
+                        This version of \(tool.executableName) no longer honours \
+                        \(check.mechanism). Hushnote uses it to switch the agent's tools off, so \
+                        it will not run it. Update \(tool.executableName) or pick another provider.
+                        """
+                    )
+                }
+            } catch {
+                return .unavailable(
+                    "\(tool.executableName) could not confirm that \(check.mechanism) still applies."
+                )
+            }
+        }
+
         do {
             let probe = try await probe(executable, arguments: tool.authProbeArguments)
             if let problem = tool.signInProblem(probe) {
@@ -143,14 +166,26 @@ public actor AgentCLIProvider: InsightProvider {
         }
     }
 
-    private func probe(_ executable: URL, arguments: [String]) async throws -> AgentProcessResult {
+    /// Runs a short read-only command against the tool.
+    ///
+    /// `environment` defaults to the very environment a real summary uses, so
+    /// that a probe of the lockdown is a probe of the lockdown as configured
+    /// and not of some cleaner arrangement that only exists here.
+    private func probe(
+        _ executable: URL,
+        arguments: [String],
+        environment: [String: String]? = AgentProcessEnvironment.minimal()
+    ) async throws -> AgentProcessResult {
         let sandbox = try AgentSandboxDirectory.make(label: "\(tool.rawValue)-probe")
         defer { sandbox.remove() }
+        let support = try AgentSandboxDirectory.make(label: "\(tool.rawValue)-probe-support")
+        defer { support.remove() }
         return try await runner.run(
             AgentProcessInvocation(
                 executableURL: executable,
                 arguments: arguments,
-                environment: AgentProcessEnvironment.minimal(),
+                environment: environment
+                    ?? tool.environment(sandbox: sandbox.url, supportDirectory: support.url),
                 workingDirectory: sandbox.url,
                 standardInput: "",
                 timeout: .seconds(20)

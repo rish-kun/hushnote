@@ -71,6 +71,25 @@ public enum AgentCLITool: String, Sendable, CaseIterable {
         }
     }
 
+    /// A second capability check, for lockdowns that `--help` cannot show.
+    ///
+    /// opencode has no flag for switching its tools off — only
+    /// `OPENCODE_CONFIG_CONTENT`, which is undocumented and appears in no help
+    /// output. Running `agent list` with that variable set makes its effect
+    /// visible: the agent Hushnote defines shows up only when the variable is
+    /// still honoured. Verified on this machine, where `hushnote (primary)`
+    /// appears in the list with the variable set and not without it.
+    public var configurationProbe: (arguments: [String], expecting: String, mechanism: String)? {
+        switch self {
+        case .claude, .codex:
+            // Everything these two rely on is a documented flag, and the
+            // required-flag check already covers it.
+            nil
+        case .opencode:
+            (["agent", "list"], Self.opencodeAgentName, "OPENCODE_CONFIG_CONTENT")
+        }
+    }
+
     // MARK: - authentication
 
     public var authProbeArguments: [String] {
