@@ -7,15 +7,65 @@ import SwiftUI
 /// screen does not claim to know.
 enum ModelAvailability: Equatable, Sendable {
     case notInstalled
-    case downloading
+    /// Carries how far the fetch has got, because a spinner and the word
+    /// "Downloading…" is all this screen used to say for the length of a
+    /// several-hundred-megabyte transfer.
+    case downloading(ModelDownloadProgress)
     case ready
     case failed(String)
+
+    var isDownloading: Bool {
+        if case .downloading = self { return true }
+        return false
+    }
+
+    var progress: ModelDownloadProgress? {
+        if case .downloading(let progress) = self { return progress }
+        return nil
+    }
+}
+
+/// What a meeting will use a model for. Hushnote runs two passes -- a live one
+/// during capture and an accuracy-first one afterwards -- and they need not be
+/// the same model, so a row says which of the two jobs it holds.
+enum ModelRole: Equatable, Sendable {
+    case live
+    case final
+    case both
+
+    var caption: String {
+        switch self {
+        case .live: "Used live during capture"
+        case .final: "Used for the final pass"
+        case .both: "Used live and for the final pass"
+        }
+    }
+}
+
+/// The pill on the right of a model's name.
+enum ModelBadge: Hashable, Sendable {
+    /// This model is one a meeting will actually use right now.
+    case active
+    case recommended
+    /// Still served, but a newer artifact supersedes it.
+    case legacy
+    case englishOnly
+
+    var title: String {
+        switch self {
+        case .active: "Active"
+        case .recommended: "Recommended"
+        case .legacy: "Legacy"
+        case .englishOnly: "English only"
+        }
+    }
 }
 
 struct ModelRow: Identifiable {
     var model: SpeechModel
     var availability: ModelAvailability
-    var role: String?
+    var role: ModelRole?
+    var badges: [ModelBadge]
 
     var id: String { model.id }
 }
@@ -30,7 +80,9 @@ enum SpeechModelResolver {
     nonisolated static func model(named name: String) -> SpeechModel {
         let value = name.lowercased()
         if let exact = SpeechModelCatalog.all.first(where: {
-            $0.displayName.lowercased() == value || $0.id.lowercased() == value
+            $0.displayName.lowercased() == value
+                || $0.id.lowercased() == value
+                || $0.runtimeIdentifier.lowercased() == value
         }) {
             return exact
         }
@@ -54,12 +106,49 @@ enum ModelListPolicy {
         let live = SpeechModelResolver.model(named: draft.liveModel).id
         let final = SpeechModelResolver.model(named: draft.finalModel).id
         return SpeechModelCatalog.all.map { model in
-            ModelRow(
+            let role: ModelRole? = switch (model.id == live, model.id == final) {
+            case (true, true): .both
+            case (true, false): .live
+            case (false, true): .final
+            case (false, false): nil
+            }
+            return ModelRow(
                 model: model,
                 availability: availability[model.id] ?? .notInstalled,
-                role: model.id == live ? "Live default" : (model.id == final ? "Final default" : nil)
+                role: role,
+                badges: badges(model: model, role: role)
             )
         }
+    }
+
+    /// At most two, ordered by how much they change what the user would do: the
+    /// model in use, then why they might pick a different one.
+    nonisolated static func badges(model: SpeechModel, role: ModelRole?) -> [ModelBadge] {
+        var badges: [ModelBadge] = []
+        if role != nil { badges.append(.active) }
+        // A row already carrying "Active" does not also need to be told it is
+        // the recommendation: the user is using it.
+        if role == nil, model.id == SpeechModelCatalog.recommended.id {
+            badges.append(.recommended)
+        }
+        if SpeechModelCatalog.legacy.contains(model.id) { badges.append(.legacy) }
+        if !model.isMultilingual { badges.append(.englishOnly) }
+        return badges
+    }
+
+    /// The two lists the screen is drawn as. Catalog order is preserved inside
+    /// each, so a model does not move within its section as its state changes.
+    ///
+    /// A download in flight belongs under "Available": it has not landed, and
+    /// moving the row between two sections halfway through a transfer is how a
+    /// progress bar ends up somewhere the user is not looking.
+    nonisolated static func partition(
+        _ rows: [ModelRow]
+    ) -> (downloaded: [ModelRow], available: [ModelRow]) {
+        (
+            downloaded: rows.filter { $0.availability == .ready },
+            available: rows.filter { $0.availability != .ready }
+        )
     }
 
     /// A download loads a multi-gigabyte Core ML model onto the same Neural
@@ -76,10 +165,17 @@ enum ModelListPolicy {
         }
     }
 
+    /// Deliberately not gated on the recording phase. A download started before
+    /// Record is still saturating the link during the meeting, so stopping it
+    /// is exactly the thing a busy machine needs to allow.
+    nonisolated static func canCancel(_ availability: ModelAvailability) -> Bool {
+        availability.isDownloading
+    }
+
     nonisolated static func downloadLabel(_ availability: ModelAvailability) -> String {
         switch availability {
         case .notInstalled: "Download"
-        case .downloading: "Downloading…"
+        case .downloading: "Cancel"
         case .ready: "Ready"
         case .failed: "Retry"
         }
@@ -90,6 +186,74 @@ enum ModelListPolicy {
         return gigabytes >= 1
             ? String(format: "~%.1f GB", gigabytes)
             : "~\(model.approximateDownloadBytes / 1_000_000) MB"
+    }
+
+    // MARK: - Meters
+    //
+    // Ordinal, and only ordinal. Hushnote has no word-error-rate or real-time
+    // factor measurements of its own and will not print numbers it cannot
+    // source, so both meters are a rank of the catalog against itself, mapped
+    // onto the five segments the bars are drawn with.
+
+    /// Accuracy ranks by the tier the catalog already assigns, then by
+    /// generation -- Large v2 is behind every Large v3 build regardless of file
+    /// size -- and then by artifact size, because within one generation a
+    /// larger file is a less lossy compression of the same weights.
+    nonisolated static func accuracyMeter(_ model: SpeechModel) -> Int {
+        quintile(of: model.id, in: accuracyRanking)
+    }
+
+    /// Speed ranks by artifact size, largest first, and then lifts the turbo
+    /// and distilled builds one segment: those are the same or smaller weights
+    /// behind a decoder built to run faster, which is the entire reason Argmax
+    /// publishes them separately.
+    nonisolated static func speedMeter(_ model: SpeechModel) -> Int {
+        let base = quintile(of: model.id, in: speedRanking)
+        return isFastDecoder(model) ? min(5, base + 1) : base
+    }
+
+    private nonisolated static func isFastDecoder(_ model: SpeechModel) -> Bool {
+        let identifier = model.runtimeIdentifier
+        return identifier.contains("turbo") || identifier.contains("distil")
+    }
+
+    private nonisolated static func tierRank(_ tier: SpeechModelTier) -> Int {
+        switch tier {
+        case .fast: 0
+        case .balanced: 1
+        case .accurate: 2
+        }
+    }
+
+    private nonisolated static let accuracyRanking: [String] = SpeechModelCatalog.all
+        .sorted { lhs, rhs in
+            let tiers = (tierRank(lhs.tier), tierRank(rhs.tier))
+            if tiers.0 != tiers.1 { return tiers.0 < tiers.1 }
+            let generations = (generation(lhs), generation(rhs))
+            if generations.0 != generations.1 { return generations.0 < generations.1 }
+            if lhs.approximateDownloadBytes != rhs.approximateDownloadBytes {
+                return lhs.approximateDownloadBytes < rhs.approximateDownloadBytes
+            }
+            return lhs.id < rhs.id
+        }
+        .map(\.id)
+
+    private nonisolated static let speedRanking: [String] = SpeechModelCatalog.all
+        .sorted { lhs, rhs in
+            if lhs.approximateDownloadBytes != rhs.approximateDownloadBytes {
+                return lhs.approximateDownloadBytes > rhs.approximateDownloadBytes
+            }
+            return lhs.id < rhs.id
+        }
+        .map(\.id)
+
+    private nonisolated static func generation(_ model: SpeechModel) -> Int {
+        model.runtimeIdentifier.contains("large-v2") ? 0 : 1
+    }
+
+    private nonisolated static func quintile(of id: String, in ranking: [String]) -> Int {
+        guard let index = ranking.firstIndex(of: id), !ranking.isEmpty else { return 1 }
+        return min(5, 1 + (index * 5) / ranking.count)
     }
 }
 
@@ -184,14 +348,106 @@ struct APIKeyField: View {
     }
 }
 
+/// The small segmented bar Handy uses to compare models at a glance. Five
+/// segments, filled to an ordinal rank -- see `ModelListPolicy`'s meters for
+/// why it is a rank and not a number.
+struct ModelMeter: View {
+    let title: String
+    let filled: Int
+    let tint: Color
+
+    private let segments = 5
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 2.5) {
+                ForEach(0..<segments, id: \.self) { index in
+                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                        .fill(index < filled ? tint : HushnoteTheme.rule.opacity(0.55))
+                        .frame(width: 11, height: 4)
+                }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title) \(filled) out of \(segments)")
+    }
+}
+
+struct ModelBadgePill: View {
+    let badge: ModelBadge
+
+    var body: some View {
+        Text(badge.title.uppercased())
+            .font(.caption2.weight(.bold))
+            .tracking(0.7)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .foregroundStyle(foreground)
+            .background(
+                Capsule(style: .continuous).fill(background)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(HushnoteTheme.rule.opacity(badge == .active ? 0 : 0.8), lineWidth: 0.8)
+            )
+    }
+
+    private var foreground: Color {
+        badge == .active ? HushnoteTheme.paperRaised : HushnoteTheme.secondaryInk
+    }
+
+    private var background: Color {
+        badge == .active ? HushnoteTheme.vermilion : .clear
+    }
+}
+
+/// The bar, the percentage and the transfer rate, which is the whole reason
+/// this row is not a spinner.
+struct ModelDownloadBar: View {
+    let progress: ModelDownloadProgress
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule(style: .continuous)
+                        .fill(HushnoteTheme.rule.opacity(0.5))
+                    Capsule(style: .continuous)
+                        .fill(HushnoteTheme.vermilion)
+                        .frame(width: geometry.size.width * min(max(progress.fraction, 0), 1))
+                }
+            }
+            .frame(height: 4)
+
+            HStack {
+                Text(ModelDownloadText.percentage(progress.fraction))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(ModelDownloadText.rate(progress.bytesPerSecond))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: 420)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(ModelDownloadText.percentage(progress.fraction))
+    }
+}
+
 struct ModelManagerView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
     var body: some View {
-        let rows = ModelListPolicy.rows(
-            availability: coordinator.modelAvailability,
-            draft: state.draft
+        let split = ModelListPolicy.partition(
+            ModelListPolicy.rows(
+                availability: coordinator.modelAvailability,
+                draft: state.draft
+            )
         )
         let isBusy = state.recordingPhase.isBusy
 
@@ -200,28 +456,31 @@ struct ModelManagerView: View {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("Speech models")
                         .font(HushnoteTheme.Font.pageTitle)
-                    Text("Models are verified before they are loaded and never substituted silently.")
+                    Text("Models are verified before they are loaded and never substituted silently. Setting a default downloads it if it is not here yet, and uses it once it lands.")
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: 620, alignment: .leading)
                 }
 
                 if isBusy {
                     Label(
-                        "Downloads pause while a meeting is being captured or finalized. They use the same Neural Engine as the transcriber.",
+                        "Downloads pause while a meeting is being captured or finalized. They use the same Neural Engine as the transcriber. A download already running can still be cancelled.",
                         systemImage: "pause.circle"
                     )
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 }
 
-                ForEach(rows) { row in
-                    modelRow(row, isBusy: isBusy)
-                    Divider().opacity(0.5)
+                if !split.downloaded.isEmpty {
+                    section("DOWNLOADED", rows: split.downloaded, isBusy: isBusy)
+                }
+                if !split.available.isEmpty {
+                    section("AVAILABLE TO DOWNLOAD", rows: split.available, isBusy: isBusy)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Performance guidance", systemImage: "gauge.with.dots.needle.33percent")
                         .font(.headline)
-                    Text("Large v3 Turbo is tuned for live work on the supported M4 baseline. Use Medium if sustained transcription falls behind; Hushnote never changes your selection silently.")
+                    Text("Large v3 Turbo is tuned for live work on the supported M4 baseline. The accuracy and speed meters rank the catalog against itself; they are not measured word error rates. Hushnote never changes your selection silently.")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: 620, alignment: .leading)
                 }
@@ -232,58 +491,114 @@ struct ModelManagerView: View {
     }
 
     @ViewBuilder
+    private func section(_ title: String, rows: [ModelRow], isBusy: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 13) {
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .tracking(1.3)
+                .foregroundStyle(.secondary)
+            ForEach(rows) { row in
+                modelRow(row, isBusy: isBusy)
+                Divider().opacity(0.5)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
     private func modelRow(_ row: ModelRow, isBusy: Bool) -> some View {
-        let isDefault = row.role != nil
+        let isActive = row.role != nil
 
         HStack(alignment: .top, spacing: 22) {
-            Image(systemName: isDefault ? "waveform.circle.fill" : "waveform.circle")
+            Image(systemName: isActive ? "waveform.circle.fill" : "waveform.circle")
                 .font(.system(size: 25))
-                .foregroundStyle(isDefault ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(.secondary))
+                .foregroundStyle(isActive ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(.secondary))
                 .frame(width: 34)
+
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
+                HStack(spacing: 7) {
                     Text(row.model.displayName).font(.headline)
-                    if let role = row.role {
-                        Text(role.uppercased())
-                            .font(.caption2.weight(.bold))
-                            .tracking(0.8)
-                            .foregroundStyle(.secondary)
-                    }
+                    ForEach(row.badges, id: \.self) { ModelBadgePill(badge: $0) }
                 }
-                Text(row.model.tier.rawValue.capitalized + (row.model.isMultilingual ? " · multilingual" : ""))
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 8) {
+
+                if let role = row.role {
+                    Text(role.caption)
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.moss)
+                }
+
+                HStack(spacing: 10) {
                     Text(ModelListPolicy.sizeText(row.model))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
-                    if case .failed(let reason) = row.availability {
-                        Text(reason)
-                            .font(.caption)
-                            .foregroundStyle(HushnoteTheme.vermilionInk)
-                            .lineLimit(2)
-                    }
+                    ModelMeter(
+                        title: "Accuracy",
+                        filled: ModelListPolicy.accuracyMeter(row.model),
+                        tint: HushnoteTheme.moss
+                    )
+                    ModelMeter(
+                        title: "Speed",
+                        filled: ModelListPolicy.speedMeter(row.model),
+                        tint: HushnoteTheme.vermilionInk
+                    )
+                }
+
+                if let progress = row.availability.progress {
+                    ModelDownloadBar(progress: progress)
+                        .padding(.top, 3)
+                }
+
+                if case .failed(let reason) = row.availability {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.vermilionInk)
+                        .lineLimit(2)
                 }
             }
+
             Spacer()
-            HStack(spacing: 8) {
-                if row.availability == .downloading {
-                    ProgressView().controlSize(.small)
-                }
+
+            VStack(alignment: .trailing, spacing: 7) {
                 Button(ModelListPolicy.downloadLabel(row.availability)) {
-                    Task { await coordinator.downloadModel(row.model) }
+                    if ModelListPolicy.canCancel(row.availability) {
+                        coordinator.cancelDownload(row.model)
+                    } else {
+                        Task { await coordinator.downloadModel(row.model) }
+                    }
                 }
                 .buttonStyle(.bordered)
-                .disabled(!ModelListPolicy.canDownload(
-                    availability: row.availability,
-                    phase: state.recordingPhase
-                ))
+                .disabled(
+                    !ModelListPolicy.canCancel(row.availability)
+                        && !ModelListPolicy.canDownload(
+                            availability: row.availability,
+                            phase: state.recordingPhase
+                        )
+                )
+
+                if row.role != .both {
+                    Button("Set as default") {
+                        Task { await coordinator.setDefaultModel(row.model) }
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .disabled(isBusy)
+                }
             }
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(row.model.displayName), \(ModelListPolicy.downloadLabel(row.availability))"
-        )
+        .accessibilityLabel(accessibilityLabel(row))
+    }
+
+    private func accessibilityLabel(_ row: ModelRow) -> String {
+        var parts = [row.model.displayName]
+        parts.append(contentsOf: row.badges.map(\.title))
+        if let progress = row.availability.progress {
+            parts.append(ModelDownloadText.percentage(progress.fraction))
+        } else {
+            parts.append(ModelListPolicy.downloadLabel(row.availability))
+        }
+        return parts.joined(separator: ", ")
     }
 }
 

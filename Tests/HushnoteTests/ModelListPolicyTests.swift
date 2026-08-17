@@ -37,14 +37,15 @@ struct ModelListPolicyTests {
 
     @Test("A model already downloading or ready is not downloaded again")
     func downloadIsNotRepeated() {
-        #expect(ModelListPolicy.canDownload(availability: .downloading, phase: .idle) == false)
+        #expect(ModelListPolicy.canDownload(availability: .downloading(.starting), phase: .idle) == false)
         #expect(ModelListPolicy.canDownload(availability: .ready, phase: .idle) == false)
     }
 
     @Test("The button says which of the four states it is in")
     func labelReflectsState() {
         #expect(ModelListPolicy.downloadLabel(.notInstalled) == "Download")
-        #expect(ModelListPolicy.downloadLabel(.downloading) == "Downloading…")
+        // A download in flight offers the only thing worth pressing: stop.
+        #expect(ModelListPolicy.downloadLabel(.downloading(.starting)) == "Cancel")
         #expect(ModelListPolicy.downloadLabel(.ready) == "Ready")
         #expect(ModelListPolicy.downloadLabel(.failed("no network")) == "Retry")
     }
@@ -54,8 +55,8 @@ struct ModelListPolicyTests {
     @Test("Roles come from the models the meeting will really use")
     func rolesFollowTheDraft() {
         let rows = ModelListPolicy.rows(availability: [:], draft: MeetingDraft())
-        let live = rows.filter { $0.role == "Live default" }
-        let final = rows.filter { $0.role == "Final default" }
+        let live = rows.filter { $0.role == .live }
+        let final = rows.filter { $0.role == .final }
 
         #expect(live.count == 1)
         #expect(final.count == 1)

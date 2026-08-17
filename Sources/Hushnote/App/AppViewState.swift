@@ -149,6 +149,41 @@ struct MeetingDraft: Equatable {
     var summaryInstructions = ""
 }
 
+/// Where the chosen speech models live between launches.
+///
+/// There was nowhere: `MeetingDraft` was rebuilt from its own literals on every
+/// launch, so a model chosen on the models screen was forgotten the moment the
+/// app quit. `UserDefaults` is what the app already keeps this class of
+/// preference in — see `FloatingRecordingPanelController` — and the store is
+/// injected for the same reason it is there, so a test never touches the real
+/// domain.
+enum SpeechModelDefaults {
+    static let liveKey = "speechModel.live"
+    static let finalKey = "speechModel.final"
+
+    /// Only catalog identifiers are adopted. `SpeechModelResolver` falls through
+    /// to Large v3 for a name it does not recognise, so a stored identifier the
+    /// catalog has since dropped would quietly become a different, much larger
+    /// model rather than the choice the user actually last made.
+    nonisolated static func apply(to draft: inout MeetingDraft, from defaults: UserDefaults) {
+        if let live = defaults.string(forKey: liveKey), SpeechModelCatalog.model(id: live) != nil {
+            draft.liveModel = live
+        }
+        if let final = defaults.string(forKey: finalKey), SpeechModelCatalog.model(id: final) != nil {
+            draft.finalModel = final
+        }
+    }
+
+    nonisolated static func store(
+        liveModelID: String,
+        finalModelID: String,
+        in defaults: UserDefaults
+    ) {
+        defaults.set(liveModelID, forKey: liveKey)
+        defaults.set(finalModelID, forKey: finalKey)
+    }
+}
+
 struct MeetingListItem: Identifiable, Equatable {
     let id: UUID
     var title: String
