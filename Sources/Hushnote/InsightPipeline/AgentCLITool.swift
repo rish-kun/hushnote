@@ -195,8 +195,9 @@ public enum AgentCLITool: String, Sendable, CaseIterable {
     ///
     /// Only claude has a channel for instructions that is not the prompt, so
     /// for the other two the instruction and the transcript share one stream.
-    /// The transcript is nonce-fenced by the prompt builder, which is what
-    /// keeps the boundary meaningful there.
+    /// What keeps that boundary meaningful is that the prompt builder has
+    /// already neutralised the angle brackets in the transcript, so no spoken
+    /// sentence can close the transcript block and open something else.
     public func standardInput(for request: InsightProviderRequest) -> String {
         switch self {
         case .claude: request.userPrompt
