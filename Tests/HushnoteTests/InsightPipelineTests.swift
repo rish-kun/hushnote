@@ -206,7 +206,7 @@ struct InsightPipelineTests {
         #expect(output == #"{"answer":"ok"}"#)
         #expect(health == .unavailable("ChatGPT account not connected"))
         #expect(threadStart["params"]?["ephemeral"] == .bool(true))
-        #expect(threadStart["params"]?["sandbox"] == .string("readOnly"))
+        #expect(threadStart["params"]?["sandbox"] == .string("read-only"))
         #expect(turnStart["params"]?["sandboxPolicy"]?["type"] == .string("readOnly"))
         #expect(turnStart["params"]?["outputSchema"] == providerRequest().outputSchema)
     }

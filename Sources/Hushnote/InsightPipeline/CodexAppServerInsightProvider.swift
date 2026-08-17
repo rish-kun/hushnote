@@ -105,13 +105,45 @@ public actor CodexAppServerInsightProvider: InsightProvider {
         _ = try await call(method: "account/logout", params: .object([:]))
     }
 
+    /// Every tool Codex can reach, switched off.
+    ///
+    /// These are the same keys the verified `codex exec` lockdown uses
+    /// (`--disable` is `features.<name>=false`), expressed as the `config`
+    /// override object `thread/start` accepts.
+    private static let toollessConfig = JSONValue.object([
+        "features": .object([
+            "shell_tool": .bool(false),
+            "unified_exec": .bool(false),
+            "view_image": .bool(false)
+        ]),
+        "tools": .object(["web_search": .bool(false)]),
+        // Project docs are read from the working directory before the turn even
+        // starts, and they are billed on every summary.
+        "project_doc_max_bytes": .number(0),
+        "include_environment_context": .bool(false)
+    ])
+
     public func complete(_ request: InsightProviderRequest) async throws -> String {
         try await ensureInitialized()
+        // A turn is an agent, not a completion. It gets an empty directory to
+        // stand in, because `read-only` in Codex means "read anything on the
+        // filesystem, write nothing" and `approvalPolicy: never` means it does
+        // so without asking.
+        let sandbox = try AgentSandboxDirectory.make(label: "codex")
+        defer { sandbox.remove() }
+
         var threadParameters: [String: JSONValue] = [
             "ephemeral": .bool(true),
             "approvalPolicy": .string("never"),
-            "sandbox": .string("readOnly"),
-            "serviceName": .string("hushnote")
+            // The protocol spells the thread-level sandbox mode "read-only";
+            // "readOnly" is the turn-level policy tag and is rejected here.
+            "sandbox": .string("read-only"),
+            "serviceName": .string("hushnote"),
+            "cwd": .string(sandbox.path),
+            // The instruction channel. What Hushnote wants done goes here and
+            // only here, so that the transcript below cannot rewrite it.
+            "developerInstructions": .string(request.systemPrompt),
+            "config": Self.toollessConfig
         ]
         if let model { threadParameters["model"] = .string(model) }
         let threadResponse = try await call(
@@ -122,16 +154,20 @@ public actor CodexAppServerInsightProvider: InsightProvider {
             throw InsightProviderError.malformedResponse
         }
 
-        let prompt = request.systemPrompt + "\n\n" + request.userPrompt
+        // The data channel. Anyone who can speak in a meeting writes this.
         let turnID = nextRequestID()
         try await transport.send(.object([
             "method": .string("turn/start"),
             "id": .number(Double(turnID)),
             "params": .object([
                 "threadId": .string(threadID),
-                "input": .array([.object(["type": .string("text"), "text": .string(prompt)])]),
+                "input": .array([.object([
+                    "type": .string("text"),
+                    "text": .string(request.userPrompt)
+                ])]),
                 "approvalPolicy": .string("never"),
                 "sandboxPolicy": .object(["type": .string("readOnly")]),
+                "cwd": .string(sandbox.path),
                 "outputSchema": request.outputSchema
             ])
         ]))
