@@ -77,8 +77,12 @@ public actor WhisperKitFinalTranscriber {
         let ordered = tracks.sorted { $0.source.rawValue < $1.source.rawValue }
         let results = await decoder.decodeFiles(
             paths: ordered.map { $0.fileURL.path },
+            // See the live engine: `skipSpecialTokens` defaults to false, which
+            // leaves `<|startoftranscript|>` and the `<|6.88|>` timestamp
+            // tokens inside the decoded segment text.
             options: DecodingOptions(
                 language: languageCode,
+                skipSpecialTokens: true,
                 wordTimestamps: true,
                 chunkingStrategy: .vad
             )

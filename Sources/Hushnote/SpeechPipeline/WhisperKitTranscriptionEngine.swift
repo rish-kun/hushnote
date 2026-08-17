@@ -237,8 +237,16 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         // `chunkedOptions?.clipTimestamps = []` line in `transcribe(audioArray:)`),
         // so asking it to skip committed audio never worked. The window itself
         // is trimmed instead.
+        // `skipSpecialTokens` defaults to false, which makes WhisperKit decode
+        // the control vocabulary into the segment text it hands back:
+        // `<|startoftranscript|><|en|><|transcribe|>` on the first segment of a
+        // decode and a `<|6.88|>` timestamp token on either side of every one
+        // (`SegmentSeeker.swift`, the `options.skipSpecialTokens ? wordTokens :
+        // slicedTokens` lines). That text is what the app renders, stores,
+        // exports and cites, so it has to be asked for clean.
         let options = DecodingOptions(
             language: configuration.languageCode,
+            skipSpecialTokens: true,
             wordTimestamps: true,
             chunkingStrategy: .vad
         )
