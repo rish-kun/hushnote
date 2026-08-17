@@ -178,9 +178,10 @@ struct InsightPipelineTests {
             port: 18_080
         )
 
-        #expect(configuration.launchArguments == [
+        #expect(configuration.launchArguments(apiKey: "run-key") == [
             "--host", "127.0.0.1",
             "--port", "18080",
+            "--api-key", "run-key",
             "-m", "/Users/example/My Model.gguf"
         ])
         #expect(throws: InsightProviderError.self) {
