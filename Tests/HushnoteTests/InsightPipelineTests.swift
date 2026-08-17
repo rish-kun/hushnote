@@ -17,13 +17,13 @@ struct InsightPipelineTests {
         #expect(chunks.map { $0.segments.map(\.id) } == [["s1", "s2"], ["s2", "s3"]])
     }
 
-    @Test("Citation validation rejects fabricated evidence and canonicalizes timestamps")
+    @Test("Citation validation rejects fabricated evidence and keeps the segment's own timestamps")
     func validatesCitationsLocally() throws {
         let transcript = [segment("s1", start: 1_000, end: 2_000, text: "Ship the beta on Friday.")]
         let validCitation = EvidenceCitation(
             segmentID: "s1",
-            startMilliseconds: 99,
-            endMilliseconds: 100,
+            startMilliseconds: 1_000,
+            endMilliseconds: 2_000,
             quote: "beta on Friday"
         )
         let invalidCitation = EvidenceCitation(
@@ -33,7 +33,7 @@ struct InsightPipelineTests {
             quote: "release on Monday"
         )
         let draft = MeetingInsights(
-            overview: CitedInsight(id: "overview", text: "A beta date was discussed.", citations: [validCitation]),
+            overview: CitedInsight(id: "overview", text: "The beta ships on Friday.", citations: [validCitation]),
             keyPoints: [CitedInsight(id: "made-up", text: "Monday release", citations: [invalidCitation])]
         )
 
@@ -289,8 +289,8 @@ struct InsightPipelineTests {
             answer: "Friday.",
             citations: [EvidenceCitation(
                 segmentID: "s1",
-                startMilliseconds: 0,
-                endMilliseconds: 0,
+                startMilliseconds: 100,
+                endMilliseconds: 500,
                 quote: "launch is Friday"
             )]
         )
