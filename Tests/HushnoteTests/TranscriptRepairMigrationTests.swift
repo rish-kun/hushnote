@@ -192,6 +192,26 @@ final class TranscriptRepairMigrationTests: XCTestCase {
         XCTAssertEqual(repaired.map(\.id), ["w1", "w2"])
     }
 
+    /// Word timings are polluted independently of the segment text — the text
+    /// only ever carried the tokens Whisper put at the segment boundary — so a
+    /// row selected on `text` alone would leave them behind.
+    func testPollutedWordTimingsAreFoundWhenSegmentTextIsClean() throws {
+        let queue = try preRepairQueue()
+        try queue.write { db in
+            try insertSegment(
+                db,
+                id: "s4b",
+                text: "Ship it.",
+                words: [word("w0", " Ship"), word("w1", " it.<|1.00|>")]
+            )
+        }
+
+        try runRepair(queue)
+
+        XCTAssertEqual(try words(queue, of: "s4b").map(\.text), [" Ship", " it."])
+        XCTAssertEqual(try column(queue, "text", of: "s4b"), "Ship it.")
+    }
+
     /// Segment text that is nothing but control tokens is emptied, not deleted.
     /// A migration repairs rows; dropping them would change a user's transcript
     /// out from under them and take any edit history with it.
