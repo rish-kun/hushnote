@@ -8,27 +8,41 @@ public protocol CodexAppServerTransport: Sendable {
 }
 
 public actor ProcessCodexAppServerTransport: CodexAppServerTransport {
-    private let executableURL: URL
+    private let explicitExecutableURL: URL?
+    private let resolver: AgentExecutableResolver
     private let arguments: [String]
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
 
     public init(
-        executableURL: URL = URL(fileURLWithPath: "/usr/bin/env"),
-        arguments: [String] = ["codex", "app-server", "--listen", "stdio://"]
+        executableURL: URL? = nil,
+        arguments: [String] = ["app-server", "--listen", "stdio://"],
+        resolver: AgentExecutableResolver = AgentExecutableResolver()
     ) {
-        self.executableURL = executableURL
+        self.explicitExecutableURL = executableURL
         self.arguments = arguments
+        self.resolver = resolver
     }
+
+    /// Where `codex` actually is. Resolved on every start rather than at init,
+    /// so a tool installed after launch is picked up and a missing one is
+    /// reported as a missing tool instead of a spawn failure.
+    public func executable() throws -> URL {
+        if let explicitExecutableURL { return explicitExecutableURL }
+        return try resolver.resolve("codex")
+    }
+
+    public func launchArguments() -> [String] { arguments }
 
     public func start() throws {
         guard process == nil else { return }
         let process = Process()
         let inputPipe = Pipe()
         let outputPipe = Pipe()
-        process.executableURL = executableURL
+        process.executableURL = try executable()
         process.arguments = arguments
+        process.environment = AgentProcessEnvironment.minimal()
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = FileHandle.nullDevice
