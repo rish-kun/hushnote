@@ -325,6 +325,8 @@ struct SettingsView: View {
                         Text("Uses Codex App Server’s managed login and Codex rate limits. It does not expose ChatGPT history.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    } else if let tool = state.selectedProvider.agentCLITool {
+                        AgentCLIStatusView(tool: tool)
                     } else {
                         TextField("Path to llama-server executable", text: Binding(
                             get: { coordinator.localLlamaExecutablePath },
@@ -373,5 +375,55 @@ struct SettingsView: View {
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Says whether a coding-agent CLI can actually be used before a meeting is
+/// committed to it. "Not installed", "signed out" and "updated past the flags
+/// Hushnote relies on" are all things worth knowing here rather than halfway
+/// through a summary.
+struct AgentCLIStatusView: View {
+    let tool: AgentCLITool
+    @Environment(AppCoordinator.self) private var coordinator
+    @State private var problem: String?
+    @State private var isChecking = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Runs the \(tool.executableName) you are already signed into, with its tools switched off and nothing but an empty folder to read. No API key needed. The transcript is sent to that provider.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if isChecking {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking \(tool.executableName)…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else if let problem {
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.vermilionInk)
+                    .accessibilityLabel(problem)
+            } else {
+                Text("\(tool.displayName) is ready.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button("Check again") { check() }
+                .buttonStyle(.bordered)
+                .disabled(isChecking)
+        }
+        .task(id: tool) { check() }
+    }
+
+    private func check() {
+        isChecking = true
+        Task {
+            problem = await coordinator.agentCLIUnavailability(tool)
+            isChecking = false
+        }
     }
 }

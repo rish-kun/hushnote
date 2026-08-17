@@ -793,7 +793,23 @@ final class AppCoordinator {
             return AnthropicInsightProvider(model: "claude-sonnet-4-5-20250929", credentials: credentials)
         case .chatGPT:
             return codexProvider
+        case .claudeCLI, .codexCLI, .opencodeCLI:
+            guard let tool = state.selectedProvider.agentCLITool else {
+                throw CoordinatorError.providerUnavailable("Choose a provider in Settings.")
+            }
+            return AgentCLIProvider(tool: tool)
         }
+    }
+
+    /// Why a CLI provider cannot be used yet, or nil when it can.
+    ///
+    /// Asked in Settings rather than discovered halfway through a summary: the
+    /// tool may not be installed, may be signed out, or may have been updated
+    /// past the flags Hushnote uses to switch its tools off.
+    func agentCLIUnavailability(_ tool: AgentCLITool) async -> String? {
+        guard case .unavailable(let reason) = await AgentCLIProvider(tool: tool).healthCheck()
+        else { return nil }
+        return reason
     }
 
     private func transcriptSegments(for id: UUID) async throws -> [TranscriptSegment] {

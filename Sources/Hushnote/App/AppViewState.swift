@@ -189,9 +189,23 @@ enum InsightProviderChoice: String, CaseIterable, Identifiable {
     case openAI = "OpenAI API"
     case anthropic = "Anthropic API"
     case chatGPT = "ChatGPT via Codex"
+    case claudeCLI = "Claude Code CLI"
+    case codexCLI = "Codex CLI"
+    case opencodeCLI = "opencode CLI"
 
     var id: Self { self }
     var isLocal: Bool { self == .local }
+
+    /// The coding-agent CLI this choice drives, for the choices that are one.
+    /// These reuse a sign-in the user already has, so they need no API key.
+    var agentCLITool: AgentCLITool? {
+        switch self {
+        case .claudeCLI: .claude
+        case .codexCLI: .codex
+        case .opencodeCLI: .opencode
+        case .local, .openAI, .anthropic, .chatGPT: nil
+        }
+    }
 }
 
 /// A failure the app has to own, because the person who caused it is not

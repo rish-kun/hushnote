@@ -6,6 +6,9 @@ public struct InsightProviderDescriptor: Codable, Equatable, Sendable {
         case anthropic
         case llamaCpp
         case codexAppServer
+        case claudeCLI
+        case codexCLI
+        case opencodeCLI
     }
 
     public let id: String
@@ -70,6 +73,9 @@ public enum InsightProviderError: Error, Equatable, LocalizedError, Sendable {
     case localServiceUnavailable
     case rpcError(code: Int, message: String)
     case processExited(Int32)
+    case timedOut
+    case agentAttemptedTool(String)
+    case transcriptLeaked(String)
 
     public var errorDescription: String? {
         switch self {
@@ -80,7 +86,12 @@ public enum InsightProviderError: Error, Equatable, LocalizedError, Sendable {
         case .malformedResponse: "The provider returned a malformed response."
         case .localServiceUnavailable: "The selected local model service is unavailable."
         case .rpcError(_, let message): "Codex App Server error: \(message)"
-        case .processExited(let status): "Codex App Server exited with status \(status)."
+        case .processExited(let status): "The provider process exited with status \(status)."
+        case .timedOut: "The provider took too long and was stopped."
+        case .agentAttemptedTool(let name):
+            "The agent tried to use the \(name) tool, which Hushnote had disabled. The summary was discarded."
+        case .transcriptLeaked(let file):
+            "The transcript was written to \(file), which Hushnote does not own. The summary was discarded."
         }
     }
 }
