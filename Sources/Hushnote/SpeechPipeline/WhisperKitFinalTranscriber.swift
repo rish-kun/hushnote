@@ -122,12 +122,15 @@ public actor WhisperKitFinalTranscriber {
                     let words = (segment.words ?? []).enumerated().map { wordIndex, word in
                         TranscriptWord(
                             id: TranscriptIdentifier.word(segmentID: id, index: wordIndex),
-                            text: word.word,
+                            text: WhisperSpecialToken.cleanedWordText(word.word),
                             startMilliseconds: milliseconds(word.start),
                             endMilliseconds: milliseconds(word.end),
                             confidence: word.probability
                         )
                     }
+                    // A word that was nothing but control tokens carries no
+                    // speech, so it is dropped rather than stored empty.
+                    .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                     return TranscriptSegment(
                         id: id,
                         meetingID: meetingID,
@@ -135,7 +138,7 @@ public actor WhisperKitFinalTranscriber {
                         revision: revision,
                         startMilliseconds: start,
                         endMilliseconds: end,
-                        text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                        text: WhisperSpecialToken.cleanedSegmentText(segment.text),
                         words: words,
                         confidence: exp(segment.avgLogprob),
                         stability: .final

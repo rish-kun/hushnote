@@ -285,12 +285,15 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
             let words = (segment.words ?? []).enumerated().map { index, word in
                 TranscriptWord(
                     id: TranscriptIdentifier.word(segmentID: id, index: index),
-                    text: word.word,
+                    text: WhisperSpecialToken.cleanedWordText(word.word),
                     startMilliseconds: origin + milliseconds(word.start),
                     endMilliseconds: origin + milliseconds(word.end),
                     confidence: word.probability
                 )
             }
+            // A word that was nothing but control tokens carries no speech.
+            // Keeping it would store an empty row that scrubbing can seek to.
+            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             return TranscriptSegment(
                 id: id,
                 meetingID: configuration.meetingID,
@@ -298,7 +301,7 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
                 revision: buffer.revision + 1,
                 startMilliseconds: start,
                 endMilliseconds: end,
-                text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                text: WhisperSpecialToken.cleanedSegmentText(segment.text),
                 words: words,
                 confidence: min(1, max(0, exp(segment.avgLogprob))),
                 stability: .partial
@@ -326,8 +329,9 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         // Preserve a text-only result from unusual decoding paths that do not
         // produce timestamped segments.
         if hypothesis.isEmpty,
-            let text = result.map(\.text).joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let text = WhisperSpecialToken
+                .cleanedSegmentText(result.map(\.text).joined(separator: " "))
+                .nilIfEmpty
         {
             let duration = Int64(Double(decodedSamples.count) / 16.0)
             let id = TranscriptIdentifier.segment(
