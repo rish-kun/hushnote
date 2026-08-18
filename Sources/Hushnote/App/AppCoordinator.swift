@@ -71,6 +71,7 @@ final class AppCoordinator {
         // The models screen writes the choice down; this is where a later launch
         // reads it back, before anything can render the draft.
         SpeechModelDefaults.apply(to: &self.state.draft, from: defaults)
+        self.state.liveTranscriptionEnabled = SpeechModelDefaults.liveTranscriptionEnabled(from: defaults)
     }
 
     func bootstrap() async {
@@ -148,7 +149,16 @@ final class AppCoordinator {
                 state.meetings[index].status = .recording
             }
             state.markRecordingStarted(meetingID: meeting.id)
-            startLiveTranscription(meetingID: meeting.id, generation: generation)
+            // With the live pass off, no Whisper model is loaded during capture
+            // at all: the Neural Engine is left alone and the final pass
+            // produces the only transcript. The notice goes up in its place,
+            // because the transcript pane's empty state otherwise says it is
+            // listening for a conversation that nothing is listening to.
+            if state.liveTranscriptionEnabled {
+                startLiveTranscription(meetingID: meeting.id, generation: generation)
+            } else {
+                state.recordingNotice = LiveTranscriptionPolicy.notice(isEnabled: false)
+            }
         } catch {
             if let audioPipeline {
                 _ = try? await audioPipeline.stop()
@@ -266,7 +276,12 @@ final class AppCoordinator {
             )
             try await store.saveAudioTrack(systemTrack)
 
-            state.updateFinalization(stage: .stoppingLiveTranscription, progress: 0.15)
+            state.updateFinalization(
+                stage: LiveTranscriptionPolicy.stageAfterSavingAudio(
+                    isEnabled: state.liveTranscriptionEnabled
+                ),
+                progress: 0.15
+            )
             liveSetupTask?.cancel()
             // Do not await this task. WhisperKit/Core ML model construction does
             // not reliably cooperate with cancellation.
@@ -311,7 +326,8 @@ final class AppCoordinator {
                 finalSegments = snapshot.segments
             } catch {
                 logger.warning("Final ASR unavailable; preserving live transcript: \(error.localizedDescription, privacy: .public)")
-                guard !liveSegments.isEmpty else { throw error }
+                guard LiveTranscriptionPolicy.fallback(liveSegmentCount: liveSegments.count)
+                    == .keepLiveTranscript else { throw error }
                 finalSegments = liveSegments
             }
             if !finalSegments.isEmpty {
@@ -660,6 +676,16 @@ final class AppCoordinator {
         downloadGeneration += 1
         task.cancel()
         modelAvailability[model.id] = .notInstalled
+    }
+
+    /// Turns the live pass on or off and remembers the answer.
+    ///
+    /// Takes effect from the next meeting: a capture already running has either
+    /// loaded a model or not, and swapping that out underneath it would be a
+    /// worse surprise than the setting not applying until Stop.
+    func setLiveTranscriptionEnabled(_ isEnabled: Bool) {
+        state.liveTranscriptionEnabled = isEnabled
+        SpeechModelDefaults.store(liveTranscriptionEnabled: isEnabled, in: defaults)
     }
 
     /// Makes a model the one meetings use, and gets it here if it is not.

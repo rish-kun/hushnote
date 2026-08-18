@@ -149,6 +149,59 @@ struct MeetingDraft: Equatable {
     var summaryInstructions = ""
 }
 
+/// Whether a meeting is transcribed while it happens, and what follows from
+/// the answer.
+///
+/// Running a live pass means a second Whisper model resident on the same Neural
+/// Engine the final pass will use, and a small model's guesses on screen while
+/// people are still talking. Turning it off is not a single `if`: a progress
+/// bar that reports "Stopping live transcription…" for work that never started
+/// is a lie, and the live transcript is also the only thing standing under a
+/// final pass that fails.
+enum LiveTranscriptionPolicy {
+    /// What the recording screen says when there will be no live text.
+    ///
+    /// The transcript pane's own empty state says "Listening for the
+    /// conversation…", which is not true when nothing is listening. This sits
+    /// directly above it. It deliberately does not claim anything is in
+    /// progress -- a spinner over work that is not happening is worse than no
+    /// spinner at all.
+    nonisolated static func notice(isEnabled: Bool) -> String? {
+        isEnabled
+            ? nil
+            : "Live transcription is off. Audio is being written to disk; the transcript is produced in one pass after you press Stop."
+    }
+
+    /// The stages a finalization actually goes through, in order.
+    nonisolated static func stages(isEnabled: Bool) -> [FinalizationStage] {
+        var stages: [FinalizationStage] = [.savingAudio]
+        if isEnabled { stages.append(.stoppingLiveTranscription) }
+        stages.append(contentsOf: [.loadingFinalModel, .transcribing, .diarizing, .generatingInsights])
+        return stages
+    }
+
+    /// The stage reached once the audio file is closed. There is no live
+    /// session to tear down when none was started.
+    nonisolated static func stageAfterSavingAudio(isEnabled: Bool) -> FinalizationStage {
+        isEnabled ? .stoppingLiveTranscription : .loadingFinalModel
+    }
+
+    /// What to do when the final pass fails.
+    ///
+    /// A live transcript in hand beats losing the meeting. With none -- because
+    /// the live pass was off, or ran and produced nothing -- there is nothing
+    /// to keep, and the failure has to surface so the user can retry
+    /// finalization against audio that is still on disk.
+    nonisolated static func fallback(liveSegmentCount: Int) -> FinalPassFallback {
+        liveSegmentCount > 0 ? .keepLiveTranscript : .surfaceFailure
+    }
+}
+
+enum FinalPassFallback: Equatable, Sendable {
+    case keepLiveTranscript
+    case surfaceFailure
+}
+
 /// Where the chosen speech models live between launches.
 ///
 /// There was nowhere: `MeetingDraft` was rebuilt from its own literals on every
@@ -160,6 +213,20 @@ struct MeetingDraft: Equatable {
 enum SpeechModelDefaults {
     static let liveKey = "speechModel.live"
     static let finalKey = "speechModel.final"
+    static let liveTranscriptionKey = "speechModel.liveTranscription"
+
+    /// On for a machine that has never been asked, because that is what the app
+    /// already does. `UserDefaults.bool(forKey:)` answers false for a key that
+    /// was never written, which would turn the live pass off for everyone who
+    /// has not touched the setting -- so absence is read as the default rather
+    /// than as a choice.
+    nonisolated static func liveTranscriptionEnabled(from defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: liveTranscriptionKey) as? Bool ?? true
+    }
+
+    nonisolated static func store(liveTranscriptionEnabled: Bool, in defaults: UserDefaults) {
+        defaults.set(liveTranscriptionEnabled, forKey: liveTranscriptionKey)
+    }
 
     /// Only catalog identifiers are adopted. `SpeechModelResolver` falls through
     /// to Large v3 for a name it does not recognise, so a stored identifier the
@@ -315,6 +382,10 @@ final class AppViewState {
     var searchMatchedMeetingIDs: Set<UUID>?
     var selectedProvider = InsightProviderChoice.local
     var retainAudio = false
+    /// Whether the meeting is transcribed while it happens. Off trades the live
+    /// feed for not paying the Neural Engine twice; the final pass then
+    /// produces the only transcript. See `LiveTranscriptionPolicy`.
+    var liveTranscriptionEnabled = true
     var activeMeetingID: UUID?
     var selectedWorkspaceTab = "Notes"
     var question = ""

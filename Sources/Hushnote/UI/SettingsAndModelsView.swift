@@ -614,6 +614,20 @@ struct SettingsView: View {
                 Text("Settings")
                     .font(HushnoteTheme.Font.pageTitle)
 
+                settingsSection("TRANSCRIPTION") {
+                    Toggle(
+                        "Transcribe while the meeting is happening",
+                        isOn: Binding(
+                            get: { state.liveTranscriptionEnabled },
+                            set: { coordinator.setLiveTranscriptionEnabled($0) }
+                        )
+                    )
+                    Text("When off, no speech model is loaded during capture: the audio is written to disk and \(SpeechModelResolver.model(named: state.draft.finalModel).displayName) produces the transcript in one pass after you press Stop. That leaves the Neural Engine to the recording and keeps a smaller model's guesses off the screen, at the cost of having nothing to read until the meeting ends.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 620, alignment: .leading)
+                }
+
                 settingsSection("PRIVACY") {
                     Toggle("Keep audio after finalization", isOn: $state.retainAudio)
                     Text("When off, temporary CAF tracks are removed after the final transcript and speaker pass succeed.")
