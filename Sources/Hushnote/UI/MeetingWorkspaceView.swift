@@ -177,6 +177,11 @@ struct CompletedMeetingView: View {
                     Button("Markdown") { coordinator.export(meetingID: meetingID, format: .markdown) }
                     Button("SubRip (.srt)") { coordinator.export(meetingID: meetingID, format: .srt) }
                     Button("JSON") { coordinator.export(meetingID: meetingID, format: .json) }
+                    Divider()
+                    Button(MeetingAudioExport.menuTitle(isAvailable: canExportAudio)) {
+                        coordinator.exportAudio(meetingID: meetingID)
+                    }
+                    .disabled(!canExportAudio)
                 } label: {
                     Label("Export", systemImage: "square.and.arrow.up")
                 }
@@ -214,6 +219,13 @@ struct CompletedMeetingView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: meetingID) { await coordinator.loadMeeting(meetingID) }
+    }
+
+    /// Answered from the loaded meeting rather than from disk: this is read
+    /// every time the menu is built. See `MeetingAudioExport`.
+    private var canExportAudio: Bool {
+        guard let meeting else { return false }
+        return MeetingAudioExport.isAvailable(retainsAudio: meeting.retainsAudio, status: meeting.status)
     }
 
     private var meeting: MeetingListItem? {

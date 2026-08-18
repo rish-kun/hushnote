@@ -1,12 +1,60 @@
 import AppKit
 import Foundation
 
-enum MeetingExportFormat: String {
+/// The formats a transcript is serialized into. The meeting's audio is not one
+/// of them: it is a file that already exists and is copied, not a document
+/// this type builds.
+enum TranscriptExportFormat: String {
     case markdown
     case srt
     case json
 
     var fileExtension: String { rawValue == "markdown" ? "md" : rawValue }
+}
+
+/// Whether the recording itself can be handed over, and which file that is.
+///
+/// Audio is deleted the moment a meeting finalizes unless the user asked to
+/// keep it, so for most meetings there is nothing to export.
+enum MeetingAudioExport {
+    /// Decided from the loaded meeting, not from the disk: this answers on
+    /// every render of the export menu, and a meeting directory must not be
+    /// listed that often. The model can still be stale — audio deleted under a
+    /// meeting already on screen — so the export path checks disk for real.
+    ///
+    /// Deletion only happens after a *successful* finalization. A meeting that
+    /// never got there still holds its recording, and that recording is the
+    /// only copy of the meeting.
+    nonisolated static func isAvailable(retainsAudio: Bool, status: MeetingStatus) -> Bool {
+        switch status {
+        case .recording, .finalizing, .interrupted, .failed: return true
+        case .idle, .ready: return retainsAudio
+        }
+    }
+
+    /// The take worth exporting. A meeting directory can hold several — each
+    /// capture retry allocates its own — and the one holding the most audio is
+    /// the meeting. Pre-take `system.caf` recordings are still found.
+    nonisolated static func source(in directory: URL, fileManager: FileManager = .default) -> URL? {
+        AudioPipeline.longestTake(in: directory, fileManager: fileManager)
+    }
+
+    /// The extension comes off the file itself. A `.caf` offered as `.m4a` is a
+    /// file no player will open.
+    nonisolated static func filename(title: String, source: URL) -> String {
+        MeetingExporter.sanitized(title) + "." + source.pathExtension
+    }
+
+    /// A disabled item with no explanation is a dead end, so the item says why
+    /// it cannot be pressed. Keeping it in place for every meeting is what
+    /// makes the feature discoverable at all.
+    nonisolated static func menuTitle(isAvailable: Bool) -> String {
+        isAvailable ? "Audio (.caf)" : "Audio (not kept for this meeting)"
+    }
+
+    /// Said when the model offered the option but the disk disagrees.
+    static let missingAudioMessage =
+        "This meeting's audio is no longer on disk. It is removed after finalization unless Settings keeps it."
 }
 
 enum MeetingExporter {
@@ -15,7 +63,7 @@ enum MeetingExporter {
         meeting: MeetingListItem,
         transcript: [TranscriptSegment],
         insights: InsightWorkspaceState,
-        format: MeetingExportFormat
+        format: TranscriptExportFormat
     ) throws {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = sanitized(meeting.title) + "." + format.fileExtension
@@ -36,6 +84,29 @@ enum MeetingExporter {
             data = try encoder.encode(payload)
         }
         try data.write(to: destination, options: .atomic)
+    }
+
+    /// Hands over the recording itself.
+    ///
+    /// A meeting's audio runs to hundreds of megabytes, so it is never read
+    /// into memory the way the text formats are — the file is copied.
+    @MainActor
+    static func exportAudio(meeting: MeetingListItem, source: URL) throws {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = MeetingAudioExport.filename(title: meeting.title, source: source)
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        try copyAudio(from: source, to: destination)
+    }
+
+    /// `copyItem` refuses a destination that exists, and the save panel has
+    /// already asked the user about replacing that file by the time we get
+    /// here, so the answer they gave is honoured.
+    static func copyAudio(from source: URL, to destination: URL, fileManager: FileManager = .default) throws {
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.copyItem(at: source, to: destination)
     }
 
     private static func markdown(
@@ -86,7 +157,7 @@ enum MeetingExporter {
         return String(format: "%02lld:%02lld:%02lld,%03lld", hours, minutes, seconds, millis)
     }
 
-    private static func sanitized(_ value: String) -> String {
+    static func sanitized(_ value: String) -> String {
         value.replacingOccurrences(of: "/", with: "-").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

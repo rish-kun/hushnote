@@ -38,8 +38,8 @@ struct ModelCatalogTests {
 
     @Test("Export formats expose stable file extensions")
     func exportExtensions() {
-        #expect(MeetingExportFormat.markdown.fileExtension == "md")
-        #expect(MeetingExportFormat.srt.fileExtension == "srt")
-        #expect(MeetingExportFormat.json.fileExtension == "json")
+        #expect(TranscriptExportFormat.markdown.fileExtension == "md")
+        #expect(TranscriptExportFormat.srt.fileExtension == "srt")
+        #expect(TranscriptExportFormat.json.fileExtension == "json")
     }
 }

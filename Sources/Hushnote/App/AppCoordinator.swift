@@ -745,11 +745,29 @@ final class AppCoordinator {
         }
     }
 
-    func export(meetingID: UUID, format: MeetingExportFormat) {
+    func export(meetingID: UUID, format: TranscriptExportFormat) {
         guard let meeting = state.meetings.first(where: { $0.id == meetingID }) else { return }
         let transcript = cachedSegments[meetingID] ?? []
         do {
             try MeetingExporter.export(meeting: meeting, transcript: transcript, insights: state.insights, format: format)
+        } catch {
+            state.report(.export, error.localizedDescription)
+        }
+    }
+
+    /// Copies the meeting's own recording out. The menu already decided this
+    /// meeting should keep audio, but that decision is made from the loaded
+    /// model and the file can be gone anyway -- deleted by a finalization that
+    /// finished while this meeting sat on screen. Say so rather than opening a
+    /// save panel that would produce nothing.
+    func exportAudio(meetingID: UUID) {
+        guard let meeting = state.meetings.first(where: { $0.id == meetingID }) else { return }
+        guard let source = MeetingAudioExport.source(in: recoveryAudioDirectory(for: meetingID)) else {
+            state.report(.export, MeetingAudioExport.missingAudioMessage)
+            return
+        }
+        do {
+            try MeetingExporter.exportAudio(meeting: meeting, source: source)
         } catch {
             state.report(.export, error.localizedDescription)
         }
@@ -959,7 +977,8 @@ final class AppCoordinator {
             template: state.draft.template,
             excerpt: excerpt,
             isRecoverable: meeting.status == .interrupted,
-            status: meeting.status
+            status: meeting.status,
+            retainsAudio: meeting.retainsAudio
         )
         if let index = state.meetings.firstIndex(where: { $0.id == meeting.id }) {
             state.meetings[index] = replacement
@@ -977,7 +996,8 @@ final class AppCoordinator {
             template: .general,
             excerpt: meeting.status == .interrupted ? "Recording can be recovered and finalized." : "Local meeting transcript",
             isRecoverable: meeting.status == .interrupted,
-            status: meeting.status
+            status: meeting.status,
+            retainsAudio: meeting.retainsAudio
         )
     }
 
@@ -1010,10 +1030,16 @@ final class AppCoordinator {
         state.insights.error = nil
     }
 
-    private func registerRecoveryAudio(for meetingID: UUID) async throws {
-        let directory = applicationDataURL
+    /// Where a meeting's takes live, whether they are being recovered or
+    /// exported.
+    private func recoveryAudioDirectory(for meetingID: UUID) -> URL {
+        applicationDataURL
             .appending(path: "RecoveryAudio", directoryHint: .isDirectory)
             .appending(path: meetingID.uuidString, directoryHint: .isDirectory)
+    }
+
+    private func registerRecoveryAudio(for meetingID: UUID) async throws {
+        let directory = recoveryAudioDirectory(for: meetingID)
         // A meeting may hold several takes if capture was retried; recover the
         // longest one. Pre-take `system.caf` recordings are still found.
         guard let url = AudioPipeline.longestTake(in: directory) else { return }

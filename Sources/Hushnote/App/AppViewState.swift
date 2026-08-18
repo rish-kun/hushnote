@@ -260,6 +260,10 @@ struct MeetingListItem: Identifiable, Equatable {
     var excerpt: String
     var isRecoverable: Bool = false
     var status: MeetingStatus = .idle
+    /// Whether this meeting was recorded with "Keep audio after finalization"
+    /// on. Carried on the item so the export menu can decide what to offer
+    /// without listing a directory on every render. See `MeetingAudioExport`.
+    var retainsAudio: Bool = false
 }
 
 struct TranscriptLineItem: Identifiable, Equatable {
