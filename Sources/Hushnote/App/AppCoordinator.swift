@@ -151,13 +151,12 @@ final class AppCoordinator {
             state.markRecordingStarted(meetingID: meeting.id)
             // With the live pass off, no Whisper model is loaded during capture
             // at all: the Neural Engine is left alone and the final pass
-            // produces the only transcript. The notice goes up in its place,
-            // because the transcript pane's empty state otherwise says it is
-            // listening for a conversation that nothing is listening to.
+            // produces the only transcript. Nothing is announced here -- the
+            // transcript pane's own empty state says it, which is where a
+            // person is already looking. `recordingNotice` stays for the case
+            // it is actually about: a live pass that was asked for and failed.
             if state.liveTranscriptionEnabled {
                 startLiveTranscription(meetingID: meeting.id, generation: generation)
-            } else {
-                state.recordingNotice = LiveTranscriptionPolicy.notice(isEnabled: false)
             }
         } catch {
             if let audioPipeline {

@@ -92,9 +92,11 @@ struct ActiveMeetingView: View {
                 // tens of times a second.
                 SystemLevelMeter()
                 Spacer()
-                Label("Live text is provisional", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if state.liveTranscriptionEnabled {
+                    Label("Live text is provisional", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 30)
             .padding(.vertical, 11)
@@ -113,13 +115,21 @@ struct ActiveMeetingView: View {
             }
 
             if state.transcript.isEmpty {
+                // With live transcription off nothing is listening for text, so
+                // the pane says what will actually happen instead. See
+                // `LiveTranscriptionPolicy.emptyTranscript`.
+                let empty = LiveTranscriptionPolicy.emptyTranscript(isEnabled: state.liveTranscriptionEnabled)
                 VStack(spacing: 13) {
-                    Image(systemName: "waveform")
+                    Image(systemName: empty.symbol)
                         .font(.system(size: 28, weight: .light))
-                        .foregroundStyle(HushnoteTheme.vermilionInk)
-                    Text("Listening for the conversation…")
+                        .foregroundStyle(
+                            state.liveTranscriptionEnabled
+                                ? AnyShapeStyle(HushnoteTheme.vermilionInk)
+                                : AnyShapeStyle(.secondary)
+                        )
+                    Text(empty.title)
                         .font(HushnoteTheme.Font.emptyStateTitle)
-                    Text("The source tracks are already being written to disk.")
+                    Text(empty.detail)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }

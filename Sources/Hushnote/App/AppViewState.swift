@@ -159,17 +159,32 @@ struct MeetingDraft: Equatable {
 /// is a lie, and the live transcript is also the only thing standing under a
 /// final pass that fails.
 enum LiveTranscriptionPolicy {
-    /// What the recording screen says when there will be no live text.
+    /// What the transcript pane says while it holds nothing.
     ///
-    /// The transcript pane's own empty state says "Listening for the
-    /// conversation…", which is not true when nothing is listening. This sits
-    /// directly above it. It deliberately does not claim anything is in
-    /// progress -- a spinner over work that is not happening is worse than no
-    /// spinner at all.
-    nonisolated static func notice(isEnabled: Bool) -> String? {
+    /// With the live pass off, "Listening for the conversation…" is a lie:
+    /// nothing is listening for a transcript, and the text arrives in one pass
+    /// when the meeting is finalized. The off copy deliberately implies no work
+    /// in flight -- a spinner over work that is not happening is worse than no
+    /// spinner at all -- so it carries its own symbol rather than the waveform,
+    /// which reads as sound being taken in.
+    struct EmptyTranscriptCopy: Equatable {
+        let symbol: String
+        let title: String
+        let detail: String
+    }
+
+    nonisolated static func emptyTranscript(isEnabled: Bool) -> EmptyTranscriptCopy {
         isEnabled
-            ? nil
-            : "Live transcription is off. Audio is being written to disk; the transcript is produced in one pass after you press Stop."
+            ? EmptyTranscriptCopy(
+                symbol: "waveform",
+                title: "Listening for the conversation…",
+                detail: "The source tracks are already being written to disk."
+            )
+            : EmptyTranscriptCopy(
+                symbol: "waveform.slash",
+                title: "Live transcription is off",
+                detail: "The audio is being written to disk. The transcript is produced in one pass after you press Stop."
+            )
     }
 
     /// The stages a finalization actually goes through, in order.

@@ -10,25 +10,6 @@ import Testing
 /// transcript is also the safety net under a final pass that fails.
 @Suite("Realtime transcription policy")
 struct RealtimeTranscriptionPolicyTests {
-    @Test("Nothing is announced when the live pass is running normally")
-    func noNoticeWhenEnabled() {
-        #expect(LiveTranscriptionPolicy.notice(isEnabled: true) == nil)
-    }
-
-    /// The recording screen's empty state says "Listening for the
-    /// conversation…", which is not true when nothing is listening. The notice
-    /// sits directly above it and says what will actually happen.
-    @Test("A capture with no live pass says so, without implying work in flight")
-    func noticeWhenDisabled() {
-        let notice = LiveTranscriptionPolicy.notice(isEnabled: false)
-
-        #expect(notice != nil)
-        #expect(notice?.contains("off") == true)
-        #expect(notice?.contains("Stop") == true)
-        // Nothing is transcribing during capture, so nothing may say it is.
-        #expect(notice?.lowercased().contains("transcribing") == false)
-    }
-
     @Test("Finalization does not report a step that never happens")
     func stagesDropTheLivePassTeardown() {
         let withLive = LiveTranscriptionPolicy.stages(isEnabled: true)
@@ -98,5 +79,36 @@ struct RealtimeTranscriptionDefaultsTests {
         let defaults = scratchDefaults()
         #expect(defaults.bool(forKey: SpeechModelDefaults.liveTranscriptionKey) == false)
         #expect(SpeechModelDefaults.liveTranscriptionEnabled(from: defaults))
+    }
+}
+
+/// The transcript pane's own empty state is what a person actually reads while
+/// a meeting runs. With the live pass off it said "Listening for the
+/// conversation…" for a conversation nothing was listening to.
+@Suite("Recording empty state")
+struct RecordingEmptyStateTests {
+    @Test("A running live pass still says it is listening")
+    func enabledKeepsTheListeningCopy() {
+        let copy = LiveTranscriptionPolicy.emptyTranscript(isEnabled: true)
+
+        #expect(copy.title == "Listening for the conversation…")
+        #expect(copy.detail == "The source tracks are already being written to disk.")
+        #expect(copy.symbol == "waveform")
+    }
+
+    @Test("With no live pass, the empty state says when the transcript arrives")
+    func disabledSaysWhatWillHappen() {
+        let copy = LiveTranscriptionPolicy.emptyTranscript(isEnabled: false)
+
+        #expect(copy.title != LiveTranscriptionPolicy.emptyTranscript(isEnabled: true).title)
+        #expect(copy.title.lowercased().contains("listening") == false)
+        #expect(copy.detail.lowercased().contains("listening") == false)
+        // What it must actually say: the pass is off, and Stop is when text appears.
+        #expect(copy.title.lowercased().contains("off"))
+        #expect(copy.detail.contains("Stop"))
+        // Nothing is transcribing during capture, so nothing may claim to be.
+        #expect(copy.detail.lowercased().contains("transcribing") == false)
+        // A waveform reads as sound being taken in. Nothing is.
+        #expect(copy.symbol != "waveform")
     }
 }
