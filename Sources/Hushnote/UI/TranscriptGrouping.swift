@@ -203,3 +203,34 @@ enum TranscriptGrouping {
         }
     }
 }
+
+extension TranscriptParagraph {
+    /// Whether anything but prose belongs above this paragraph.
+    ///
+    /// The header is apparatus, and apparatus that repeats stops being read.
+    /// A paragraph that merely continues the same voice in the same stretch of
+    /// the recording draws nothing at all: the break itself is the signal.
+    var showsHeader: Bool {
+        speakerLabel != nil || timestamp != nil || possibleLeakage
+    }
+}
+
+/// Which paragraph, if any, is currently open for correction.
+///
+/// Editing a transcript is per segment, and a paragraph is opened to reveal the
+/// segments inside it. The identity held while that is open is a paragraph's --
+/// which is a segment identity, minted by `TranscriptIdentifier` -- so it stops
+/// answering to anything the moment the transcript is replaced. Resolving it
+/// against the paragraphs actually on screen is what keeps an editor from
+/// outliving the text it was opened over; the row crash `9615daf` fixed was the
+/// same mistake made with an array index.
+enum TranscriptEditingFocus {
+    nonisolated static func surviving(
+        _ editing: UUID?,
+        isEditable: Bool,
+        in paragraphs: [TranscriptParagraph]
+    ) -> UUID? {
+        guard isEditable, let editing else { return nil }
+        return paragraphs.contains(where: { $0.id == editing }) ? editing : nil
+    }
+}

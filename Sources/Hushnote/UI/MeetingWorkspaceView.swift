@@ -418,26 +418,58 @@ enum TranscriptRowText {
     }
 }
 
+/// The transcript, read as prose.
+///
+/// The pane used to draw one row per ASR segment, and Whisper emits a segment
+/// every few seconds: a fixed timestamp column, a fixed speaker column and a
+/// fragment like "having a", several hundred times over. `TranscriptGrouping`
+/// decides where a paragraph begins; this only draws them.
+///
+/// Correcting the transcript is still per segment. A paragraph is a block of
+/// text until it is opened, and opening it reveals the segments inside as
+/// individual fields -- so a correction is written back to the one segment it
+/// belongs to, and a merged paragraph is never written over a single segment's
+/// text. Only one paragraph is open at a time, and it closes by itself if the
+/// transcript underneath it is replaced.
 struct TranscriptView: View {
     let isEditable: Bool
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @State private var isFollowing = true
+    @State private var openParagraph: UUID?
 
     var body: some View {
+        // One linear pass over the transcript. A paragraph that did not change
+        // compares equal to the one it replaces, so a segment arriving live
+        // rebuilds the paragraph it joins and leaves everything above it alone.
+        let paragraphs = TranscriptGrouping.paragraphs(state.transcript)
+        let open = TranscriptEditingFocus.surviving(
+            openParagraph,
+            isEditable: isEditable,
+            in: paragraphs
+        )
+
         ScrollViewReader { proxy in
             ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(state.transcript) { line in
-                    TranscriptRow(line: line, isEditable: isEditable) { text in
-                        commit(line: line, text: text)
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(paragraphs) { paragraph in
+                        TranscriptParagraphView(
+                            paragraph: paragraph,
+                            isEditable: isEditable,
+                            isOpen: open == paragraph.id,
+                            toggleOpen: {
+                                openParagraph = open == paragraph.id ? nil : paragraph.id
+                            },
+                            onEdit: commit
+                        )
                     }
-                    Divider().opacity(0.42)
                 }
-            }
-            .frame(maxWidth: HushnoteTheme.contentMaxWidth, alignment: .leading)
-            .padding(.horizontal, 38)
-            .padding(.vertical, 20)
+                .frame(maxWidth: HushnoteTheme.transcriptMeasure, alignment: .leading)
+                .padding(.horizontal, 38)
+                // Every paragraph brings its own space above it, so the pane
+                // only has to add the last one's worth at the bottom.
+                .padding(.top, 2)
+                .padding(.bottom, 34)
             }
             // A live transcript is a live region: VoiceOver should not treat a
             // new line as a layout change to re-announce from the top.
@@ -451,19 +483,23 @@ struct TranscriptView: View {
             } action: { _, following in
                 isFollowing = following
             }
-            .onChange(of: state.transcript.last?.id) { _, last in
-                guard isFollowing, let last else { return }
+            // Still driven by the arriving segment rather than by the paragraph:
+            // a segment that joins the paragraph already on screen lengthens it
+            // without changing its identity, and the pane has to keep up with
+            // that too.
+            .onChange(of: state.transcript.last?.id) { _, _ in
+                guard isFollowing, let anchor = paragraphs.last?.id else { return }
                 withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(last, anchor: .bottom)
+                    proxy.scrollTo(anchor, anchor: .bottom)
                 }
             }
             .overlay(alignment: .bottomTrailing) {
                 // Only offered once the user has actually left the bottom, so
                 // it never competes with the transcript it would scroll.
-                if !isFollowing, let last = state.transcript.last?.id {
+                if !isFollowing, let anchor = paragraphs.last?.id {
                     Button {
                         withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(last, anchor: .bottom)
+                            proxy.scrollTo(anchor, anchor: .bottom)
                         }
                         isFollowing = true
                     } label: {
@@ -479,7 +515,10 @@ struct TranscriptView: View {
             }
         }
         .overlay {
-            if state.transcript.isEmpty {
+            // Asked of the paragraphs rather than the segments: a transcript of
+            // nothing but control tokens has no prose in it, and an empty pane
+            // would say nothing at all.
+            if paragraphs.isEmpty {
                 ContentUnavailableView("No transcript", systemImage: "text.quote", description: Text("The final transcript has not been produced yet."))
             }
         }
@@ -497,7 +536,129 @@ struct TranscriptView: View {
     }
 }
 
-/// One transcript line.
+/// One paragraph: prose, and only the apparatus it earns.
+///
+/// The name of a speaker and the time appear above the paragraph, small and
+/// quiet, and only where `TranscriptGrouping` decided a reader needs them. A
+/// paragraph that continues the same voice in the same stretch of the recording
+/// carries nothing at all -- the break is the signal.
+private struct TranscriptParagraphView: View {
+    let paragraph: TranscriptParagraph
+    let isEditable: Bool
+    let isOpen: Bool
+    let toggleOpen: () -> Void
+    let onEdit: (TranscriptLineItem, String) -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if paragraph.showsHeader || isOpen { header }
+            if isOpen { segments } else { prose }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // A hover target the whole width of the measure, so the correction
+        // affordance in the margin can be reached from anywhere in the
+        // paragraph rather than only from the words themselves.
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .overlay(alignment: .topLeading) { correctionAffordance }
+        // A new voice or a new time opens a section and is given room; a
+        // paragraph that merely continues gets a paragraph's worth of space.
+        .padding(.top, paragraph.showsHeader ? 26 : 13)
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 9) {
+            if let speaker = paragraph.speakerLabel {
+                Text(speaker)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(
+                        speaker == "You" ? HushnoteTheme.moss : HushnoteTheme.secondaryInk
+                    )
+            }
+            if let timestamp = paragraph.timestamp {
+                TimestampButton(seconds: timestamp)
+            }
+            if paragraph.possibleLeakage {
+                Image(systemName: "waveform.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help("This may duplicate audio leaking between tracks")
+            }
+            if isOpen {
+                Spacer(minLength: 12)
+                Button("Done", action: toggleOpen)
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(HushnoteTheme.vermilionInk)
+            }
+        }
+    }
+
+    /// The paragraph as one block of text, built run by run so that live text
+    /// arriving mid-paragraph can still read as provisional without breaking
+    /// the paragraph in two.
+    private var prose: some View {
+        proseText
+            .font(HushnoteTheme.Font.reading)
+            .foregroundStyle(HushnoteTheme.ink)
+            .lineSpacing(7)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+    }
+
+    private var proseText: Text {
+        paragraph.runs.enumerated().reduce(Text(verbatim: "")) { accumulated, entry in
+            let run = Text(verbatim: entry.element.text)
+            let styled = entry.element.isProvisional
+                ? run.foregroundStyle(HushnoteTheme.secondaryInk).italic()
+                : run
+            return entry.offset == 0
+                ? accumulated + styled
+                : accumulated + Text(verbatim: " ") + styled
+        }
+    }
+
+    /// The paragraph opened up: one field per segment, because one segment is
+    /// what a correction is written back to.
+    private var segments: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(paragraph.lines) { line in
+                TranscriptRow(line: line) { onEdit(line, $0) }
+            }
+        }
+        .padding(.vertical, 9)
+        .padding(.horizontal, 12)
+        .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8).stroke(HushnoteTheme.rule.opacity(0.7))
+        }
+    }
+
+    /// Kept out in the margin so it never sits over the prose, and kept out of
+    /// sight until the pointer is in the paragraph. It stays in the
+    /// accessibility tree either way.
+    @ViewBuilder
+    private var correctionAffordance: some View {
+        if isEditable, !isOpen {
+            Button(action: toggleOpen) {
+                Image(systemName: "pencil")
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .padding(4)
+            }
+            .buttonStyle(.plain)
+            .help("Correct this paragraph")
+            .accessibilityLabel("Correct this paragraph")
+            .accessibilityHint("Opens the segments in this paragraph for editing")
+            .opacity(isHovering ? 1 : 0)
+            .offset(x: -30, y: paragraph.showsHeader ? 25 : 1)
+        }
+    }
+}
+
+/// One segment, while its paragraph is open for correction.
 ///
 /// The row is handed its line by value and keeps its own draft, so it never
 /// reads back through the array it came from. The editor used to take a
@@ -506,64 +667,47 @@ struct TranscriptView: View {
 /// freshly identified segments, a focused field's `controlTextDidEndEditing`
 /// read the old position and `Array._checkSubscript` trapped. The row's
 /// identity is the line's, so a replacement tears the row down and builds a new
-/// one instead of re-reading a position that has moved.
+/// one instead of re-reading a position that has moved -- and a paragraph that
+/// no longer exists closes rather than keeping a row alive over nothing.
 private struct TranscriptRow: View {
     let line: TranscriptLineItem
-    let isEditable: Bool
     let onEdit: (String) -> Void
 
     @State private var draft: String
     @FocusState private var isFocused: Bool
 
-    init(line: TranscriptLineItem, isEditable: Bool, onEdit: @escaping (String) -> Void) {
+    init(line: TranscriptLineItem, onEdit: @escaping (String) -> Void) {
         self.line = line
-        self.isEditable = isEditable
         self.onEdit = onEdit
         _draft = State(initialValue: TranscriptRowText.display(line.text))
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 15) {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             TimestampButton(seconds: line.start)
-                .frame(width: 58, alignment: .leading)
-            Text(line.speaker)
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(line.speaker == "You" ? HushnoteTheme.moss : HushnoteTheme.secondaryInk)
-                .frame(width: 86, alignment: .leading)
-            if isEditable {
-                TextField("Transcript", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...8)
-                    .focused($isFocused)
-                    .onChange(of: line.text) { _, incoming in
-                        guard let next = TranscriptRowText.reseededDraft(
-                            incoming: incoming,
-                            draft: draft,
-                            isFocused: isFocused
-                        ) else { return }
-                        draft = next
-                    }
-                    .onChange(of: draft) { previous, text in
-                        guard TranscriptEditPolicy.isHumanEdit(
-                            isFocused: isFocused,
-                            from: previous,
-                            to: text
-                        ) else { return }
-                        onEdit(text)
-                    }
-            } else {
-                Text(TranscriptRowText.display(line.text))
-                    .foregroundStyle(line.isProvisional ? .secondary : .primary)
-                    .italic(line.isProvisional)
-                    .textSelection(.enabled)
-            }
-            if line.possibleLeakage {
-                Image(systemName: "waveform.badge.exclamationmark")
-                    .foregroundStyle(.orange)
-                    .help("This may duplicate audio leaking between tracks")
-            }
+            TextField("Transcript", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(HushnoteTheme.Font.reading)
+                .lineLimit(1...8)
+                .focused($isFocused)
+                .onChange(of: line.text) { _, incoming in
+                    guard let next = TranscriptRowText.reseededDraft(
+                        incoming: incoming,
+                        draft: draft,
+                        isFocused: isFocused
+                    ) else { return }
+                    draft = next
+                }
+                .onChange(of: draft) { previous, text in
+                    guard TranscriptEditPolicy.isHumanEdit(
+                        isFocused: isFocused,
+                        from: previous,
+                        to: text
+                    ) else { return }
+                    onEdit(text)
+                }
         }
-        .padding(.vertical, 15)
+        .padding(.vertical, 4)
     }
 }
 

@@ -147,6 +147,12 @@ enum HushnoteTheme {
 
     static let sidebarWidth: CGFloat = 248
     static let contentMaxWidth: CGFloat = 940
+    /// The measure the transcript is set to. Narrower than a page, because a
+    /// line of prose that runs the full width of a window is read by hopping
+    /// rather than by scanning: this is around 70 characters of
+    /// `Font.reading`, which is where the eye finds the next line without
+    /// looking for it.
+    static let transcriptMeasure: CGFloat = 660
 }
 
 extension View {
