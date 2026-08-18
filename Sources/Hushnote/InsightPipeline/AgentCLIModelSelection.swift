@@ -205,4 +205,22 @@ public enum AgentCLIModelMenu {
     public static func showsMenu(discovered: [String], stored: String?) -> Bool {
         !options(discovered: discovered, stored: stored).isEmpty
     }
+
+    /// What the field says will happen, in the same sentence whether something
+    /// was chosen or not. An empty field is a real answer -- "whatever the CLI
+    /// is set to" -- and saying so is the difference between a blank control
+    /// that looks unfinished and one that reads as deliberate.
+    public static func caption(
+        executableName: String,
+        resolution: AgentCLIModelName.Resolution
+    ) -> String {
+        switch resolution {
+        case .unset:
+            "Leave this empty and \(executableName) uses its own default model."
+        case .valid(let model):
+            "Summaries will ask \(executableName) for \(model)."
+        case .rejected(let reason):
+            "\(reason) Until then, \(executableName)'s own default model is used."
+        }
+    }
 }

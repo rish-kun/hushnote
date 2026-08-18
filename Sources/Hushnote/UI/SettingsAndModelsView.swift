@@ -348,6 +348,99 @@ struct APIKeyField: View {
     }
 }
 
+/// Which model the chosen CLI should run.
+///
+/// Two affordances, because the tools disagree about how knowable their models
+/// are: a menu of what this one actually listed, and a field that takes
+/// anything. The field is the real control -- `codex` names no models at all,
+/// and a CLI that is missing, signed out or offline names none either -- so the
+/// menu appears beside it only when there is something to open it onto.
+///
+/// Empty is a deliberate answer, not an unfinished one: it leaves `--model` off
+/// the command line entirely, so the CLI runs whatever the user configured in
+/// it rather than a model Hushnote picked for them.
+struct AgentCLIModelField: View {
+    let tool: AgentCLITool
+    @Environment(AppCoordinator.self) private var coordinator
+    @State private var entry = ""
+    @State private var discovered: [String] = []
+    @State private var isDiscovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 9) {
+                TextField("Model", text: $entry)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 320)
+                    .accessibilityLabel("Model for \(tool.executableName)")
+                    .onChange(of: entry) { coordinator.setAgentCLIModel(entry, for: tool) }
+
+                if AgentCLIModelMenu.showsMenu(discovered: discovered, stored: stored) {
+                    Menu("Choose…") {
+                        ForEach(options, id: \.self) { model in
+                            Button(model) { entry = model }
+                        }
+                        Divider()
+                        Button("\(tool.executableName)'s own default") { entry = "" }
+                    }
+                    .fixedSize()
+                    .accessibilityLabel("Models \(tool.executableName) offers")
+                } else if isDiscovering {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            Text(caption)
+                .font(.caption)
+                .foregroundStyle(captionStyle)
+                .frame(maxWidth: 620, alignment: .leading)
+                .accessibilityLabel(caption)
+
+            if let note = listingNote {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 620, alignment: .leading)
+            }
+        }
+        .task(id: tool) {
+            entry = coordinator.agentCLIModel(for: tool)
+            discovered = []
+            isDiscovering = true
+            discovered = await coordinator.agentCLIModels(tool)
+            isDiscovering = false
+        }
+    }
+
+    private var resolution: AgentCLIModelName.Resolution { AgentCLIModelName.resolve(entry) }
+
+    private var stored: String? { AgentCLIModelName.argument(entry) }
+
+    private var options: [String] {
+        AgentCLIModelMenu.options(discovered: discovered, stored: stored)
+    }
+
+    private var caption: String {
+        AgentCLIModelMenu.caption(executableName: tool.executableName, resolution: resolution)
+    }
+
+    private var captionStyle: AnyShapeStyle {
+        if case .rejected = resolution { return AnyShapeStyle(HushnoteTheme.vermilionInk) }
+        return AnyShapeStyle(.secondary)
+    }
+
+    /// Why there is no menu, when there is no menu. A tool that lists nothing
+    /// and a tool that could not be asked are different situations, and neither
+    /// should read as the control having failed to load.
+    private var listingNote: String? {
+        guard !isDiscovering, discovered.isEmpty else { return nil }
+        guard tool.modelListing != nil else {
+            return "\(tool.executableName) does not list the models it takes, so type the name you want."
+        }
+        return "\(tool.executableName) listed no models just now. Type the name you want."
+    }
+}
+
 /// The small segmented bar Handy uses to compare models at a glance. Five
 /// segments, filled to an ordinal rank -- see `ModelListPolicy`'s meters for
 /// why it is a rank and not a number.
@@ -656,6 +749,7 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     } else if let tool = state.selectedProvider.agentCLITool {
                         AgentCLIStatusView(tool: tool)
+                        AgentCLIModelField(tool: tool)
                     } else {
                         TextField("Path to llama-server executable", text: Binding(
                             get: { coordinator.localLlamaExecutablePath },

@@ -923,8 +923,31 @@ final class AppCoordinator {
             guard let tool = state.selectedProvider.agentCLITool else {
                 throw CoordinatorError.providerUnavailable("Choose a provider in Settings.")
             }
-            return AgentCLIProvider(tool: tool)
+            return AgentCLIProvider(
+                tool: tool,
+                model: AgentCLIModelDefaults.model(for: tool, from: defaults)
+            )
         }
+    }
+
+    /// The model this CLI is asked for, as it should appear in the field.
+    /// Empty means nothing was chosen and the CLI's own default is used.
+    func agentCLIModel(for tool: AgentCLITool) -> String {
+        AgentCLIModelDefaults.model(for: tool, from: defaults) ?? ""
+    }
+
+    /// Remembers which model a CLI should run. Kept per tool, because the
+    /// three do not share a namespace of model names.
+    func setAgentCLIModel(_ raw: String, for tool: AgentCLITool) {
+        AgentCLIModelDefaults.store(raw, for: tool, in: defaults)
+    }
+
+    /// The models this CLI says it takes, for Settings to offer alongside the
+    /// field. An empty answer is ordinary -- codex names none, and a tool that
+    /// is missing or signed out names none either -- and means the field is
+    /// the whole control.
+    func agentCLIModels(_ tool: AgentCLITool) async -> [String] {
+        await AgentCLIProvider(tool: tool).availableModels()
     }
 
     /// Why a CLI provider cannot be used yet, or nil when it can.

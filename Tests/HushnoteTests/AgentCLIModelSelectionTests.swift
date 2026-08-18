@@ -249,6 +249,27 @@ struct AgentCLIModelSelectionTests {
         )
     }
 
+    @Test("The caption names the model that will run, or says the CLI's default will")
+    func explainsWhatWillRun() {
+        let unset = AgentCLIModelMenu.caption(executableName: "codex", resolution: .unset)
+        #expect(unset.contains("codex"))
+        #expect(unset.lowercased().contains("default"))
+
+        let chosen = AgentCLIModelMenu.caption(
+            executableName: "codex",
+            resolution: .valid("gpt-5.1-codex-max")
+        )
+        #expect(chosen.contains("gpt-5.1-codex-max"))
+
+        let refused = AgentCLIModelMenu.caption(
+            executableName: "codex",
+            resolution: .rejected(reason: "A model name cannot start with a dash.")
+        )
+        #expect(refused.contains("A model name cannot start with a dash."))
+        // A refusal has to say what happens instead, or the field looks broken.
+        #expect(refused.contains("codex"))
+    }
+
     private static func scratchDefaults() -> UserDefaults {
         let defaults = UserDefaults(suiteName: "hushnote.tests.\(UUID().uuidString)")!
         for tool in AgentCLITool.allCases {

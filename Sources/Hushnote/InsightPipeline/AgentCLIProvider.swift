@@ -101,6 +101,23 @@ public actor AgentCLIProvider: InsightProvider {
         return .available
     }
 
+    /// The models this tool says it takes, for Settings to offer.
+    ///
+    /// Every way this can go wrong ends in an empty list rather than an error:
+    /// the tool may name no models at all, may not be installed, may be signed
+    /// out, may need a network it does not have, or may have renamed the
+    /// command since. None of that stops a summary, because the model can
+    /// always be typed instead — so none of it is worth surfacing as a failure.
+    ///
+    /// Only the listing command runs. It reads; it is never given a prompt.
+    public func availableModels() async -> [String] {
+        guard let listing = tool.modelListing,
+              let executable = try? resolver.resolve(tool.executableName),
+              let result = try? await probe(executable, arguments: listing.arguments)
+        else { return [] }
+        return listing.models(in: result.standardOutput + "\n" + result.standardError)
+    }
+
     public func complete(_ request: InsightProviderRequest) async throws -> String {
         let executable = try resolver.resolve(tool.executableName)
         let sandbox = try AgentSandboxDirectory.make(label: tool.rawValue)
