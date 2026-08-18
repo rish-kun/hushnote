@@ -1,4 +1,5 @@
 import Foundation
+import WhisperKit
 
 /// How far a model download has got, and how fast it is moving.
 ///
@@ -107,5 +108,123 @@ enum ModelDownloadText {
             return String(format: "%.0f KB/s", bytesPerSecond / 1_000)
         }
         return String(format: "%.0f B/s", bytesPerSecond)
+    }
+}
+
+/// Fetching a model's artifacts, separated from loading them.
+///
+/// The two were one call: `downloadModel` asked the engine to `load(model:)`,
+/// which downloads, prewarms and compiles in a single opaque await. Splitting
+/// them is what lets the screen show a fetch that is 24% done, and what lets a
+/// test drive that screen without touching the network.
+protocol SpeechModelDownloading: Sendable {
+    /// - Parameter onProgress: fractional progress, and the byte rate the
+    ///   transport measured for this chunk when it measured one.
+    /// - Returns: the folder the model's artifacts are in.
+    func download(
+        model: SpeechModel,
+        onProgress: @escaping @Sendable (Double, Double?) -> Void
+    ) async throws -> URL
+}
+
+/// The real thing. `WhisperKit.download(variant:progressCallback:)` yields a
+/// `Progress` per HTTP chunk; HubApi hangs the rate it measured for that chunk
+/// on it under `ProgressUserInfoKey.throughputKey` when it has one.
+///
+/// Cancellation is Task cancellation: HubApi wraps its transfer in
+/// `withTaskCancellationHandler` and tells the downloader to stop, so
+/// cancelling the task that calls this is enough.
+struct WhisperKitModelDownloader: SpeechModelDownloading {
+    func download(
+        model: SpeechModel,
+        onProgress: @escaping @Sendable (Double, Double?) -> Void
+    ) async throws -> URL {
+        try await WhisperKit.download(
+            variant: model.runtimeIdentifier,
+            progressCallback: { progress in
+                onProgress(
+                    progress.fractionCompleted,
+                    progress.userInfo[.throughputKey] as? Double
+                )
+            }
+        )
+    }
+}
+
+/// The running rate average, in a box.
+///
+/// The progress callback is `@Sendable` and fires from whatever thread finished
+/// a chunk, but an estimator carries state across calls. Hopping to an actor per
+/// chunk would let two reports land out of order, and a progress bar that goes
+/// backwards for a frame is worse than one that is a little late.
+private final class RateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var estimator: ModelDownloadRateEstimator
+
+    init(totalBytes: Int64) {
+        estimator = ModelDownloadRateEstimator(totalBytes: totalBytes)
+    }
+
+    func record(fraction: Double, at time: TimeInterval, reported: Double?) -> Double? {
+        lock.lock()
+        defer { lock.unlock() }
+        return estimator.record(fraction: fraction, at: time, reportedBytesPerSecond: reported)
+    }
+}
+
+/// Drives one model download from asked-for to on disk, reporting every state
+/// the row should show.
+///
+/// This is deliberately not a method on `AppCoordinator`: the coordinator opens
+/// the real meeting database in its initialiser and cannot be built in a test,
+/// and the two states most worth pinning down -- cancelled, and
+/// landed-but-would-not-load -- are exactly the ones a real download will not
+/// produce on demand.
+struct ModelDownloadRunner: Sendable {
+    private let downloader: any SpeechModelDownloading
+    private let now: @Sendable () -> TimeInterval
+
+    init(
+        downloader: any SpeechModelDownloading,
+        now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
+        self.downloader = downloader
+        self.now = now
+    }
+
+    /// - Parameter install: what to do with the artifacts once they are on
+    ///   disk. Loading is separate from fetching, and it can fail on its own:
+    ///   Core ML compilation is where a model that downloaded perfectly still
+    ///   does not come up, and calling that row "Ready" is how a meeting starts
+    ///   against a model that is not there.
+    /// - Parameter report: every state the row should show, ending in `.ready`,
+    ///   `.failed` or -- for a cancellation -- `.notInstalled`.
+    func run(
+        model: SpeechModel,
+        install: @Sendable (URL) async throws -> Void,
+        report: @escaping @Sendable (ModelAvailability) -> Void
+    ) async {
+        let rate = RateBox(totalBytes: model.approximateDownloadBytes)
+        do {
+            let folder = try await downloader.download(model: model) { fraction, reported in
+                report(
+                    .downloading(
+                        ModelDownloadProgress(
+                            fraction: fraction,
+                            bytesPerSecond: rate.record(fraction: fraction, at: now(), reported: reported)
+                        )
+                    )
+                )
+            }
+            try Task.checkCancellation()
+            try await install(folder)
+            report(.ready)
+        } catch is CancellationError {
+            // Stopping a download is not a failure, and a row that says
+            // "Retry" after the user pressed Cancel is arguing with them.
+            report(.notInstalled)
+        } catch {
+            report(Task.isCancelled ? .notInstalled : .failed(error.localizedDescription))
+        }
     }
 }

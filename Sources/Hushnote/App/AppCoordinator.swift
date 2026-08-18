@@ -46,9 +46,19 @@ final class AppCoordinator {
     @ObservationIgnored private var cachedSegments: [UUID: [TranscriptSegment]] = [:]
     @ObservationIgnored private var pendingEditTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingNoteTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private let downloader: any SpeechModelDownloading
+    @ObservationIgnored private let defaults: UserDefaults
+    /// One per model, so a download can be cancelled by the row that started it.
+    @ObservationIgnored private var downloadTasks: [String: Task<Void, Never>] = [:]
 
-    init(state: AppViewState) {
+    init(
+        state: AppViewState,
+        downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
+        defaults: UserDefaults = .standard
+    ) {
         self.state = state
+        self.downloader = downloader
+        self.defaults = defaults
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "Hushnote", directoryHint: .isDirectory)
         applicationDataURL = base
@@ -58,6 +68,9 @@ final class AppCoordinator {
         } catch {
             fatalError("Unable to open the local Hushnote database: \(error.localizedDescription)")
         }
+        // The models screen writes the choice down; this is where a later launch
+        // reads it back, before anything can render the draft.
+        SpeechModelDefaults.apply(to: &self.state.draft, from: defaults)
     }
 
     func bootstrap() async {
@@ -624,16 +637,85 @@ final class AppCoordinator {
             availability: modelAvailability[model.id] ?? .notInstalled,
             phase: state.recordingPhase
         ) else { return }
-        modelAvailability[model.id] = .downloading
-        do {
-            let engine = speechEngine ?? WhisperKitTranscriptionEngine()
-            try await engine.load(model: model)
-            speechEngine = engine
-            loadedModel = model
-            modelAvailability[model.id] = .ready
-        } catch {
-            modelAvailability[model.id] = .failed(error.localizedDescription)
-            state.markFailed(.init(kind: .modelDownload, message: "Model download failed: \(error.localizedDescription)"))
+        modelAvailability[model.id] = .downloading(.starting)
+
+        // The work runs in a task the coordinator owns so the row's Cancel
+        // button has something to cancel. HubApi wraps its transfer in
+        // `withTaskCancellationHandler`, so cancelling this stops the fetch
+        // rather than merely abandoning it.
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runDownload(model)
+        }
+        downloadTasks[model.id] = task
+        await task.value
+        downloadTasks[model.id] = nil
+    }
+
+    /// Stops a download in flight. Not gated on the recording phase: a transfer
+    /// started before Record is still saturating the same link during the
+    /// meeting, so stopping it is precisely what a busy machine needs to allow.
+    func cancelDownload(_ model: SpeechModel) {
+        guard let task = downloadTasks.removeValue(forKey: model.id) else { return }
+        downloadGeneration += 1
+        task.cancel()
+        modelAvailability[model.id] = .notInstalled
+    }
+
+    /// Makes a model the one meetings use, and gets it here if it is not.
+    ///
+    /// Choosing is what downloading means on this screen: the selection is
+    /// recorded and persisted first, so a download that fails leaves a row the
+    /// user can retry rather than a choice that silently did not take.
+    func setDefaultModel(_ model: SpeechModel) async {
+        state.draft.liveModel = model.id
+        state.draft.finalModel = model.id
+        SpeechModelDefaults.store(liveModelID: model.id, finalModelID: model.id, in: defaults)
+        guard modelAvailability[model.id] != .ready else { return }
+        await downloadModel(model)
+    }
+
+    /// The download itself, its progress reporting and its cancellation live in
+    /// `ModelDownloadRunner`, which is testable without opening the database
+    /// this class opens in its initialiser. What is left here is the part that
+    /// only the coordinator can do: writing the row's state where the screen
+    /// reads it, and keeping the loaded engine.
+    private func runDownload(_ model: SpeechModel) async {
+        let generation = downloadGeneration
+        await ModelDownloadRunner(downloader: downloader).run(
+            model: model,
+            install: { [weak self] folder in
+                guard let self else { throw CancellationError() }
+                try await self.installDownloadedModel(model, from: folder)
+            },
+            report: { [weak self] availability in
+                Task { @MainActor [weak self] in
+                    self?.applyDownloadState(availability, to: model.id, generation: generation)
+                }
+            }
+        )
+    }
+
+    private func installDownloadedModel(_ model: SpeechModel, from folder: URL) async throws {
+        let engine = speechEngine ?? WhisperKitTranscriptionEngine()
+        try await engine.load(model: model, modelFolder: folder)
+        speechEngine = engine
+        loadedModel = model
+    }
+
+    /// Bumped whenever a download is cancelled, so a chunk callback still in
+    /// flight cannot put a progress bar back on a row the user just cleared.
+    @ObservationIgnored private var downloadGeneration = 0
+
+    private func applyDownloadState(
+        _ availability: ModelAvailability,
+        to modelID: String,
+        generation: Int
+    ) {
+        guard generation == downloadGeneration else { return }
+        modelAvailability[modelID] = availability
+        if case .failed(let reason) = availability {
+            state.markFailed(.init(kind: .modelDownload, message: "Model download failed: \(reason)"))
         }
     }
 
@@ -650,8 +732,9 @@ final class AppCoordinator {
     /// Whether a key is already in the Keychain, so the field can say so.
     func hasStoredCredential(for provider: InsightProviderChoice) async -> Bool {
         guard let key = Self.credentialKey(for: provider) else { return false }
-        guard let stored = try? await credentials.credential(for: key) else { return false }
-        return stored != nil
+        // `try?` flattens the optional the store returns, so this is one test
+        // for both "the Keychain refused" and "there is nothing stored".
+        return (try? await credentials.credential(for: key)) != nil
     }
 
     /// Saves the key, then actually verifies it. The key is never held anywhere

@@ -69,15 +69,26 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     }
 
     public func load(model: SpeechModel) async throws {
+        try await load(model: model, modelFolder: nil)
+    }
+
+    /// - Parameter modelFolder: artifacts already fetched by
+    ///   `SpeechModelDownloading`. Loading used to mean downloading too, which
+    ///   is why the models screen could not show a fetch that was 24% done:
+    ///   the download was buried inside one opaque await that also prewarmed
+    ///   and compiled. Given a folder, WhisperKit loads from it and resolves
+    ///   nothing over the network.
+    public func load(model: SpeechModel, modelFolder: URL?) async throws {
         guard configuration == nil else { throw SpeechPipelineError.sessionAlreadyRunning }
         guard model.provider == .whisperKit else { throw SpeechPipelineError.modelNotLoaded }
 
         let config = WhisperKitConfig(
-            model: model.runtimeIdentifier,
+            model: modelFolder == nil ? model.runtimeIdentifier : nil,
+            modelFolder: modelFolder?.path,
             verbose: false,
             prewarm: true,
             load: true,
-            download: true
+            download: modelFolder == nil
         )
         decoder = WhisperKitDecoder(kit: try await WhisperKit(config))
     }
