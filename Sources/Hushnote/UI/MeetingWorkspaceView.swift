@@ -357,54 +357,44 @@ enum TranscriptEditPolicy {
     }
 }
 
+/// How a transcript row's editable draft keeps up with the model without
+/// taking the text away from whoever is typing.
+enum TranscriptRowText {
+    /// The draft to adopt when the line changes underneath an existing row, or
+    /// `nil` to leave the row alone.
+    ///
+    /// Two refusals matter. A focused row belongs to the user: re-seeding it
+    /// would drop their insertion point at the end of a sentence they did not
+    /// write. And an unchanged value is not a change: assigning it would
+    /// invalidate the row on every transcript revision for nothing.
+    ///
+    /// Because a re-seed only ever happens while the row is unfocused, and
+    /// `TranscriptEditPolicy.isHumanEdit` requires focus, a model-driven
+    /// replacement can never be written back as the user's correction.
+    nonisolated static func reseededDraft(
+        incoming: String,
+        draft: String,
+        isFocused: Bool
+    ) -> String? {
+        guard !isFocused, incoming != draft else { return nil }
+        return incoming
+    }
+}
+
 struct TranscriptView: View {
     let isEditable: Bool
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
-    @FocusState private var focusedLine: UUID?
     @State private var isFollowing = true
 
     var body: some View {
-        @Bindable var state = state
-
         ScrollViewReader { proxy in
             ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach($state.transcript) { $line in
-                    HStack(alignment: .top, spacing: 15) {
-                        TimestampButton(seconds: line.start)
-                            .frame(width: 58, alignment: .leading)
-                        Text(line.speaker)
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(line.speaker == "You" ? HushnoteTheme.moss : HushnoteTheme.secondaryInk)
-                            .frame(width: 86, alignment: .leading)
-                        if isEditable {
-                            TextField("Transcript", text: $line.text, axis: .vertical)
-                                .textFieldStyle(.plain)
-                                .lineLimit(1...8)
-                                .focused($focusedLine, equals: line.id)
-                                .onChange(of: line.text) { previous, text in
-                                    guard TranscriptEditPolicy.isHumanEdit(
-                                        isFocused: focusedLine == line.id,
-                                        from: previous,
-                                        to: text
-                                    ) else { return }
-                                    line.isUserEdited = true
-                                    coordinator.queueTranscriptEdit(id: line.segmentID, text: text)
-                                }
-                        } else {
-                            Text(line.text)
-                                .foregroundStyle(line.isProvisional ? .secondary : .primary)
-                                .italic(line.isProvisional)
-                                .textSelection(.enabled)
-                        }
-                        if line.possibleLeakage {
-                            Image(systemName: "waveform.badge.exclamationmark")
-                                .foregroundStyle(.orange)
-                                .help("This may duplicate audio leaking between tracks")
-                        }
+                ForEach(state.transcript) { line in
+                    TranscriptRow(line: line, isEditable: isEditable) { text in
+                        commit(line: line, text: text)
                     }
-                    .padding(.vertical, 15)
                     Divider().opacity(0.42)
                 }
             }
@@ -456,6 +446,87 @@ struct TranscriptView: View {
                 ContentUnavailableView("No transcript", systemImage: "text.quote", description: Text("The final transcript has not been produced yet."))
             }
         }
+    }
+
+    /// Records the correction against the line's identity, resolved at the
+    /// moment of the edit. The transcript may have been replaced since the row
+    /// was built; a position captured earlier would address a different line,
+    /// or none at all.
+    private func commit(line: TranscriptLineItem, text: String) {
+        if let index = state.transcript.firstIndex(where: { $0.id == line.id }) {
+            state.transcript[index].isUserEdited = true
+        }
+        coordinator.queueTranscriptEdit(id: line.segmentID, text: text)
+    }
+}
+
+/// One transcript line.
+///
+/// The row is handed its line by value and keeps its own draft, so it never
+/// reads back through the array it came from. The editor used to take a
+/// per-element binding out of `ForEach($state.transcript)`, and those resolve by
+/// position: when the final pass replaced the transcript with a shorter list of
+/// freshly identified segments, a focused field's `controlTextDidEndEditing`
+/// read the old position and `Array._checkSubscript` trapped. The row's
+/// identity is the line's, so a replacement tears the row down and builds a new
+/// one instead of re-reading a position that has moved.
+private struct TranscriptRow: View {
+    let line: TranscriptLineItem
+    let isEditable: Bool
+    let onEdit: (String) -> Void
+
+    @State private var draft: String
+    @FocusState private var isFocused: Bool
+
+    init(line: TranscriptLineItem, isEditable: Bool, onEdit: @escaping (String) -> Void) {
+        self.line = line
+        self.isEditable = isEditable
+        self.onEdit = onEdit
+        _draft = State(initialValue: line.text)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 15) {
+            TimestampButton(seconds: line.start)
+                .frame(width: 58, alignment: .leading)
+            Text(line.speaker)
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(line.speaker == "You" ? HushnoteTheme.moss : HushnoteTheme.secondaryInk)
+                .frame(width: 86, alignment: .leading)
+            if isEditable {
+                TextField("Transcript", text: $draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...8)
+                    .focused($isFocused)
+                    .onChange(of: line.text) { _, incoming in
+                        guard let next = TranscriptRowText.reseededDraft(
+                            incoming: incoming,
+                            draft: draft,
+                            isFocused: isFocused
+                        ) else { return }
+                        draft = next
+                    }
+                    .onChange(of: draft) { previous, text in
+                        guard TranscriptEditPolicy.isHumanEdit(
+                            isFocused: isFocused,
+                            from: previous,
+                            to: text
+                        ) else { return }
+                        onEdit(text)
+                    }
+            } else {
+                Text(line.text)
+                    .foregroundStyle(line.isProvisional ? .secondary : .primary)
+                    .italic(line.isProvisional)
+                    .textSelection(.enabled)
+            }
+            if line.possibleLeakage {
+                Image(systemName: "waveform.badge.exclamationmark")
+                    .foregroundStyle(.orange)
+                    .help("This may duplicate audio leaking between tracks")
+            }
+        }
+        .padding(.vertical, 15)
     }
 }
 
