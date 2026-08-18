@@ -90,6 +90,36 @@ public enum AgentCLITool: String, Sendable, CaseIterable {
         }
     }
 
+    // MARK: - models
+
+    /// The read-only command that makes this tool name the models it takes, or
+    /// nil when it names none.
+    ///
+    /// Probed on this machine on 2026-08-18, using nothing but listing
+    /// commands:
+    ///
+    /// - `opencode models` (1.18.18) prints one `provider/model` per line and
+    ///   nothing else, filtered to the providers the user is signed in to.
+    /// - `claude --help` (2.1.234) has no `models` subcommand; `--model` is
+    ///   where the aliases are written down, in its own help text.
+    /// - `codex` (0.147.0) enumerates nothing anywhere: `codex exec --help`
+    ///   documents `-m, --model <MODEL>` as "Model the agent should use" and
+    ///   there is no listing subcommand. It is nil on purpose, so the control
+    ///   shows a text field rather than an empty menu.
+    ///
+    /// Discovery is never a gate. Whatever this returns, and whether the
+    /// command succeeds at all, the user can still type an identifier.
+    public var modelListing: AgentCLIModelListing? {
+        switch self {
+        case .claude:
+            AgentCLIModelListing(arguments: ["--help"], shape: .quotedInHelp(flag: "--model"))
+        case .codex:
+            nil
+        case .opencode:
+            AgentCLIModelListing(arguments: ["models"], shape: .qualifiedIdentifierPerLine)
+        }
+    }
+
     // MARK: - authentication
 
     public var authProbeArguments: [String] {

@@ -266,6 +266,40 @@ enum SpeechModelDefaults {
     }
 }
 
+/// Which model each coding-agent CLI is asked to run, between launches.
+///
+/// One key per tool, because the tools do not share a namespace: a Codex model
+/// name means nothing to opencode, and carrying the last choice across a
+/// provider switch would send a meeting to a model that does not exist. Stored
+/// beside the speech-model choices and read the same way, through an injected
+/// `UserDefaults` so a test never touches the real domain.
+///
+/// Absence is the default state and means "whatever the CLI itself is
+/// configured to use". Hushnote does not name a model of its own: doing so
+/// would quietly override the user's own configuration on every summary.
+enum AgentCLIModelDefaults {
+    static let keyPrefix = "agentCLI.model."
+
+    static func key(for tool: AgentCLITool) -> String { keyPrefix + tool.rawValue }
+
+    /// Validated on the way out as well as in. The value ends up in an
+    /// argument vector, and the defaults domain is a file a person can edit.
+    nonisolated static func model(for tool: AgentCLITool, from defaults: UserDefaults) -> String? {
+        guard let stored = defaults.string(forKey: key(for: tool)) else { return nil }
+        return AgentCLIModelName.argument(stored)
+    }
+
+    /// Storing something unusable clears the key rather than keeping it, so a
+    /// cleared field and a refused one both land on the CLI's own default.
+    nonisolated static func store(_ raw: String, for tool: AgentCLITool, in defaults: UserDefaults) {
+        guard let model = AgentCLIModelName.argument(raw) else {
+            defaults.removeObject(forKey: key(for: tool))
+            return
+        }
+        defaults.set(model, forKey: key(for: tool))
+    }
+}
+
 struct MeetingListItem: Identifiable, Equatable {
     let id: UUID
     var title: String
