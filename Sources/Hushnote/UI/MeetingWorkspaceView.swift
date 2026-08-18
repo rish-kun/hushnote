@@ -357,9 +357,22 @@ enum TranscriptEditPolicy {
     }
 }
 
-/// How a transcript row's editable draft keeps up with the model without
-/// taking the text away from whoever is typing.
+/// What a transcript row puts on screen, and how its editable draft keeps up
+/// with the model without taking the text away from whoever is typing.
 enum TranscriptRowText {
+    /// Whisper's control vocabulary must never reach the screen.
+    ///
+    /// `skipSpecialTokens`, the engines' own sanitizing and the `v6` migration
+    /// all sit upstream of here, and the user still saw
+    /// `<|startoftranscript|><|en|><|transcribe|>` in the transcript pane: a
+    /// meeting captured before those landed is read back from a database this
+    /// launch may not have migrated. The view is the only place that can be
+    /// certain, and it costs one scan of a string that almost never contains
+    /// `<|`.
+    nonisolated static func display(_ text: String) -> String {
+        WhisperSpecialToken.cleanedSegmentText(text)
+    }
+
     /// The draft to adopt when the line changes underneath an existing row, or
     /// `nil` to leave the row alone.
     ///
@@ -370,14 +383,16 @@ enum TranscriptRowText {
     ///
     /// Because a re-seed only ever happens while the row is unfocused, and
     /// `TranscriptEditPolicy.isHumanEdit` requires focus, a model-driven
-    /// replacement can never be written back as the user's correction.
+    /// replacement -- including one that only differs by the tokens `display`
+    /// removed -- can never be written back as the user's correction.
     nonisolated static func reseededDraft(
         incoming: String,
         draft: String,
         isFocused: Bool
     ) -> String? {
-        guard !isFocused, incoming != draft else { return nil }
-        return incoming
+        guard !isFocused else { return nil }
+        let next = display(incoming)
+        return next == draft ? nil : next
     }
 }
 
@@ -482,7 +497,7 @@ private struct TranscriptRow: View {
         self.line = line
         self.isEditable = isEditable
         self.onEdit = onEdit
-        _draft = State(initialValue: line.text)
+        _draft = State(initialValue: TranscriptRowText.display(line.text))
     }
 
     var body: some View {
@@ -515,7 +530,7 @@ private struct TranscriptRow: View {
                         onEdit(text)
                     }
             } else {
-                Text(line.text)
+                Text(TranscriptRowText.display(line.text))
                     .foregroundStyle(line.isProvisional ? .secondary : .primary)
                     .italic(line.isProvisional)
                     .textSelection(.enabled)

@@ -32,6 +32,27 @@ struct TranscriptRowBindingTests {
         #expect(Self.focusedPosition >= final.count)
     }
 
+    // MARK: - A row is seeded by identity, never by position
+
+    /// The row is handed the line it renders. Feeding it a whole transcript and
+    /// a position is what made a replacement fatal.
+    @Test("A row's draft comes from its own line")
+    func rowSeedsFromItsOwnLine() {
+        let final = Self.finalTranscript()
+        #expect(TranscriptRowText.display(final[0].text) == "Oh, whoever is done.")
+        #expect(TranscriptRowText.display(final[1].text) == "When it was the...")
+    }
+
+    /// The replacement carries different identities, so SwiftUI tears the old
+    /// rows down and builds new ones: nothing survives to be re-read at a stale
+    /// position. Each new row seeds from the line it was built for.
+    @Test("Rows rebuilt after a replacement seed from the replacement")
+    func rowsRebuiltAfterReplacement() {
+        let final = Self.finalTranscript()
+        let seeded = final.map { TranscriptRowText.display($0.text) }
+        #expect(seeded == ["Oh, whoever is done.", "When it was the..."])
+    }
+
     // MARK: - Re-seeding an existing row
 
     @Test("An unfocused row adopts the model's new text")
@@ -65,7 +86,7 @@ struct TranscriptRowBindingTests {
     func unchangedLineDoesNotReseed() {
         #expect(
             TranscriptRowText.reseededDraft(
-                incoming: "we should ship on Friday",
+                incoming: "  we should ship on Friday  ",
                 draft: "we should ship on Friday",
                 isFocused: false
             ) == nil
@@ -79,7 +100,7 @@ struct TranscriptRowBindingTests {
     @Test("Re-seeding a row is never a human edit")
     func reseedIsNeverAHumanEdit() throws {
         let draft = "Oh, whoever is done."
-        let incoming = "When it was the..."
+        let incoming = "<|1.00|> When it was the...<|2.00|>"
         let reseeded = try #require(
             TranscriptRowText.reseededDraft(incoming: incoming, draft: draft, isFocused: false)
         )
@@ -102,8 +123,8 @@ struct TranscriptRowBindingTests {
 
     private static func finalTranscript() -> [TranscriptLineItem] {
         [
-            "Oh, whoever is done.",
-            "When it was the...",
+            "<|startoftranscript|><|en|><|transcribe|><|0.00|> Oh, whoever is done.<|1.16|>",
+            "<|1.00|> When it was the...<|2.00|>",
         ].enumerated().map { ordinal, text in
             line(pass: .final, ordinal: ordinal, text: text, isProvisional: false)
         }
