@@ -110,10 +110,20 @@ public actor AgentCLIProvider: InsightProvider {
     /// always be typed instead — so none of it is worth surfacing as a failure.
     ///
     /// Only the listing command runs. It reads; it is never given a prompt.
+    ///
+    /// Asked in the very environment a summary runs in, for the same reason the
+    /// lockdown probe is: opencode writes into a shared database with no off
+    /// switch, so even a listing has to be pointed at a temporary one, and the
+    /// models it names under that environment are the models it will actually
+    /// have when a meeting is sent to it.
     public func availableModels() async -> [String] {
         guard let listing = tool.modelListing,
               let executable = try? resolver.resolve(tool.executableName),
-              let result = try? await probe(executable, arguments: listing.arguments)
+              let result = try? await probe(
+                  executable,
+                  arguments: listing.arguments,
+                  environment: nil
+              )
         else { return [] }
         return listing.models(in: result.standardOutput + "\n" + result.standardError)
     }

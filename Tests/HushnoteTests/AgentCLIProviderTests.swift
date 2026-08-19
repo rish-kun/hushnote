@@ -493,6 +493,31 @@ struct AgentCLIModelChoiceTests {
         #expect(invocation.standardInput.isEmpty)
     }
 
+    @Test("Asking opencode for models does not touch the user's shared database")
+    func asksOpencodeUnderTheRunEnvironment() async throws {
+        let bin = try makeTemporaryBin()
+        defer { try? FileManager.default.removeItem(at: bin) }
+        try makeExecutable(named: "opencode", in: bin, mode: 0o755)
+        let runner = FakeAgentProcessRunner(results: [
+            .init(standardOutput: "opencode/big-pickle", standardError: "", exitCode: 0)
+        ])
+        let provider = AgentCLIProvider(
+            tool: .opencode,
+            resolver: AgentExecutableResolver(searchPaths: [bin]),
+            runner: runner
+        )
+
+        _ = await provider.availableModels()
+        let invocation = try #require(await runner.recorded().first)
+
+        // Listed under the very environment a summary runs in: opencode's
+        // conversation database is redirected there and its tools are off, and
+        // the models it names are the ones it will actually have.
+        #expect(invocation.environment["OPENCODE_DB"] != nil)
+        #expect(invocation.environment["OPENCODE_CONFIG_CONTENT"] != nil)
+        #expect(invocation.environment["OPENCODE_DISABLE_PROJECT_CONFIG"] == "1")
+    }
+
     @Test("A listing that fails leaves the text field to do the work")
     func toleratesAFailedListing() async throws {
         let bin = try makeTemporaryBin()
