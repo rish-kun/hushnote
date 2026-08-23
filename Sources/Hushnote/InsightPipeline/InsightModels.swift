@@ -39,6 +39,26 @@ public struct EvidenceCitation: Codable, Equatable, Sendable {
         self.endMilliseconds = endMilliseconds
         self.quote = quote
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case segmentID
+        case startMilliseconds
+        case endMilliseconds
+        case quote
+    }
+
+    /// Provider responses only need to identify and quote a transcript segment.
+    /// Timing is authoritative transcript metadata and is filled in by
+    /// `CitationValidator`; accepting an omitted value here avoids making a model
+    /// copy two integers perfectly before its otherwise valid evidence can be
+    /// checked. Persisted, validated citations still encode their real timings.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        segmentID = try container.decode(String.self, forKey: .segmentID)
+        startMilliseconds = try container.decodeIfPresent(Int64.self, forKey: .startMilliseconds) ?? -1
+        endMilliseconds = try container.decodeIfPresent(Int64.self, forKey: .endMilliseconds) ?? -1
+        quote = try container.decode(String.self, forKey: .quote)
+    }
 }
 
 public struct CitedInsight: Codable, Equatable, Sendable, Identifiable {
@@ -144,4 +164,3 @@ public struct ValidatedQuestionAnswer: Codable, Equatable, Sendable {
         self.validation = validation
     }
 }
-

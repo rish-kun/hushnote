@@ -3,6 +3,14 @@ import XCTest
 @testable import Hushnote
 
 final class PersistenceTests: XCTestCase {
+    /// A store on disk, so a second connection can watch what the first writes.
+    private func temporaryStore() throws -> (MeetingStore, URL, URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let databaseURL = directory.appending(path: "hushnote.sqlite")
+        return (try MeetingStore(databaseURL: databaseURL), databaseURL, directory)
+    }
+
     func testMeetingNotesRoundTripAndUpdatePreservesFormatting() async throws {
         let store = try MeetingStore(inMemory: ())
         let meeting = Meeting(title: "Weekly sync", notes: "Agenda\n- Launch")
@@ -114,6 +122,107 @@ final class PersistenceTests: XCTestCase {
         let newMatches = try await store.searchSegments("aurora")
         XCTAssertTrue(oldMatches.isEmpty)
         XCTAssertEqual(newMatches.map(\.id), ["s1"])
+    }
+
+    func testReupsertingAnUnchangedSegmentIssuesNoUpdate() async throws {
+        let (store, databaseURL, directory) = try temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let meeting = Meeting(title: "Steady state")
+        try await store.saveMeeting(meeting)
+        let segment = TranscriptSegment(
+            id: "s1",
+            meetingID: meeting.id,
+            source: .system,
+            revision: 1,
+            startMilliseconds: 0,
+            endMilliseconds: 1_000,
+            text: "quarterly budget review",
+            speakerName: "Ari",
+            stability: .stable
+        )
+        try await store.upsertSegments([segment])
+        try SearchIndexProbe.removeRow(forSegment: segment.id, at: databaseURL)
+
+        for _ in 0..<20 {
+            try await store.upsertSegments([segment])
+        }
+
+        let matches = try await store.searchSegments("quarterly")
+        XCTAssertTrue(
+            matches.isEmpty,
+            "an identical re-upsert must not issue an UPDATE, so the FTS trigger cannot fire"
+        )
+        let stored = try await store.segment(id: segment.id)
+        XCTAssertEqual(stored, segment)
+    }
+
+    func testUpsertScopesItsUpdateToTheColumnsThatChanged() async throws {
+        let (store, databaseURL, directory) = try temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let meeting = Meeting(title: "Scoped writes")
+        try await store.saveMeeting(meeting)
+        var segment = TranscriptSegment(
+            id: "s1",
+            meetingID: meeting.id,
+            source: .system,
+            revision: 1,
+            startMilliseconds: 0,
+            endMilliseconds: 1_000,
+            text: "quarterly budget review",
+            speakerName: "Ari",
+            stability: .stable
+        )
+        try await store.upsertSegments([segment])
+        try SearchIndexProbe.removeRow(forSegment: segment.id, at: databaseURL)
+
+        // Neither column the index holds is changing here, so the trigger must
+        // stay out of it even though the row is genuinely updated.
+        segment.revision = 2
+        segment.stability = .final
+        segment.confidence = 0.91
+        try await store.upsertSegments([segment])
+
+        let stale = try await store.searchSegments("quarterly")
+        XCTAssertTrue(stale.isEmpty)
+        let stored = try await store.segment(id: segment.id)
+        XCTAssertEqual(stored?.revision, 2)
+        XCTAssertEqual(stored?.stability, .final)
+        XCTAssertEqual(stored?.confidence, 0.91)
+    }
+
+    func testUpsertingChangedTextOrSpeakerStaysSearchable() async throws {
+        let (store, _, directory) = try temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let meeting = Meeting(title: "Corrections")
+        try await store.saveMeeting(meeting)
+        var segment = TranscriptSegment(
+            id: "s1",
+            meetingID: meeting.id,
+            source: .system,
+            revision: 1,
+            startMilliseconds: 0,
+            endMilliseconds: 1_000,
+            text: "quarterly budget review",
+            speakerName: "Ari",
+            stability: .stable
+        )
+        try await store.upsertSegments([segment])
+
+        segment.revision = 2
+        segment.text = "quarterly budget approved"
+        try await store.upsertSegments([segment])
+        let stale = try await store.searchSegments("review")
+        let corrected = try await store.searchSegments("approved")
+        XCTAssertTrue(stale.isEmpty)
+        XCTAssertEqual(corrected.map(\.id), ["s1"])
+
+        segment.revision = 3
+        segment.speakerName = "Rhea"
+        try await store.upsertSegments([segment])
+        let renamed = try await store.searchSegments("Rhea")
+        let stored = try await store.segment(id: "s1")
+        XCTAssertEqual(renamed.map(\.id), ["s1"])
+        XCTAssertEqual(stored, segment)
     }
 
     func testRecoveryMarksActiveMeetingsInterrupted() async throws {
@@ -542,6 +651,36 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(snapshots.map(\.output), [output])
         XCTAssertEqual(runs.map(\.status), [.succeeded])
         XCTAssertNotNil(runs[0].finishedAt)
+    }
+
+    func testInterruptedProviderRunsAreFailedAtRelaunchBoundary() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let first = Meeting(title: "Interrupted provider")
+        let second = Meeting(title: "Completed provider")
+        try await store.saveMeeting(first)
+        try await store.saveMeeting(second)
+        _ = try await store.beginProviderRun(
+            meetingID: first.id,
+            providerID: "cli-opencode",
+            purpose: "summary"
+        )
+        let completedID = try await store.beginProviderRun(
+            meetingID: second.id,
+            providerID: "cli-codex",
+            purpose: "summary"
+        )
+        try await store.finishProviderRun(id: completedID, status: .succeeded)
+        let finishedAt = Date(timeIntervalSince1970: 10_000)
+
+        let changed = try await store.failInterruptedProviderRuns(at: finishedAt)
+
+        XCTAssertEqual(changed, 1)
+        let interrupted = try await store.providerRuns(meetingID: first.id)
+        let completed = try await store.providerRuns(meetingID: second.id)
+        XCTAssertEqual(interrupted[0].status, .failed)
+        XCTAssertEqual(interrupted[0].finishedAt, finishedAt)
+        XCTAssertEqual(interrupted[0].errorMessage, "The app closed before the provider finished.")
+        XCTAssertEqual(completed[0].status, .succeeded)
     }
 
     func testDeleteAudioFilesAlsoRemovesTrackMetadata() async throws {

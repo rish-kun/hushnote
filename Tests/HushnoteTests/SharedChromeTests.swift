@@ -11,7 +11,7 @@ import Testing
 struct SharedChromeTests {
     @Test("One wording for each recording state")
     func statusWordingIsSingular() {
-        #expect(RecordingStatusText.label(for: .preparing) == "Starting recording…")
+        #expect(RecordingStatusText.label(for: .preparing) == "Arming audio…")
         #expect(RecordingStatusText.label(for: .recording) == "Recording")
         #expect(RecordingStatusText.label(for: .paused) == "Recording paused")
         #expect(RecordingStatusText.label(for: .finalizing(0.4)) == "Finalizing")

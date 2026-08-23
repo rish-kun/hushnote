@@ -146,66 +146,38 @@ struct CompletedMeetingView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
-    private let tabs = ["Notes", "Transcript", "Summary", "Ask"]
+    private let tabs = WorkspaceTab.allCases
 
     var body: some View {
         @Bindable var state = state
 
         VStack(spacing: 0) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(meeting?.title ?? "Meeting")
-                        .font(HushnoteTheme.Font.pageTitle)
-                    HStack(spacing: 8) {
-                        if let meeting {
-                            Text(meeting.startedAt, format: .dateTime.weekday(.wide).month(.wide).day().hour().minute())
-                            Text("·")
-                            Text(DurationText.clock(meeting.duration))
-                            Text("·")
-                            Text(meeting.template.rawValue)
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 18) {
+                    meetingHeading
+                    Spacer(minLength: 18)
+                    meetingActions
                 }
-                Spacer()
-                if canStartTranscribing {
-                    Button("Start Transcribing") {
-                        Task { await coordinator.startMeeting(meetingID: meetingID) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.vermilion)
+                VStack(alignment: .leading, spacing: 16) {
+                    meetingHeading
+                    meetingActions
                 }
-                if meeting?.isRecoverable == true {
-                    Button("Finalize recovery") {
-                        Task { await coordinator.recoverMeeting(meetingID) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.vermilion)
-                }
-                Menu {
-                    Button("Markdown") { coordinator.export(meetingID: meetingID, format: .markdown) }
-                    Button("SubRip (.srt)") { coordinator.export(meetingID: meetingID, format: .srt) }
-                    Button("JSON") { coordinator.export(meetingID: meetingID, format: .json) }
-                    Divider()
-                    Button(MeetingAudioExport.menuTitle(isAvailable: canExportAudio)) {
-                        coordinator.exportAudio(meetingID: meetingID)
-                    }
-                    .disabled(!canExportAudio)
-                } label: {
-                    Label("Export", systemImage: "square.and.arrow.up")
-                }
-                .menuStyle(.borderlessButton)
             }
             .padding(.horizontal, 38)
             .padding(.top, 31)
             .padding(.bottom, 20)
 
+            if let exportState = state.audioExports[meetingID], exportState != .idle {
+                audioExportStatus(exportState)
+                    .padding(.horizontal, 38)
+                    .padding(.bottom, 12)
+            }
+
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 24) {
                     ForEach(tabs, id: \.self) { tab in
-                        let isSelected = state.selectedWorkspaceTab == tab
-                        Button(tab) { state.selectedWorkspaceTab = tab }
+                        let isSelected = state.workspaceTab(for: meetingID) == tab
+                        Button(tab.rawValue) { coordinator.setWorkspaceTab(tab, for: meetingID) }
                             .buttonStyle(.plain)
                             .font(.callout.weight(isSelected ? .semibold : .regular))
                             .foregroundStyle(isSelected ? AnyShapeStyle(HushnoteTheme.ink) : AnyShapeStyle(.secondary))
@@ -231,11 +203,67 @@ struct CompletedMeetingView: View {
         .task(id: meetingID) { await coordinator.loadMeeting(meetingID) }
     }
 
+    private var meetingHeading: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            EditableMeetingTitle(
+                title: meeting?.title ?? "Meeting",
+                save: { await coordinator.renameMeeting(meetingID: meetingID, title: $0) }
+            )
+            HStack(spacing: 8) {
+                if let meeting {
+                    Text(meeting.startedAt, format: .dateTime.weekday(.wide).month(.wide).day().hour().minute())
+                    Text("·")
+                    Text(DurationText.clock(meeting.duration))
+                    Text("·")
+                    Text(meeting.template.rawValue)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var meetingActions: some View {
+        HStack(spacing: 10) {
+            if canStartTranscribing {
+                Button("Start Transcribing") {
+                    Task { await coordinator.startMeeting(meetingID: meetingID) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.vermilion)
+            }
+            if meeting?.isRecoverable == true {
+                Button("Finalize recovery") {
+                    Task { await coordinator.recoverMeeting(meetingID) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.vermilion)
+            }
+            Menu {
+                Button("Markdown") { coordinator.export(meetingID: meetingID, format: .markdown) }
+                Button("SubRip (.srt)") { coordinator.export(meetingID: meetingID, format: .srt) }
+                Button("JSON") { coordinator.export(meetingID: meetingID, format: .json) }
+                Divider()
+                Button(MeetingAudioFileFormat.m4a.title) {
+                    coordinator.exportAudio(meetingID: meetingID, format: .m4a)
+                }
+                .disabled(!canExportAudio)
+                Button(MeetingAudioFileFormat.originalCAF.title) {
+                    coordinator.exportAudio(meetingID: meetingID, format: .originalCAF)
+                }
+                .disabled(!canExportAudio)
+            } label: {
+                Label("Export", systemImage: "square.and.arrow.up")
+            }
+            .menuStyle(.borderlessButton)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
     /// Answered from the loaded meeting rather than from disk: this is read
     /// every time the menu is built. See `MeetingAudioExport`.
     private var canExportAudio: Bool {
-        guard let meeting else { return false }
-        return MeetingAudioExport.isAvailable(retainsAudio: meeting.retainsAudio, status: meeting.status)
+        coordinator.audioAvailable(meetingID: meetingID)
     }
 
     private var meeting: MeetingListItem? {
@@ -248,31 +276,56 @@ struct CompletedMeetingView: View {
     }
 
     @ViewBuilder
+    private func audioExportStatus(_ exportState: AudioExportState) -> some View {
+        switch exportState {
+        case .idle:
+            EmptyView()
+        case .exporting(let format, let progress):
+            HStack(spacing: 10) {
+                ProgressView(value: progress).frame(maxWidth: 180)
+                Text("Exporting \(format.title)…").font(.caption)
+                Button("Cancel") { coordinator.cancelAudioExport(meetingID: meetingID) }
+                    .buttonStyle(.borderless)
+            }
+        case .succeeded(let destination):
+            Label("Exported \(destination.lastPathComponent)", systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.moss)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.vermilionInk)
+        }
+    }
+
+    @ViewBuilder
     private var workspaceTab: some View {
-        switch state.selectedWorkspaceTab {
-        case "Notes": MeetingNotesView(meetingID: meetingID)
-        case "Summary": summaryWorkspace
-        case "Transcript":
+        switch state.workspaceTab(for: meetingID) {
+        case .notes: MeetingNotesView(meetingID: meetingID)
+        case .summary: summaryWorkspace
+        case .transcript:
             TranscriptView(isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase))
-        case "Ask": AskMeetingView()
-        default: EmptyView()
+        case .ask: AskMeetingView()
         }
     }
 
     private var summaryWorkspace: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 30) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Meeting summary")
-                        .font(HushnoteTheme.Font.sectionTitle)
-                    Spacer()
-                    ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
-                    Button(state.insights.isGenerating ? "Generating…" : (state.insights.summary.isEmpty ? "Generate summary" : "Regenerate")) {
-                        Task { await coordinator.generateInsights(meetingID: meetingID) }
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline, spacing: 16) {
+                        summaryTitle
+                        Spacer(minLength: 16)
+                        summaryActions
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(HushnoteTheme.inkFill)
-                    .disabled(state.insights.isGenerating || state.transcript.isEmpty)
+                    VStack(alignment: .leading, spacing: 14) {
+                        summaryTitle
+                        summaryActions
+                    }
+                }
+
+                if state.insights.generationStage != nil {
+                    InsightGenerationStatusView(workspace: state.insights)
                 }
 
                 // The error sits beside the summary rather than replacing it: a
@@ -283,12 +336,34 @@ struct CompletedMeetingView: View {
                         .foregroundStyle(HushnoteTheme.vermilionInk)
                 }
 
-                if state.insights.summary.isEmpty {
+                if let candidate = state.insights.candidateSummaryVersion {
+                    SummaryCandidateView(
+                        version: candidate,
+                        keep: { coordinator.keepCurrentSummary(meetingID: meetingID) },
+                        use: { Task { await coordinator.activateSummaryVersion(candidate, meetingID: meetingID) } },
+                        copy: { coordinator.copySummary(candidate.text) }
+                    )
+                }
+
+                if state.insights.isEditingSummary {
+                    summaryEditor
+                } else if state.insights.summary.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Summary will appear here")
+                        Text("Start the meeting summary")
                             .font(.headline)
-                        Text("Stop transcribing to finalize the transcript and generate structured follow-through with your configured provider.")
+                        Text("Write it in your own words, or generate a cited draft from the transcript.")
                             .foregroundStyle(.secondary)
+                        HStack(spacing: 10) {
+                            Button("Write summary") { coordinator.beginSummaryEditing(meetingID: meetingID) }
+                                .buttonStyle(.borderedProminent)
+                                .tint(HushnoteTheme.inkFill)
+                            Button("Generate summary") {
+                                Task { await coordinator.generateInsights(meetingID: meetingID) }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(state.insights.isGenerating || state.transcript.isEmpty)
+                        }
+                        .padding(.top, 6)
                     }
                     .padding(.vertical, 28)
                 } else {
@@ -300,8 +375,90 @@ struct CompletedMeetingView: View {
                     summaryList("Action items", items: state.insights.actions, symbol: "square")
                     summaryList("Open questions", items: state.insights.openQuestions, symbol: "questionmark.circle")
                 }
+
+                if !state.insights.summaryVersions.isEmpty {
+                    SummaryHistoryView(
+                        versions: state.insights.summaryVersions,
+                        activeID: state.insights.activeSummaryVersionID,
+                        hasMore: state.insights.hasMoreSummaryVersions,
+                        isLoading: state.insights.isLoadingSummaryVersions,
+                        activate: { version in
+                            Task { await coordinator.activateSummaryVersion(version, meetingID: meetingID) }
+                        },
+                        loadMore: {
+                            Task { await coordinator.loadMoreSummaryVersions(meetingID: meetingID) }
+                        }
+                    )
+                }
             }
             .pageChrome()
+        }
+    }
+
+    private var summaryEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            TextEditor(text: Binding(
+                get: { state.insights.summaryDraft },
+                set: { value in
+                    state.updateInsights(for: meetingID) { $0.summaryDraft = value }
+                }
+            ))
+            .font(HushnoteTheme.Font.readingLarge)
+            .lineSpacing(6)
+            .frame(minHeight: 180)
+            .scrollContentBackground(.hidden)
+            .padding(12)
+            .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 9))
+            .overlay { RoundedRectangle(cornerRadius: 9).stroke(HushnoteTheme.rule) }
+            .accessibilityLabel("Meeting summary")
+
+            HStack(spacing: 10) {
+                Button("Save") { Task { await coordinator.saveSummary(meetingID: meetingID) } }
+                    .buttonStyle(.borderedProminent)
+                    .tint(HushnoteTheme.inkFill)
+                    .keyboardShortcut("s", modifiers: [.command])
+                    .disabled(
+                        state.insights.isSavingSummary
+                            || !state.insights.hasUnsavedSummaryChanges
+                            || state.insights.summaryDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
+                Button("Cancel") { coordinator.cancelSummaryEditing(meetingID: meetingID) }
+                    .buttonStyle(.bordered)
+                    .disabled(state.insights.isSavingSummary)
+                if state.insights.isSavingSummary {
+                    ProgressView().controlSize(.small)
+                    Text("Saving…").font(.caption).foregroundStyle(.secondary)
+                } else if state.insights.hasUnsavedSummaryChanges {
+                    Text("Unsaved changes").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var summaryTitle: some View {
+        Text("Meeting summary")
+            .font(HushnoteTheme.Font.sectionTitle)
+    }
+
+    @ViewBuilder
+    private var summaryActions: some View {
+        if state.insights.generationStage != nil {
+            Button("Cancel") { coordinator.cancelInsightGeneration(meetingID: meetingID) }
+                .buttonStyle(.bordered)
+        } else {
+            HStack(spacing: 12) {
+                ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
+                if !state.insights.summary.isEmpty {
+                    Button("Edit") { coordinator.beginSummaryEditing(meetingID: meetingID) }
+                        .buttonStyle(.bordered)
+                }
+                Button(state.insights.summary.isEmpty ? "Generate summary" : "Regenerate") {
+                    Task { await coordinator.generateInsights(meetingID: meetingID) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(HushnoteTheme.inkFill)
+                .disabled(state.insights.isGenerating || state.transcript.isEmpty)
+            }
         }
     }
 
@@ -322,6 +479,173 @@ struct CompletedMeetingView: View {
         }
     }
 
+}
+
+private struct EditableMeetingTitle: View {
+    let title: String
+    let save: (String) async -> Bool
+
+    @State private var isEditing = false
+    @State private var draft = ""
+    @State private var isSaving = false
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if isEditing {
+                TextField("Meeting name", text: $draft)
+                    .textFieldStyle(.plain)
+                    .font(HushnoteTheme.Font.pageTitle)
+                    .focused($isFocused)
+                    .onSubmit { commit() }
+                    .onExitCommand { cancel() }
+                    .disabled(isSaving)
+                if isSaving { ProgressView().controlSize(.small) }
+            } else {
+                Text(title)
+                    .font(HushnoteTheme.Font.pageTitle)
+                    .lineLimit(2)
+                Button {
+                    draft = title
+                    isEditing = true
+                    isFocused = true
+                } label: {
+                    Image(systemName: "pencil")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Rename meeting")
+                .accessibilityLabel("Rename meeting")
+            }
+        }
+    }
+
+    private func commit() {
+        guard !isSaving else { return }
+        isSaving = true
+        Task {
+            let saved = await save(draft)
+            isSaving = false
+            if saved { isEditing = false }
+        }
+    }
+
+    private func cancel() {
+        draft = title
+        isEditing = false
+    }
+}
+
+private struct SummaryCandidateView: View {
+    let version: SummaryVersion
+    let keep: () -> Void
+    let use: () -> Void
+    let copy: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("New generated version", systemImage: "sparkles")
+                    .font(.headline)
+                Spacer()
+                Text(version.createdAt, style: .time)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text(version.text)
+                .font(HushnoteTheme.Font.reading)
+                .lineSpacing(5)
+                .lineLimit(10)
+                .textSelection(.enabled)
+            HStack(spacing: 10) {
+                Button("Use Generated", action: use)
+                    .buttonStyle(.borderedProminent)
+                    .tint(HushnoteTheme.inkFill)
+                Button("Keep Current", action: keep).buttonStyle(.bordered)
+                Button("Copy", action: copy).buttonStyle(.borderless)
+            }
+        }
+        .padding(16)
+        .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 10))
+        .overlay { RoundedRectangle(cornerRadius: 10).stroke(HushnoteTheme.moss.opacity(0.45)) }
+    }
+}
+
+private struct SummaryHistoryView: View {
+    let versions: [SummaryVersion]
+    let activeID: UUID?
+    let hasMore: Bool
+    let isLoading: Bool
+    let activate: (SummaryVersion) -> Void
+    let loadMore: () -> Void
+
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup("Summary history (\(versions.count))", isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(versions) { version in
+                    Button { activate(version) } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: version.id == activeID ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(version.id == activeID ? HushnoteTheme.moss : .secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(version.kind == .manual ? "Manual edit" : "Generated")
+                                    .font(.callout.weight(.medium))
+                                Text(version.createdAt, format: .dateTime.month().day().hour().minute())
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(version.text.replacingOccurrences(of: "\n", with: " "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .frame(maxWidth: 300, alignment: .trailing)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(version.id == activeID)
+                    Divider().opacity(0.45)
+                }
+                if hasMore {
+                    Button(isLoading ? "Loading…" : "Load older versions", action: loadMore)
+                        .buttonStyle(.borderless)
+                        .disabled(isLoading)
+                        .padding(.vertical, 8)
+                }
+            }
+            .padding(.top, 8)
+        }
+        .font(.callout)
+    }
+}
+
+private struct InsightGenerationStatusView: View {
+    let workspace: InsightWorkspaceState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ProgressView(value: workspace.generationProgress)
+                .tint(HushnoteTheme.moss)
+            HStack {
+                Text(workspace.generationStage?.title ?? "Preparing summary…")
+                Spacer()
+                if let started = workspace.generationStartedAt {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(DurationText.clock(context.date.timeIntervalSince(started)))
+                            .monospacedDigit()
+                    }
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
 }
 
 struct MeetingNotesView: View {
@@ -435,6 +759,7 @@ struct TranscriptView: View {
     let isEditable: Bool
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isFollowing = true
     @State private var openParagraph: UUID?
 
@@ -489,8 +814,12 @@ struct TranscriptView: View {
             // that too.
             .onChange(of: state.transcript.last?.id) { _, _ in
                 guard isFollowing, let anchor = paragraphs.last?.id else { return }
-                withAnimation(.easeOut(duration: 0.18)) {
+                if reduceMotion {
                     proxy.scrollTo(anchor, anchor: .bottom)
+                } else {
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(anchor, anchor: .bottom)
+                    }
                 }
             }
             .overlay(alignment: .bottomTrailing) {
@@ -498,8 +827,12 @@ struct TranscriptView: View {
                 // it never competes with the transcript it would scroll.
                 if !isFollowing, let anchor = paragraphs.last?.id {
                     Button {
-                        withAnimation(.easeOut(duration: 0.2)) {
+                        if reduceMotion {
                             proxy.scrollTo(anchor, anchor: .bottom)
+                        } else {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo(anchor, anchor: .bottom)
+                            }
                         }
                         isFollowing = true
                     } label: {
@@ -549,7 +882,11 @@ private struct TranscriptParagraphView: View {
     let toggleOpen: () -> Void
     let onEdit: (TranscriptLineItem, String) -> Void
 
+    @Environment(AppCoordinator.self) private var coordinator
     @State private var isHovering = false
+    @State private var isRenamingSpeaker = false
+    @State private var speakerDraft = ""
+    @FocusState private var speakerFieldFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -571,11 +908,36 @@ private struct TranscriptParagraphView: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 9) {
             if let speaker = paragraph.speakerLabel {
-                Text(speaker)
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(
-                        speaker == "You" ? HushnoteTheme.moss : HushnoteTheme.secondaryInk
-                    )
+                if isRenamingSpeaker {
+                    TextField("Speaker name", text: $speakerDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.footnote.weight(.semibold))
+                        .frame(width: 180)
+                        .focused($speakerFieldFocused)
+                        .onSubmit { saveSpeakerName() }
+                        .onExitCommand { isRenamingSpeaker = false }
+                    Button("Save", action: saveSpeakerName)
+                        .buttonStyle(.borderless)
+                        .font(.caption.weight(.semibold))
+                    Button("Cancel") { isRenamingSpeaker = false }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                } else {
+                    Button {
+                        speakerDraft = speaker
+                        isRenamingSpeaker = true
+                        speakerFieldFocused = true
+                    } label: {
+                        Text(speaker)
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(
+                                speaker == "You" ? HushnoteTheme.moss : HushnoteTheme.secondaryInk
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Rename speaker")
+                    .accessibilityLabel("Rename \(speaker)")
+                }
             }
             if let timestamp = paragraph.timestamp {
                 TimestampButton(seconds: timestamp)
@@ -592,6 +954,17 @@ private struct TranscriptParagraphView: View {
                     .buttonStyle(.plain)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(HushnoteTheme.vermilionInk)
+            }
+        }
+    }
+
+    private func saveSpeakerName() {
+        guard let segmentID = paragraph.lines.first?.segmentID,
+              !speakerDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let value = speakerDraft
+        Task {
+            if await coordinator.renameSpeaker(segmentID: segmentID, name: value) {
+                isRenamingSpeaker = false
             }
         }
     }
@@ -646,7 +1019,7 @@ private struct TranscriptParagraphView: View {
                 Image(systemName: "pencil")
                     .font(.caption)
                     .foregroundStyle(HushnoteTheme.secondaryInk)
-                    .padding(4)
+                    .frame(width: 28, height: 28)
             }
             .buttonStyle(.plain)
             .help("Correct this paragraph")

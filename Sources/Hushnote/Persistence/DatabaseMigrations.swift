@@ -150,6 +150,59 @@ enum HushnoteDatabaseMigrations {
         migrator.registerMigration("v6_repair_transcript_pollution") { db in
             try repairTranscriptSegments(db)
         }
+        migrator.registerMigration("v7_summary_versions_and_trash") { db in
+            try db.alter(table: "meetings") { table in
+                table.add(column: "deletedAt", .datetime)
+            }
+            try db.create(index: "meetings_on_deletedAt", on: "meetings", columns: ["deletedAt"])
+
+            try db.create(table: "summaryVersions") { table in
+                table.column("id", .text).primaryKey()
+                table.column("meetingID", .text)
+                    .notNull()
+                    .references("meetings", onDelete: .cascade)
+                table.column("kind", .text).notNull()
+                table.column("text", .text).notNull()
+                table.column("createdAt", .datetime).notNull()
+                table.column("sourceInsightSnapshotID", .text)
+                    .references("insightSnapshots", onDelete: .setNull)
+            }
+            try db.create(
+                index: "summaryVersions_on_meetingID_createdAt",
+                on: "summaryVersions",
+                columns: ["meetingID", "createdAt"]
+            )
+            try db.alter(table: "meetings") { table in
+                table.add(column: "activeSummaryVersionID", .text)
+                    .references("summaryVersions", onDelete: .setNull)
+            }
+
+            // Existing generated summaries become immutable versions. The
+            // newest snapshot remains what the app displays after migration.
+            let snapshots = try InsightSnapshotRecord
+                .order(Column("createdAt"), Column("id"))
+                .fetchAll(db)
+            var latestByMeeting: [String: SummaryVersionRecord] = [:]
+            for snapshot in snapshots {
+                guard let stored = try? snapshot.model() else { continue }
+                let version = SummaryVersion(
+                    id: UUID(),
+                    meetingID: stored.meetingID,
+                    kind: .generated,
+                    text: stored.output.insights.overview.text,
+                    createdAt: stored.createdAt,
+                    sourceInsightSnapshotID: stored.id
+                )
+                let record = SummaryVersionRecord(version)
+                try record.insert(db)
+                latestByMeeting[record.meetingID] = record
+            }
+            for (meetingID, version) in latestByMeeting {
+                try MeetingRecord
+                    .filter(key: meetingID)
+                    .updateAll(db, Column("activeSummaryVersionID").set(to: version.id))
+            }
+        }
         return migrator
     }
 

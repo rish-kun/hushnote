@@ -27,6 +27,14 @@ struct FailureRoutingTests {
             FailureRoute.route(for: .meetingLoad)
                 == .appAlert(title: "This meeting could not be opened")
         )
+        #expect(
+            FailureRoute.route(for: .summarySave)
+                == .appAlert(title: "Your summary was not saved")
+        )
+        #expect(
+            FailureRoute.route(for: .meetingRename)
+                == .appAlert(title: "The meeting name was not saved")
+        )
     }
 
     /// An insight failure belongs where the request was made and where the

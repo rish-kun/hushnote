@@ -11,12 +11,17 @@ struct AppShellView: View {
         let meetings = state.filteredMeetings
 
         return NavigationSplitView {
-            List(selection: $state.selection) {
+            List(selection: Binding(
+                get: { state.selection },
+                set: { coordinator.setSelection($0) }
+            )) {
                 Section {
                     Label("Meetings", systemImage: "text.book.closed")
                         .tag(SidebarDestination.meetings)
                     Label("Models", systemImage: "cpu")
                         .tag(SidebarDestination.models)
+                    Label("Storage", systemImage: "internaldrive")
+                        .tag(SidebarDestination.storage)
                     Label("Settings", systemImage: "slider.horizontal.3")
                         .tag(SidebarDestination.settings)
                 }
@@ -134,11 +139,11 @@ struct AppShellView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(HushnoteTheme.vermilion)
         case .openModels:
-            Button("Open Models") { state.selection = .models }
+            Button("Open Models") { coordinator.setSelection(.models) }
                 .buttonStyle(.borderedProminent)
                 .tint(HushnoteTheme.inkFill)
         case .openSettings:
-            Button("Open Settings") { state.selection = .settings }
+            Button("Open Settings") { coordinator.setSelection(.settings) }
                 .buttonStyle(.borderedProminent)
                 .tint(HushnoteTheme.inkFill)
         }
@@ -151,6 +156,8 @@ struct AppShellView: View {
             MeetingsHomeView()
         case .models:
             ModelManagerView()
+        case .storage:
+            StorageDashboardView()
         case .settings:
             SettingsView()
         case .meeting(let id):
@@ -162,7 +169,7 @@ struct AppShellView: View {
     private var recordingSidebarFooter: some View {
         if state.recordingPhase.isCapturing {
             Button {
-                if let id = state.activeMeetingID { state.selection = .meeting(id) }
+                if let id = state.activeMeetingID { coordinator.setSelection(.meeting(id)) }
             } label: {
                 HStack(spacing: 10) {
                     RecordingPulse(isActive: state.recordingPhase == .recording)
@@ -209,6 +216,7 @@ struct AppShellView: View {
 struct MeetingsHomeView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
+    @State private var isShowingRecentlyDeleted = false
 
     var body: some View {
         let meetings = state.filteredMeetings
@@ -233,10 +241,16 @@ struct MeetingsHomeView: View {
 
             Divider().opacity(0.55)
 
-            if meetings.isEmpty {
+            if meetings.isEmpty && state.recentlyDeletedMeetings.isEmpty {
                 emptyState
             } else {
-                meetingList(meetings)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        if !meetings.isEmpty { meetingList(meetings) }
+                        if !state.recentlyDeletedMeetings.isEmpty { recentlyDeletedSection }
+                    }
+                    .padding(.horizontal, 38)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -267,11 +281,10 @@ struct MeetingsHomeView: View {
     }
 
     private func meetingList(_ meetings: [MeetingListItem]) -> some View {
-        ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(meetings) { meeting in
+        ForEach(meetings) { meeting in
+            HStack(spacing: 10) {
                     Button {
-                        state.selection = .meeting(meeting.id)
+                        coordinator.setSelection(.meeting(meeting.id))
                     } label: {
                         HStack(alignment: .top, spacing: 22) {
                             VStack(alignment: .leading, spacing: 4) {
@@ -305,18 +318,65 @@ struct MeetingsHomeView: View {
                                 .foregroundStyle(.tertiary)
                             }
                             Spacer()
-                            Image(systemName: "arrow.up.right")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
                         }
                         .padding(.vertical, 20)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    Divider().opacity(0.5)
+                    .contextMenu {
+                        Button("Rename…") { coordinator.promptToRenameMeeting(meetingID: meeting.id) }
+                        Button("Move to Recently Deleted", role: .destructive) {
+                            Task { await coordinator.softDeleteMeeting(meeting.id) }
+                        }
+                        .disabled(state.activeMeetingID == meeting.id)
+                    }
+
+                    Menu {
+                        Button("Rename…") { coordinator.promptToRenameMeeting(meetingID: meeting.id) }
+                        Divider()
+                        Button("Move to Recently Deleted", role: .destructive) {
+                            Task { await coordinator.softDeleteMeeting(meeting.id) }
+                        }
+                        .disabled(state.activeMeetingID == meeting.id)
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .frame(width: 24, height: 24)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            Divider().opacity(0.5)
+        }
+    }
+
+    private var recentlyDeletedSection: some View {
+        DisclosureGroup(isExpanded: $isShowingRecentlyDeleted) {
+            VStack(spacing: 0) {
+                ForEach(state.recentlyDeletedMeetings) { meeting in
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(meeting.title).font(.callout.weight(.medium))
+                            Text("Kept for up to 30 days")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Restore") { Task { await coordinator.restoreMeeting(meeting.id) } }
+                            .buttonStyle(.bordered)
+                        Button("Delete Permanently", role: .destructive) {
+                            coordinator.confirmPermanentDelete(meetingID: meeting.id)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.vertical, 12)
+                    Divider().opacity(0.45)
                 }
             }
-            .padding(.horizontal, 38)
+            .padding(.top, 8)
+        } label: {
+            Label("Recently Deleted (\(state.recentlyDeletedMeetings.count))", systemImage: "trash")
+                .font(.headline)
         }
+        .padding(.vertical, 24)
     }
 }

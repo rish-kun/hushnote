@@ -18,6 +18,7 @@ binary_path=$(swift build --disable-sandbox --package-path "$project_root" -c "$
 mkdir -p "$contents_root/MacOS" "$contents_root/Resources"
 cp "$project_root/Resources/Info.plist" "$contents_root/Info.plist"
 cp "$binary_path/Hushnote" "$contents_root/MacOS/Hushnote"
+cp "$project_root/Resources/Hushnote.icns" "$contents_root/Resources/Hushnote.icns"
 if [[ -n "$requested_identity" ]]; then
     signing_identity="$requested_identity"
 else

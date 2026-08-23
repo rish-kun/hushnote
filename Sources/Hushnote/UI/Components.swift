@@ -10,7 +10,7 @@ enum RecordingStatusText {
     nonisolated static func label(for phase: RecordingPhase) -> String {
         switch phase {
         case .idle: ""
-        case .preparing: "Starting recording…"
+        case .preparing: "Arming audio…"
         case .recording: "Recording"
         case .paused: "Recording paused"
         case .finalizing: "Finalizing"
@@ -107,7 +107,7 @@ struct RecordingPill: View {
             } label: {
                 Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
                     .labelStyle(.iconOnly)
-                    .frame(width: 18, height: 18)
+                    .frame(width: 28, height: 28)
             }
             .buttonStyle(.borderless)
             .help(isPaused ? "Resume recording" : "Pause recording")
@@ -119,7 +119,7 @@ struct RecordingPill: View {
                 Image(systemName: "stop.fill")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(width: 27, height: 27)
+                    .frame(width: 28, height: 28)
                     .background(HushnoteTheme.vermilion, in: Circle())
             }
             .buttonStyle(.plain)

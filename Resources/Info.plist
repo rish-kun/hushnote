@@ -8,6 +8,8 @@
     <string>Hushnote</string>
     <key>CFBundleIdentifier</key>
     <string>dev.rishit.hushnote</string>
+    <key>CFBundleIconFile</key>
+    <string>Hushnote</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

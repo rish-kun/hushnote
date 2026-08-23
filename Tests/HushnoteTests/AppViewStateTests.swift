@@ -76,4 +76,74 @@ final class AppViewStateTests: XCTestCase {
         XCTAssertNil(state.finalizationStage)
         XCTAssertNil(state.finalizationDetail)
     }
+
+    func testFirstDurableBufferPromotesStartupAndTerminalStatesClearIt() {
+        let state = AppViewState()
+        let meetingID = UUID()
+        state.recordingPhase = .preparing
+        state.recordingStartupStage = .waitingForFirstBuffer
+
+        state.markRecordingStarted(meetingID: meetingID)
+        XCTAssertEqual(state.recordingPhase, .recording)
+        XCTAssertEqual(state.recordingStartupStage, .ready)
+
+        state.markFinished()
+        XCTAssertEqual(state.recordingStartupStage, .idle)
+
+        state.recordingPhase = .preparing
+        state.recordingStartupStage = .arming
+        state.markFailed(.init(kind: .capture, message: "Tap stopped"))
+        XCTAssertEqual(state.recordingStartupStage, .idle)
+    }
+
+    func testInsightWorkRemainsVisibleToQuitGuardAfterNavigatingAway() {
+        let state = AppViewState()
+        let runningMeeting = UUID()
+        let displayedMeeting = UUID()
+        state.updateInsights(for: runningMeeting) { $0.isGenerating = true }
+        state.selection = .meeting(displayedMeeting)
+
+        XCTAssertFalse(state.insights.isGenerating)
+        XCTAssertTrue(state.hasInsightWork)
+        XCTAssertEqual(
+            TerminationGuard.decision(
+                for: state.recordingPhase,
+                hasInsightWork: state.hasInsightWork
+            ),
+            .confirmFinalizing
+        )
+    }
+
+    func testInsightContentAndProgressAreMeetingScoped() {
+        let state = AppViewState()
+        let first = UUID()
+        let second = UUID()
+        state.updateInsights(for: first) {
+            $0.summary = "First summary"
+            $0.isGenerating = true
+        }
+        state.updateInsights(for: second) { $0.summary = "Second summary" }
+
+        state.selection = .meeting(second)
+        XCTAssertEqual(state.insights.summary, "Second summary")
+        XCTAssertFalse(state.insights.isGenerating)
+
+        state.selection = .meeting(first)
+        XCTAssertEqual(state.insights.summary, "First summary")
+        XCTAssertTrue(state.insights.isGenerating)
+    }
+
+    func testUnsavedSummaryWorkRemainsVisibleAfterSelectionChanges() {
+        let state = AppViewState()
+        let meetingID = UUID()
+        state.updateInsights(for: meetingID) {
+            $0.summary = "Stored"
+            $0.summaryDraft = "Edited"
+            $0.isEditingSummary = true
+        }
+        state.selection = .settings
+
+        XCTAssertTrue(state.hasUnsavedSummaryChanges)
+        XCTAssertEqual(state.unsavedSummaryMeetingID, meetingID)
+    }
 }

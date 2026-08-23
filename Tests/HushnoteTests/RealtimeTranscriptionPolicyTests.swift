@@ -19,8 +19,8 @@ struct RealtimeTranscriptionPolicyTests {
         #expect(withoutLive.contains(.stoppingLiveTranscription) == false)
         #expect(withLive.first == .savingAudio)
         #expect(withoutLive.first == .savingAudio)
-        #expect(withLive.last == .generatingInsights)
-        #expect(withoutLive.last == .generatingInsights)
+        #expect(withLive.last == .diarizing)
+        #expect(withoutLive.last == .diarizing)
         #expect(withoutLive.count == withLive.count - 1)
     }
 

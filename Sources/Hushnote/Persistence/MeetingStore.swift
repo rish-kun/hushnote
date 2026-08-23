@@ -47,9 +47,49 @@ public actor MeetingStore {
 
     public func meetings(limit: Int? = nil) throws -> [Meeting] {
         try database.read { db in
-            var request = MeetingRecord.order(Column("updatedAt").desc)
+            var request = MeetingRecord
+                .filter(Column("deletedAt") == nil)
+                .order(Column("updatedAt").desc)
             if let limit { request = request.limit(limit) }
             return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    public func recentlyDeleted(
+        since date: Date = Date().addingTimeInterval(-30 * 24 * 60 * 60),
+        limit: Int? = nil
+    ) throws -> [Meeting] {
+        try database.read { db in
+            var request = MeetingRecord
+                .filter(Column("deletedAt") != nil)
+                .filter(Column("deletedAt") >= date)
+                .order(Column("deletedAt").desc)
+            if let limit { request = request.limit(limit) }
+            return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    public func updateMeetingTitle(
+        id: UUID,
+        title: String,
+        at date: Date = Date()
+    ) throws {
+        let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            throw PersistenceError.invalidMeetingTitle("Enter at least one non-whitespace character.")
+        }
+        guard cleaned.count <= 200 else {
+            throw PersistenceError.invalidMeetingTitle("Use 200 characters or fewer.")
+        }
+        try database.write { db in
+            let changed = try MeetingRecord
+                .filter(key: id.uuidString)
+                .updateAll(
+                    db,
+                    Column("title").set(to: cleaned),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(id) }
         }
     }
 
@@ -148,7 +188,17 @@ public actor MeetingStore {
                     isUserEdited: existing?.isUserEdited ?? false
                 )
                 if existing?.isUserEdited == true { record.text = existing!.text }
-                try record.save(db)
+                // `save` updates every column, and SQLite fires `UPDATE OF` on a
+                // column's presence in the SET list rather than on its value
+                // changing — so an unchanged row still ran the v5 trigger, whose
+                // delete scans the whole FTS content table. `updateChanges`
+                // compares against the row already fetched above and issues
+                // nothing at all when the two agree.
+                if let existing {
+                    try record.updateChanges(db, from: existing)
+                } else {
+                    try record.insert(db)
+                }
             }
         }
     }
@@ -384,8 +434,32 @@ public actor MeetingStore {
         output: ValidatedMeetingInsights,
         createdAt: Date = Date()
     ) throws -> UUID {
+        try saveGeneratedInsights(
+            meetingID: meetingID,
+            providerID: providerID,
+            output: output,
+            createdAt: createdAt
+        ).snapshotID
+    }
+
+    /// Saves provider output and its overview version in one transaction.
+    ///
+    /// A generated candidate becomes active only when the meeting has no active
+    /// summary. Regeneration must never silently replace a version the user has
+    /// selected or authored.
+    @discardableResult
+    public func saveGeneratedInsights(
+        meetingID: UUID,
+        providerID: String,
+        output: ValidatedMeetingInsights,
+        createdAt: Date = Date()
+    ) throws -> SavedGeneratedInsights {
         guard !providerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw PersistenceError.invalidProviderRun("provider ID must not be empty")
+        }
+        guard !output.insights.overview.text
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PersistenceError.invalidSummary("Generated overview text cannot be blank.")
         }
         let snapshot = StoredInsightSnapshot(
             id: UUID(),
@@ -394,13 +468,35 @@ public actor MeetingStore {
             createdAt: createdAt,
             output: output
         )
-        try database.write { db in
-            guard try MeetingRecord.fetchOne(db, key: meetingID.uuidString) != nil else {
+        let version = SummaryVersion(
+            meetingID: meetingID,
+            kind: .generated,
+            text: output.insights.overview.text,
+            createdAt: createdAt,
+            sourceInsightSnapshotID: snapshot.id
+        )
+        return try database.write { db in
+            guard let meeting = try MeetingRecord.fetchOne(db, key: meetingID.uuidString) else {
                 throw PersistenceError.meetingNotFound(meetingID)
             }
             try InsightSnapshotRecord(snapshot).insert(db)
+            try SummaryVersionRecord(version).insert(db)
+            let didActivate = meeting.activeSummaryVersionID == nil
+            if didActivate {
+                try MeetingRecord
+                    .filter(key: meetingID.uuidString)
+                    .updateAll(
+                        db,
+                        Column("activeSummaryVersionID").set(to: version.id.uuidString),
+                        Column("updatedAt").set(to: createdAt)
+                    )
+            }
+            return SavedGeneratedInsights(
+                snapshotID: snapshot.id,
+                summaryVersion: version,
+                didActivate: didActivate
+            )
         }
-        return snapshot.id
     }
 
     public func insightSnapshots(meetingID: UUID) throws -> [StoredInsightSnapshot] {
@@ -410,6 +506,140 @@ public actor MeetingStore {
                 .order(Column("createdAt").desc)
                 .fetchAll(db)
                 .map { try $0.model() }
+        }
+    }
+
+    public func insightSnapshot(id: UUID) throws -> StoredInsightSnapshot? {
+        try database.read { db in
+            try InsightSnapshotRecord.fetchOne(db, key: id.uuidString)?.model()
+        }
+    }
+
+    @discardableResult
+    public func createSummaryVersion(
+        meetingID: UUID,
+        kind: SummaryVersionKind,
+        text: String,
+        sourceInsightSnapshotID: UUID? = nil,
+        createdAt: Date = Date(),
+        activate: Bool = true
+    ) throws -> SummaryVersion {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw PersistenceError.invalidSummary("Enter at least one non-whitespace character.")
+        }
+        guard kind == .manual || sourceInsightSnapshotID != nil else {
+            throw PersistenceError.invalidSummary("A generated summary must reference its insight snapshot.")
+        }
+        let version = SummaryVersion(
+            meetingID: meetingID,
+            kind: kind,
+            text: text,
+            createdAt: createdAt,
+            sourceInsightSnapshotID: sourceInsightSnapshotID
+        )
+        try database.write { db in
+            guard try MeetingRecord.fetchOne(db, key: meetingID.uuidString) != nil else {
+                throw PersistenceError.meetingNotFound(meetingID)
+            }
+            if let sourceInsightSnapshotID {
+                guard let snapshot = try InsightSnapshotRecord.fetchOne(
+                    db,
+                    key: sourceInsightSnapshotID.uuidString
+                ), snapshot.meetingID == meetingID.uuidString else {
+                    throw PersistenceError.invalidSummary("The source snapshot belongs to another meeting or is missing.")
+                }
+            }
+            try SummaryVersionRecord(version).insert(db)
+            if activate {
+                try MeetingRecord
+                    .filter(key: meetingID.uuidString)
+                    .updateAll(
+                        db,
+                        Column("activeSummaryVersionID").set(to: version.id.uuidString),
+                        Column("updatedAt").set(to: createdAt)
+                    )
+            }
+        }
+        return version
+    }
+
+    public func summaryVersions(
+        meetingID: UUID,
+        limit: Int = 50,
+        before date: Date? = nil
+    ) throws -> [SummaryVersion] {
+        try database.read { db in
+            var request = SummaryVersionRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+            if let date { request = request.filter(Column("createdAt") < date) }
+            return try request
+                .order(Column("createdAt").desc, Column("id").desc)
+                .limit(max(1, limit))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func summaryVersion(id: UUID) throws -> SummaryVersion? {
+        try database.read { db in
+            try SummaryVersionRecord.fetchOne(db, key: id.uuidString)?.model()
+        }
+    }
+
+    public func activeSummaryVersion(meetingID: UUID) throws -> SummaryVersion? {
+        try database.read { db in
+            guard let meeting = try MeetingRecord.fetchOne(db, key: meetingID.uuidString) else {
+                throw PersistenceError.meetingNotFound(meetingID)
+            }
+            guard let id = meeting.activeSummaryVersionID else { return nil }
+            return try SummaryVersionRecord.fetchOne(db, key: id)?.model()
+        }
+    }
+
+    public func activateSummaryVersion(
+        id: UUID,
+        meetingID: UUID,
+        at date: Date = Date()
+    ) throws {
+        try database.write { db in
+            guard let version = try SummaryVersionRecord.fetchOne(db, key: id.uuidString),
+                  version.meetingID == meetingID.uuidString else {
+                throw PersistenceError.invalidSummary("The selected version does not belong to this meeting.")
+            }
+            let changed = try MeetingRecord
+                .filter(key: meetingID.uuidString)
+                .updateAll(
+                    db,
+                    Column("activeSummaryVersionID").set(to: id.uuidString),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(meetingID) }
+        }
+    }
+
+    public func deleteSummaryVersion(id: UUID, meetingID: UUID, at date: Date = Date()) throws {
+        try database.write { db in
+            guard let meeting = try MeetingRecord.fetchOne(db, key: meetingID.uuidString) else {
+                throw PersistenceError.meetingNotFound(meetingID)
+            }
+            guard let version = try SummaryVersionRecord.fetchOne(db, key: id.uuidString),
+                  version.meetingID == meetingID.uuidString else {
+                throw PersistenceError.invalidSummary("The selected version does not belong to this meeting.")
+            }
+            _ = try SummaryVersionRecord.deleteOne(db, key: id.uuidString)
+            if meeting.activeSummaryVersionID == id.uuidString {
+                let replacement = try SummaryVersionRecord
+                    .filter(Column("meetingID") == meetingID.uuidString)
+                    .order(Column("createdAt").desc, Column("id").desc)
+                    .fetchOne(db)
+                try MeetingRecord
+                    .filter(key: meetingID.uuidString)
+                    .updateAll(
+                        db,
+                        Column("activeSummaryVersionID").set(to: replacement?.id),
+                        Column("updatedAt").set(to: date)
+                    )
+            }
         }
     }
 
@@ -477,6 +707,26 @@ public actor MeetingStore {
         }
     }
 
+    /// Closes audit rows whose process disappeared with a previous app session.
+    /// A provider run cannot legitimately survive process relaunch, so every
+    /// remaining `running` row is stale regardless of its age.
+    @discardableResult
+    public func failInterruptedProviderRuns(
+        at date: Date = Date(),
+        message: String = "The app closed before the provider finished."
+    ) throws -> Int {
+        try database.write { db in
+            try ProviderRunRecord
+                .filter(Column("status") == ProviderRunStatus.running.rawValue)
+                .updateAll(
+                    db,
+                    Column("finishedAt").set(to: date),
+                    Column("status").set(to: ProviderRunStatus.failed.rawValue),
+                    Column("errorMessage").set(to: message)
+                )
+        }
+    }
+
     /// Marks sessions that could not have completed a clean shutdown. CAF
     /// tracks remain referenced so the finalization pipeline can resume.
     @discardableResult
@@ -512,6 +762,56 @@ public actor MeetingStore {
             let deleted = try MeetingRecord.deleteOne(db, key: id.uuidString)
             guard deleted else { throw PersistenceError.meetingNotFound(id) }
         }
+    }
+
+    public func softDeleteMeeting(id: UUID, at date: Date = Date()) throws {
+        try database.write { db in
+            let changed = try MeetingRecord
+                .filter(key: id.uuidString)
+                .updateAll(
+                    db,
+                    Column("deletedAt").set(to: date),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(id) }
+        }
+    }
+
+    public func restoreMeeting(id: UUID, at date: Date = Date()) throws {
+        try database.write { db in
+            let changed = try MeetingRecord
+                .filter(key: id.uuidString)
+                .filter(Column("deletedAt") != nil)
+                .updateAll(
+                    db,
+                    Column("deletedAt").set(to: nil),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(id) }
+        }
+    }
+
+    /// Permanently removes soft-deleted meetings outside the retention window.
+    /// Audio is removed before each relational graph so a filesystem failure
+    /// leaves that meeting recoverable for the next purge attempt.
+    @discardableResult
+    public func purgeDeletedMeetings(
+        olderThan date: Date = Date().addingTimeInterval(-30 * 24 * 60 * 60)
+    ) throws -> [UUID] {
+        let ids = try database.read { db in
+            try MeetingRecord
+                .filter(Column("deletedAt") != nil)
+                .filter(Column("deletedAt") < date)
+                .order(Column("deletedAt"))
+                .fetchAll(db)
+                .compactMap { UUID(uuidString: $0.id) }
+        }
+        var purged: [UUID] = []
+        for id in ids {
+            try deleteMeeting(id: id, deleteAudioFiles: true)
+            purged.append(id)
+        }
+        return purged
     }
 
     /// Removes retained/recovery audio and its metadata together. Call this

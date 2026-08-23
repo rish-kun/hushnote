@@ -554,6 +554,8 @@ struct ModelManagerView: View {
                         .frame(maxWidth: 620, alignment: .leading)
                 }
 
+                ModelStorageLocationCard()
+
                 if isBusy {
                     Label(
                         "Downloads pause while a meeting is being captured or finalized. They use the same Neural Engine as the transcriber. A download already running can still be cancelled.",
@@ -602,6 +604,26 @@ struct ModelManagerView: View {
     private func modelRow(_ row: ModelRow, isBusy: Bool) -> some View {
         let isActive = row.role != nil
 
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 22) {
+                modelInformation(row, isActive: isActive)
+                Spacer(minLength: 18)
+                modelActions(row, isBusy: isBusy)
+            }
+            VStack(alignment: .leading, spacing: 13) {
+                modelInformation(row, isActive: isActive)
+                modelActions(row, isBusy: isBusy)
+            }
+        }
+        .padding(.vertical, 6)
+        // This row contains real buttons. Combining its descendants makes those
+        // actions disappear into one VoiceOver element; contain keeps the useful
+        // summary while leaving each control independently reachable.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityLabel(row))
+    }
+
+    private func modelInformation(_ row: ModelRow, isActive: Bool) -> some View {
         HStack(alignment: .top, spacing: 22) {
             Image(systemName: isActive ? "waveform.circle.fill" : "waveform.circle")
                 .font(.system(size: 25))
@@ -621,7 +643,7 @@ struct ModelManagerView: View {
                 }
 
                 HStack(spacing: 10) {
-                    Text(ModelListPolicy.sizeText(row.model))
+                    Text(coordinator.installedModelSizeText(row.model) ?? ModelListPolicy.sizeText(row.model))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
                     ModelMeter(
@@ -648,39 +670,45 @@ struct ModelManagerView: View {
                         .lineLimit(2)
                 }
             }
+        }
+    }
 
-            Spacer()
-
-            VStack(alignment: .trailing, spacing: 7) {
-                Button(ModelListPolicy.downloadLabel(row.availability)) {
-                    if ModelListPolicy.canCancel(row.availability) {
-                        coordinator.cancelDownload(row.model)
-                    } else {
-                        Task { await coordinator.downloadModel(row.model) }
-                    }
-                }
-                .buttonStyle(.bordered)
-                .disabled(
-                    !ModelListPolicy.canCancel(row.availability)
-                        && !ModelListPolicy.canDownload(
-                            availability: row.availability,
-                            phase: state.recordingPhase
-                        )
-                )
-
-                if row.role != .both {
-                    Button("Set as default") {
-                        Task { await coordinator.setDefaultModel(row.model) }
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    .disabled(isBusy)
+    private func modelActions(_ row: ModelRow, isBusy: Bool) -> some View {
+        HStack(spacing: 10) {
+            Button(ModelListPolicy.downloadLabel(row.availability)) {
+                if ModelListPolicy.canCancel(row.availability) {
+                    coordinator.cancelDownload(row.model)
+                } else {
+                    Task { await coordinator.downloadModel(row.model) }
                 }
             }
+            .buttonStyle(.bordered)
+            .disabled(
+                !ModelListPolicy.canCancel(row.availability)
+                    && !ModelListPolicy.canDownload(
+                        availability: row.availability,
+                        phase: state.recordingPhase
+                    )
+            )
+
+            if row.role != .both {
+                Button("Set as default") {
+                    Task { await coordinator.setDefaultModel(row.model) }
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .disabled(isBusy)
+            }
+
+            if row.availability == .ready, row.role == nil {
+                Button("Remove") { coordinator.promptToRemoveModel(row.model) }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.vermilionInk)
+                    .disabled(isBusy || !coordinator.canChangeModelStorage)
+            }
         }
-        .padding(.vertical, 6)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel(row))
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func accessibilityLabel(_ row: ModelRow) -> String {
@@ -719,17 +747,28 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: 620, alignment: .leading)
+                    ModelStorageLocationCard()
+                        .padding(.top, 8)
                 }
 
                 settingsSection("PRIVACY") {
-                    Toggle("Keep audio after finalization", isOn: $state.retainAudio)
+                    Toggle(
+                        "Keep audio after finalization",
+                        isOn: Binding(
+                            get: { state.retainAudio },
+                            set: { coordinator.setRetainAudio($0) }
+                        )
+                    )
                     Text("When off, temporary CAF tracks are removed after the final transcript and speaker pass succeed.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 settingsSection("INSIGHT PROVIDER") {
-                    Picker("Provider", selection: $state.selectedProvider) {
+                    Picker("Provider", selection: Binding(
+                        get: { state.selectedProvider },
+                        set: { coordinator.setSelectedProvider($0) }
+                    )) {
                         ForEach(InsightProviderChoice.allCases) { provider in
                             Text(provider.rawValue).tag(provider)
                         }
@@ -753,13 +792,13 @@ struct SettingsView: View {
                     } else {
                         TextField("Path to llama-server executable", text: Binding(
                             get: { coordinator.localLlamaExecutablePath },
-                            set: { coordinator.localLlamaExecutablePath = $0 }
+                            set: { coordinator.setLocalLlamaExecutablePath($0) }
                         ))
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 540)
                         TextField("Path to GGUF model", text: Binding(
                             get: { coordinator.localModelPath },
-                            set: { coordinator.localModelPath = $0 }
+                            set: { coordinator.setLocalModelPath($0) }
                         ))
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 540)
@@ -801,6 +840,60 @@ struct SettingsView: View {
     }
 }
 
+struct ModelStorageLocationCard: View {
+    @Environment(AppCoordinator.self) private var coordinator
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Model storage", systemImage: "internaldrive")
+                .font(.headline)
+            Text(coordinator.modelStorageDisplayPath)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .lineLimit(2)
+
+            HStack(spacing: 10) {
+                Button("Choose Folder…") { coordinator.chooseModelStorageDirectory() }
+                    .buttonStyle(.bordered)
+                if coordinator.modelStoragePaths.parentDirectory != nil {
+                    Button("Use Default") { coordinator.resetModelStorageDirectory() }
+                        .buttonStyle(.bordered)
+                }
+                Button("Reveal in Finder") { coordinator.revealModelStorage() }
+                    .buttonStyle(.borderless)
+            }
+
+            if let progress = coordinator.modelStorageMigrationProgress {
+                VStack(alignment: .leading, spacing: 5) {
+                    ProgressView(
+                        value: Double(progress.completedItems),
+                        total: Double(max(progress.totalItems, 1))
+                    )
+                    Text(progress.currentItem.map { "Copying \($0)…" } ?? "Finishing model copy…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: 480)
+            } else if let queued = coordinator.queuedModelStoragePath {
+                Label("Queued for \(queued)", systemImage: "clock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let status = coordinator.modelStorageStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("A custom parent contains one Hushnote Models folder. Complete models can be copied when you switch; old files stay in place until you remove them yourself.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 620, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 /// Says whether a coding-agent CLI can actually be used before a meeting is
 /// committed to it. "Not installed", "signed out" and "updated past the flags
 /// Hushnote relies on" are all things worth knowing here rather than halfway
@@ -835,18 +928,18 @@ struct AgentCLIStatusView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Button("Check again") { check() }
+            Button("Check again") { Task { await check() } }
                 .buttonStyle(.bordered)
                 .disabled(isChecking)
         }
-        .task(id: tool) { check() }
+        .task(id: tool) { await check() }
     }
 
-    private func check() {
+    private func check() async {
         isChecking = true
-        Task {
-            problem = await coordinator.agentCLIUnavailability(tool)
-            isChecking = false
-        }
+        let nextProblem = await coordinator.agentCLIUnavailability(tool)
+        guard !Task.isCancelled else { return }
+        problem = nextProblem
+        isChecking = false
     }
 }

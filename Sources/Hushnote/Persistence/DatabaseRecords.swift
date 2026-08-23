@@ -14,6 +14,8 @@ struct MeetingRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
     var status: String
     var errorMessage: String?
     var retainsAudio: Bool
+    var activeSummaryVersionID: String?
+    var deletedAt: Date?
 
     init(_ meeting: Meeting) {
         id = meeting.id.uuidString
@@ -26,6 +28,8 @@ struct MeetingRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
         status = meeting.status.rawValue
         errorMessage = meeting.errorMessage
         retainsAudio = meeting.retainsAudio
+        activeSummaryVersionID = meeting.activeSummaryVersionID?.uuidString
+        deletedAt = meeting.deletedAt
     }
 
     func model() throws -> Meeting {
@@ -42,7 +46,55 @@ struct MeetingRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
             updatedAt: updatedAt,
             status: status,
             errorMessage: errorMessage,
-            retainsAudio: retainsAudio
+            retainsAudio: retainsAudio,
+            activeSummaryVersionID: activeSummaryVersionID.flatMap(UUID.init(uuidString:)),
+            deletedAt: deletedAt
+        )
+    }
+}
+
+struct SummaryVersionRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "summaryVersions"
+
+    var id: String
+    var meetingID: String
+    var kind: String
+    var text: String
+    var createdAt: Date
+    var sourceInsightSnapshotID: String?
+
+    init(_ version: SummaryVersion) {
+        id = version.id.uuidString
+        meetingID = version.meetingID.uuidString
+        kind = version.kind.rawValue
+        text = version.text
+        createdAt = version.createdAt
+        sourceInsightSnapshotID = version.sourceInsightSnapshotID?.uuidString
+    }
+
+    func model() throws -> SummaryVersion {
+        guard let id = UUID(uuidString: id),
+              let meetingID = UUID(uuidString: meetingID),
+              let kind = SummaryVersionKind(rawValue: kind)
+        else {
+            throw PersistenceError.corruptRecord("summary version \(self.id)")
+        }
+        let sourceID: UUID?
+        if let sourceInsightSnapshotID {
+            guard let parsed = UUID(uuidString: sourceInsightSnapshotID) else {
+                throw PersistenceError.corruptRecord("summary version \(self.id)")
+            }
+            sourceID = parsed
+        } else {
+            sourceID = nil
+        }
+        return SummaryVersion(
+            id: id,
+            meetingID: meetingID,
+            kind: kind,
+            text: text,
+            createdAt: createdAt,
+            sourceInsightSnapshotID: sourceID
         )
     }
 }
@@ -288,6 +340,8 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     case corruptRecord(String)
     case invalidSearchQuery
     case invalidProviderRun(String)
+    case invalidSummary(String)
+    case invalidMeetingTitle(String)
 
     public var errorDescription: String? {
         switch self {
@@ -296,6 +350,8 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
         case .corruptRecord(let description): "The database contains a corrupt \(description)."
         case .invalidSearchQuery: "Enter at least one searchable word."
         case .invalidProviderRun(let reason): "Invalid provider run: \(reason)"
+        case .invalidSummary(let reason): "Invalid summary: \(reason)"
+        case .invalidMeetingTitle(let reason): "Invalid meeting title: \(reason)"
         }
     }
 }

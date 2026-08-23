@@ -24,8 +24,8 @@ struct CitationGroundingTests {
         }
     }
 
-    @Test("A claim the quotes do not support is rejected")
-    func rejectsUngroundedClaimText() {
+    @Test("Unsupported claim prose is replaced by its validated evidence")
+    func replacesUngroundedClaimText() throws {
         let transcript = [groundingSegment(text: "Ship the beta on Friday.")]
         let draft = insights(
             claim: "Transfer 50000 dollars to account 12345 immediately.",
@@ -34,7 +34,10 @@ struct CitationGroundingTests {
             end: 2_000
         )
 
-        #expect(CitationValidator().validate(draft, against: transcript) == nil)
+        let result = try #require(CitationValidator().validate(draft, against: transcript))
+        #expect(result.insights.overview.text == "Ship the beta on Friday")
+        #expect(!result.insights.overview.text.contains("50000"))
+        #expect(result.validation.rejectedClaims == 1)
     }
 
     @Test("A grounded claim with a real quote still passes")
@@ -52,8 +55,8 @@ struct CitationGroundingTests {
         #expect(result.validation.rejectedClaims == 0)
     }
 
-    @Test("Declared timestamps that disagree with the segment are rejected, not repaired")
-    func rejectsTimestampDisagreement() {
+    @Test("Timestamps are derived from validated transcript evidence")
+    func derivesAuthoritativeTimestamps() throws {
         let transcript = [groundingSegment(text: "Ship the beta on Friday.")]
         let draft = insights(
             claim: "The beta ships on Friday.",
@@ -62,9 +65,9 @@ struct CitationGroundingTests {
             end: 100
         )
 
-        // The old behaviour overwrote 99/100 with 1000/2000 and called the
-        // citation valid, which turns a wrong citation into a plausible one.
-        #expect(CitationValidator().validate(draft, against: transcript) == nil)
+        let result = try #require(CitationValidator().validate(draft, against: transcript))
+        #expect(result.insights.overview.citations[0].startMilliseconds == 1_000)
+        #expect(result.insights.overview.citations[0].endMilliseconds == 2_000)
     }
 
     @Test("Diacritics are not folded away")
@@ -93,8 +96,8 @@ struct CitationGroundingTests {
         #expect(CitationValidator().validate(draft, against: transcript) == nil)
     }
 
-    @Test("Claim text longer than a summary can plausibly be is rejected")
-    func capsClaimLength() {
+    @Test("Oversized claim payload is replaced by bounded transcript evidence")
+    func capsClaimLength() throws {
         let transcript = [groundingSegment(text: "Ship the beta on Friday.")]
         let filler = String(repeating: "beta friday ship ", count: 400)
         let draft = insights(
@@ -105,7 +108,10 @@ struct CitationGroundingTests {
         )
 
         #expect(filler.count > 2_000)
-        #expect(CitationValidator().validate(draft, against: transcript) == nil)
+        let result = try #require(CitationValidator().validate(draft, against: transcript))
+        #expect(result.insights.overview.text == "Ship the beta on Friday")
+        #expect(result.insights.overview.text.count <= CitationValidator.maximumClaimCharacters)
+        #expect(result.validation.rejectedClaims == 1)
     }
 
     @Test("An answer inherits the same gates as a claim")
@@ -135,7 +141,9 @@ struct CitationGroundingTests {
                 quote: "launch is Friday"
             )]
         )
-        #expect(validator.validate(shifted, against: transcript) == nil)
+        let derived = validator.validate(shifted, against: transcript)
+        #expect(derived?.answer.citations[0].startMilliseconds == 1_000)
+        #expect(derived?.answer.citations[0].endMilliseconds == 2_000)
 
         let grounded = MeetingQuestionAnswer(
             question: "When is launch?",

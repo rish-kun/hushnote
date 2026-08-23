@@ -25,6 +25,8 @@ public struct Meeting: Codable, Equatable, Identifiable, Sendable {
     public var status: MeetingStatus
     public var errorMessage: String?
     public var retainsAudio: Bool
+    public var activeSummaryVersionID: UUID?
+    public var deletedAt: Date?
 
     public init(
         id: UUID = UUID(),
@@ -36,7 +38,9 @@ public struct Meeting: Codable, Equatable, Identifiable, Sendable {
         updatedAt: Date = Date(),
         status: MeetingStatus = .idle,
         errorMessage: String? = nil,
-        retainsAudio: Bool = false
+        retainsAudio: Bool = false,
+        activeSummaryVersionID: UUID? = nil,
+        deletedAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -48,6 +52,54 @@ public struct Meeting: Codable, Equatable, Identifiable, Sendable {
         self.status = status
         self.errorMessage = errorMessage
         self.retainsAudio = retainsAudio
+        self.activeSummaryVersionID = activeSummaryVersionID
+        self.deletedAt = deletedAt
+    }
+}
+
+public enum SummaryVersionKind: String, Codable, CaseIterable, Sendable {
+    case generated
+    case manual
+}
+
+/// One immutable revision of the meeting overview.
+///
+/// Generated revisions point back to the insight snapshot that supplied their
+/// text. Manual revisions deliberately keep authored whitespace verbatim.
+public struct SummaryVersion: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var meetingID: UUID
+    public var kind: SummaryVersionKind
+    public var text: String
+    public var createdAt: Date
+    public var sourceInsightSnapshotID: UUID?
+
+    public init(
+        id: UUID = UUID(),
+        meetingID: UUID,
+        kind: SummaryVersionKind,
+        text: String,
+        createdAt: Date = Date(),
+        sourceInsightSnapshotID: UUID? = nil
+    ) {
+        self.id = id
+        self.meetingID = meetingID
+        self.kind = kind
+        self.text = text
+        self.createdAt = createdAt
+        self.sourceInsightSnapshotID = sourceInsightSnapshotID
+    }
+}
+
+public struct SavedGeneratedInsights: Equatable, Sendable {
+    public var snapshotID: UUID
+    public var summaryVersion: SummaryVersion
+    public var didActivate: Bool
+
+    public init(snapshotID: UUID, summaryVersion: SummaryVersion, didActivate: Bool) {
+        self.snapshotID = snapshotID
+        self.summaryVersion = summaryVersion
+        self.didActivate = didActivate
     }
 }
 

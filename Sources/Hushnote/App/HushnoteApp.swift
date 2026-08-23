@@ -34,6 +34,7 @@ struct HushnoteApp: App {
         }
         .defaultSize(width: 1180, height: 760)
         .commands {
+            HushnoteAboutCommands()
             CommandGroup(after: .newItem) {
                 if state.recordingPhase.isCapturing {
                     Button(state.recordingPhase == .paused ? "Resume recording" : "Pause recording") {
@@ -53,12 +54,21 @@ struct HushnoteApp: App {
                 .environment(state)
                 .environment(coordinator)
         } label: {
-            Label(
-                state.recordingPhase.isCapturing ? "Hushnote is recording" : "Hushnote",
-                systemImage: state.recordingPhase.isCapturing ? "record.circle.fill" : "waveform"
-            )
+            Label {
+                Text(state.recordingPhase.isCapturing ? "Hushnote is recording" : "Hushnote")
+            } icon: {
+                Image(nsImage: HushnoteBrandImages.menuBarTemplate(
+                    isRecording: state.recordingPhase.isCapturing
+                ))
+            }
         }
         .menuBarExtraStyle(.menu)
+
+        Window("About Hushnote", id: AboutHushnoteView.windowID) {
+            AboutHushnoteView()
+        }
+        .defaultPosition(.center)
+        .windowResizability(.contentSize)
     }
 }
 

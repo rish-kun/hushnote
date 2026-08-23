@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UniformTypeIdentifiers
 
 /// The formats a transcript is serialized into. The meeting's audio is not one
 /// of them: it is a file that already exists and is copied, not a document
@@ -58,6 +59,21 @@ enum MeetingAudioExport {
 }
 
 enum MeetingExporter {
+    @MainActor
+    static func audioDestination(
+        meeting: MeetingListItem,
+        format: MeetingAudioFileFormat
+    ) -> URL? {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = sanitized(meeting.title) + "." + format.fileExtension
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = switch format {
+        case .m4a: [.mpeg4Audio]
+        case .originalCAF: [UTType(filenameExtension: "caf") ?? .audio]
+        }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
     @MainActor
     static func export(
         meeting: MeetingListItem,

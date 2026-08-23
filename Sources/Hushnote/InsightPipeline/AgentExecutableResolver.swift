@@ -54,8 +54,8 @@ public struct AgentExecutableResolver: Sendable {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let absolute = ["/opt/homebrew/bin", "/usr/local/bin"].map { URL(filePath: $0) }
         let relativeToHome = [
-            ".local/bin",
             ".opencode/bin",
+            ".local/bin",
             ".bun/bin",
             ".npm-global/bin",
             ".npm/bin",
@@ -64,7 +64,10 @@ public struct AgentExecutableResolver: Sendable {
             ".yarn/bin",
             ".volta/bin"
         ].map { home.appending(path: $0, directoryHint: .isDirectory) }
-        return absolute + relativeToHome
+        // Prefer the user's explicit CLI installation over an older package-
+        // manager copy. Every candidate still passes the ownership and write-
+        // access checks below, so this does not reintroduce PATH hijacking.
+        return relativeToHome + absolute
     }
 
     public func resolve(_ name: String) throws -> URL {

@@ -46,9 +46,55 @@ struct InsightPipelineTests {
         #expect(result.validation.rejectedCitations == 1)
     }
 
+    @Test("Provider citations may omit timestamps because the transcript owns them")
+    func decodesCitationWithoutProviderTimestamps() throws {
+        let data = Data(#"{"segmentID":"s1","quote":"beta on Friday"}"#.utf8)
+        let citation = try JSONDecoder().decode(EvidenceCitation.self, from: data)
+        let draft = MeetingInsights(
+            overview: CitedInsight(id: "overview", text: "The beta ships Friday.", citations: [citation])
+        )
+
+        let result = try #require(CitationValidator().validate(
+            draft,
+            against: [segment("s1", start: 1_000, end: 2_000, text: "Ship the beta on Friday.")]
+        ))
+
+        #expect(result.insights.overview.citations[0].startMilliseconds == 1_000)
+        #expect(result.insights.overview.citations[0].endMilliseconds == 2_000)
+    }
+
+    @Test("A grounded claim survives an invalid overview as an extractive fallback")
+    func fallsBackToValidatedClaim() throws {
+        let transcript = [segment("s1", text: "Priya will ship the beta on Friday.")]
+        let valid = EvidenceCitation(
+            segmentID: "s1",
+            startMilliseconds: -1,
+            endMilliseconds: -1,
+            quote: "ship the beta on Friday"
+        )
+        let invalid = EvidenceCitation(
+            segmentID: "s1",
+            startMilliseconds: -1,
+            endMilliseconds: -1,
+            quote: "budget was approved"
+        )
+        let draft = MeetingInsights(
+            overview: CitedInsight(id: "overview", text: "A budget was approved.", citations: [invalid]),
+            keyPoints: [CitedInsight(id: "shipping", text: "The beta ships on Friday.", citations: [valid])]
+        )
+
+        let result = try #require(CitationValidator().validate(draft, against: transcript))
+        #expect(result.insights.overview.id == "shipping")
+        #expect(result.insights.overview.text == "The beta ships on Friday.")
+        #expect(result.validation.rejectedClaims == 1)
+    }
+
     @Test("Pipeline validates before synthesis and validates synthesized output again")
     func performsTwoCitationPasses() async throws {
-        let transcript = [segment("s1", text: "Priya will ship the beta on Friday.")]
+        let transcript = [
+            segment("s1", text: "Priya will ship the beta on Friday."),
+            segment("s2", start: 1_000, end: 2_000, text: "Sam approved the launch plan on Tuesday.")
+        ]
         let citation = EvidenceCitation(
             segmentID: "s1",
             startMilliseconds: 0,
@@ -61,30 +107,116 @@ struct InsightPipelineTests {
             endMilliseconds: 1_000,
             quote: "budget was approved"
         )
-        let extraction = MeetingInsights(
+        let firstExtraction = MeetingInsights(
             overview: CitedInsight(id: "overview", text: "The beta was scheduled.", citations: [citation]),
             keyPoints: [CitedInsight(id: "fabricated", text: "Unsupported extraction claim", citations: [fabricated])]
+        )
+        let secondCitation = EvidenceCitation(
+            segmentID: "s2",
+            startMilliseconds: 1_000,
+            endMilliseconds: 2_000,
+            quote: "approved the launch plan on Tuesday"
+        )
+        let secondExtraction = MeetingInsights(
+            overview: CitedInsight(
+                id: "second-overview",
+                text: "The launch plan was approved Tuesday.",
+                citations: [secondCitation]
+            )
         )
         let synthesis = MeetingInsights(
             overview: CitedInsight(id: "overview", text: "The beta was scheduled.", citations: [citation]),
             actionItems: [ActionItemInsight(id: "action", text: "Priya will ship the beta.", owner: "Priya", dueDate: "Friday", citations: [citation])],
             risks: [CitedInsight(id: "fabricated-final", text: "An unsupported final claim", citations: [fabricated])]
         )
-        let provider = ScriptedInsightProvider(responses: [try json(extraction), try json(synthesis)])
+        let provider = ScriptedInsightProvider(responses: [
+            try json(firstExtraction), try json(secondExtraction), try json(synthesis)
+        ])
         let pipeline = InsightPipeline(
             provider: provider,
-            chunker: TranscriptChunker(maximumCharacters: 1_000, overlapSegments: 0)
+            chunker: TranscriptChunker(maximumCharacters: 150, overlapSegments: 0)
         )
 
         let result = try await pipeline.generateInsights(transcript: transcript)
         let requests = await provider.recordedRequests()
 
-        #expect(requests.map(\.purpose) == [.chunkExtraction, .synthesis])
-        #expect(!requests[1].userPrompt.contains("Unsupported extraction claim"))
+        #expect(requests.map(\.purpose) == [.chunkExtraction, .chunkExtraction, .synthesis])
+        #expect(!requests[2].userPrompt.contains("Unsupported extraction claim"))
         #expect(result.insights.actionItems.map(\.owner) == ["Priya"])
         #expect(result.insights.risks.isEmpty)
         #expect(result.validation.rejectedClaims == 1)
         #expect(result.validation.rejectedCitations == 1)
+    }
+
+    @Test("Single-chunk generation returns after its validated extraction")
+    func reportsProgress() async throws {
+        let transcript = [segment("s1", text: "Priya will ship the beta on Friday.")]
+        let citation = EvidenceCitation(
+            segmentID: "s1",
+            startMilliseconds: 0,
+            endMilliseconds: 1_000,
+            quote: "ship the beta on Friday"
+        )
+        let insights = MeetingInsights(
+            overview: CitedInsight(id: "overview", text: "The beta ships on Friday.", citations: [citation])
+        )
+        let provider = ScriptedInsightProvider(responses: [try json(insights)])
+        let recorder = ProgressRecorder()
+
+        _ = try await InsightPipeline(provider: provider).generateInsights(transcript: transcript) {
+            await recorder.append($0)
+        }
+
+        #expect(await recorder.values() == [
+            .preparing,
+            .extracting(current: 1, total: 1),
+            .validating,
+            .completed
+        ])
+        #expect(await provider.recordedRequests().count == 1)
+    }
+
+    @Test("Malformed extraction output is distinguished from unsupported citations")
+    func reportsMalformedExtraction() async {
+        let provider = ScriptedInsightProvider(responses: ["not json"])
+
+        await #expect(throws: InsightPipelineError.invalidProviderOutput) {
+            _ = try await InsightPipeline(provider: provider)
+                .generateInsights(transcript: [segment("s1", text: "A real transcript sentence.")])
+        }
+    }
+
+    @Test("Malformed synthesis falls back to already validated chunk facts")
+    func fallsBackWhenSynthesisIsMalformed() async throws {
+        let firstCitation = EvidenceCitation(
+            segmentID: "s1", startMilliseconds: 0, endMilliseconds: 1_000,
+            quote: "ship the beta on Friday"
+        )
+        let secondCitation = EvidenceCitation(
+            segmentID: "s2", startMilliseconds: 1_000, endMilliseconds: 2_000,
+            quote: "approved the launch plan on Tuesday"
+        )
+        let first = MeetingInsights(overview: CitedInsight(
+            id: "first", text: "The beta ships Friday.", citations: [firstCitation]
+        ))
+        let second = MeetingInsights(overview: CitedInsight(
+            id: "second", text: "The launch plan was approved Tuesday.", citations: [secondCitation]
+        ))
+        let provider = ScriptedInsightProvider(responses: [try json(first), try json(second), "not json"])
+        let pipeline = InsightPipeline(
+            provider: provider,
+            chunker: TranscriptChunker(maximumCharacters: 150, overlapSegments: 0)
+        )
+
+        let result = try await pipeline.generateInsights(transcript: [
+            segment("s1", text: "Priya will ship the beta on Friday."),
+            segment("s2", start: 1_000, end: 2_000, text: "Sam approved the launch plan on Tuesday.")
+        ])
+
+        #expect(result.insights.overview.id == "first")
+        #expect(await provider.recordedRequests().map(\.purpose) == [
+            .chunkExtraction, .chunkExtraction, .synthesis
+        ])
     }
 
     @Test("Provider errors propagate without selecting another provider")
@@ -259,7 +391,7 @@ struct InsightPipelineTests {
         let insights = MeetingInsights(
             overview: CitedInsight(id: "overview", text: "First", citations: [citation])
         )
-        let provider = ScriptedInsightProvider(responses: [try json(insights), try json(insights)])
+        let provider = ScriptedInsightProvider(responses: [try json(insights)])
         let pipeline = InsightPipeline(
             provider: provider,
             chunker: TranscriptChunker(maximumCharacters: 1_000, overlapSegments: 0)
@@ -364,6 +496,13 @@ private func providerRequest() -> InsightProviderRequest {
             "additionalProperties": .bool(false)
         ])
     )
+}
+
+private actor ProgressRecorder {
+    private var progress: [InsightPipelineProgress] = []
+
+    func append(_ value: InsightPipelineProgress) { progress.append(value) }
+    func values() -> [InsightPipelineProgress] { progress }
 }
 
 private actor ScriptedInsightProvider: InsightProvider {

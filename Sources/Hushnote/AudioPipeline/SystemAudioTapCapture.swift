@@ -434,18 +434,11 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             mScope: kAudioDevicePropertyScopeInput,
             mElement: kAudioObjectPropertyElementMain
         )
-        for attempt in 0..<40 {
+        try CaptureStartPreparation.waitForInputStream(probe: {
             var size: UInt32 = 0
             let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
-            if status == noErr, size >= UInt32(MemoryLayout<AudioStreamID>.size) {
-                return
-            }
-            if status != noErr, attempt > 4 {
-                try check(status, operation: "prepare the system-audio input stream")
-            }
-            Thread.sleep(forTimeInterval: 0.025)
-        }
-        throw AudioPipelineError.audioCaptureFailed
+            return .init(status: status, byteCount: size)
+        })
     }
 
     /// Core Audio can still briefly reject the first start while applying an
@@ -455,20 +448,9 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         _ deviceID: AudioObjectID,
         ioProcID: AudioDeviceIOProcID
     ) throws {
-        let retryDelays: [TimeInterval] = [0, 0.05, 0.1, 0.2, 0.4]
-        var lastStatus: OSStatus = noErr
-        for delay in retryDelays {
-            if delay > 0 { Thread.sleep(forTimeInterval: delay) }
-            lastStatus = AudioDeviceStart(deviceID, ioProcID)
-            if lastStatus == noErr { return }
-            // `'nope'` is HAL's transient illegal-operation response. Other
-            // errors are deterministic and should be surfaced immediately.
-            guard lastStatus == OSStatus(bitPattern: 0x6E6F7065) else {
-                try check(lastStatus, operation: Operation.startDevice)
-                return
-            }
+        try CaptureStartPreparation.startDevice {
+            AudioDeviceStart(deviceID, ioProcID)
         }
-        try check(lastStatus, operation: Operation.startDeviceAfterWaiting)
     }
 
     /// The format read at start is used to wrap every buffer for the rest of the

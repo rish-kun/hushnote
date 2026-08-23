@@ -15,7 +15,7 @@ struct SpecialTokenDecodingOptionTests {
         let decoder = RecordingLiveDecoder([
             [SpecialTokenFixture.segment(start: 0, end: 1, text: "Hello")]
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: SpecialTokenFixture.configuration(meetingID: meetingID)
         )

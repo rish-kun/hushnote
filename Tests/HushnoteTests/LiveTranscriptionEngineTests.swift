@@ -17,7 +17,7 @@ struct LiveTranscriptionEngineTests {
                 whisperSegment(start: 0, end: 0, text: "there"),
             ]
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
         var deltas = stream.makeAsyncIterator()
 
@@ -46,7 +46,7 @@ struct LiveTranscriptionEngineTests {
                 whisperSegment(start: 2, end: 3, text: "and more"),
             ],
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: configuration(meetingID: meetingID, confirmationLagSegments: 1)
         )
@@ -81,7 +81,7 @@ struct LiveTranscriptionEngineTests {
                 ),
             ]
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
         var deltas = stream.makeAsyncIterator()
 
@@ -97,7 +97,7 @@ struct LiveTranscriptionEngineTests {
     func dropsCommittedAudioFromTheWindow() async throws {
         let meetingID = UUID()
         let decoder = WindowMirroringDecoder()
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: configuration(meetingID: meetingID, confirmationLagSegments: 2)
         )
@@ -127,7 +127,7 @@ struct LiveTranscriptionEngineTests {
     func capsTheWindowWhenNothingCommits() async throws {
         let meetingID = UUID()
         let decoder = ScriptedDecoder([[]])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
         var deltas = stream.makeAsyncIterator()
 
@@ -150,7 +150,7 @@ struct LiveTranscriptionEngineTests {
     func neverSendsClipTimestamps() async throws {
         let meetingID = UUID()
         let decoder = WindowMirroringDecoder()
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
         var deltas = stream.makeAsyncIterator()
 
@@ -178,7 +178,7 @@ struct LiveTranscriptionEngineTests {
             [whisperSegment(start: 0, end: 1, text: "one"), whisperSegment(start: 1, end: 5, text: "two")],
             [whisperSegment(start: 0, end: 4, text: "two again")],
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: configuration(meetingID: meetingID, confirmationLagSegments: 0)
         )
@@ -203,7 +203,7 @@ struct LiveTranscriptionEngineTests {
     func pushReturnsBeforeTheDecodeCompletes() async throws {
         let meetingID = UUID()
         let decoder = GatedDecoder()
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
         var deltas = stream.makeAsyncIterator()
 
@@ -224,7 +224,7 @@ struct LiveTranscriptionEngineTests {
     func cancelStopsTheInFlightDecode() async throws {
         let meetingID = UUID()
         let decoder = GatedDecoder()
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
 
         try await engine.push(frame(meetingID: meetingID, sequence: 1, startMilliseconds: 0))
@@ -255,7 +255,7 @@ struct LiveTranscriptionEngineTests {
     func finishDoesNotDecodeConcurrently() async throws {
         let meetingID = UUID()
         let decoder = GatedDecoder()
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
 
         let collected = Task {
@@ -281,6 +281,29 @@ struct LiveTranscriptionEngineTests {
         #expect(deltas.filter(\.isFinal).count == 1)
     }
 
+    @Test("A cancelled session lets go of the model and takes it back on demand")
+    func cancelReleasesTheLoadedModel() async throws {
+        let probe = ReleaseProbe()
+        // The closure builds a decoder rather than capturing one, exactly as the
+        // production recipe does, so the engine holds the only reference and
+        // what the probe reports is what the engine is keeping.
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { ReleaseTrackingDecoder(probe: probe) })
+        _ = try await engine.start(configuration: configuration(meetingID: UUID()))
+        #expect(probe.liveInstances == 1)
+
+        await engine.cancel()
+
+        // The live model is ~600 MB and the final pass loads a different
+        // artifact of its own. Holding this one past the session is what put
+        // both in memory at the moment finalization starts.
+        #expect(probe.liveInstances == 0)
+
+        // Releasing must not strand the engine: a caller that loaded a model
+        // once still gets a working session, so the model comes back on demand.
+        _ = try await engine.start(configuration: configuration(meetingID: UUID()))
+        #expect(probe.liveInstances == 1)
+    }
+
     @Test("Identifiers are scoped to the meeting that produced them")
     func identifiersDoNotCollideAcrossMeetings() async throws {
         let first = UUID()
@@ -288,7 +311,7 @@ struct LiveTranscriptionEngineTests {
         var minted: [[String]] = []
         for meetingID in [first, second] {
             let decoder = ScriptedDecoder([[whisperSegment(start: 0, end: 1, text: "Hello")]])
-            let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+            let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
             let stream = try await engine.start(configuration: configuration(meetingID: meetingID))
             var deltas = stream.makeAsyncIterator()
             try await engine.push(frame(meetingID: meetingID, sequence: 1, startMilliseconds: 0))
@@ -349,6 +372,38 @@ private func whisperSegment(
 
 private func word(_ text: String, start: Float, end: Float) -> WordTiming {
     WordTiming(word: text, tokens: [], start: start, end: end, probability: 0.9)
+}
+
+/// Counts decoder instances that are still alive. `deinit` cannot await an
+/// actor, so the count is guarded by a lock instead.
+private final class ReleaseProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var liveInstances: Int { lock.withLock { count } }
+
+    func opened() { lock.withLock { count += 1 } }
+    func closed() { lock.withLock { count -= 1 } }
+}
+
+/// Reports its own lifetime, so a test can see whether the engine is still
+/// holding a model it no longer has a session for.
+private final class ReleaseTrackingDecoder: LiveSpeechDecoder, @unchecked Sendable {
+    private let probe: ReleaseProbe
+
+    init(probe: ReleaseProbe) {
+        self.probe = probe
+        probe.opened()
+    }
+
+    deinit { probe.closed() }
+
+    func decodeWindow(
+        samples: [Float],
+        options: DecodingOptions
+    ) async throws -> [TranscriptionResult] {
+        [result(segments: [])]
+    }
 }
 
 /// Replays a fixed list of decoder responses so engine behaviour can be tested

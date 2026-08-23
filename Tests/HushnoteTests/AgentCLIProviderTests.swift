@@ -354,6 +354,31 @@ struct AgentProcessRunnerTests {
 
         #expect(clock.now - started < .seconds(20))
     }
+
+    @Test("Cancelling the owning task terminates the child promptly")
+    func cancellationStopsChild() async throws {
+        let sandbox = try AgentSandboxDirectory.make(label: "runner-cancel")
+        defer { sandbox.remove() }
+        let clock = ContinuousClock()
+        let started = clock.now
+        let task = Task {
+            try await SubprocessAgentProcessRunner().run(
+                AgentProcessInvocation(
+                    executableURL: URL(filePath: "/bin/sh"),
+                    arguments: ["-c", "while :; do :; done"],
+                    environment: AgentProcessEnvironment.minimal(),
+                    workingDirectory: sandbox.url,
+                    standardInput: "",
+                    timeout: .seconds(60)
+                )
+            )
+        }
+
+        try await Task.sleep(for: .milliseconds(150))
+        task.cancel()
+        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        #expect(clock.now - started < .seconds(10))
+    }
 }
 
 /// opencode writes conversations into a shared 1.7 GB database by default and

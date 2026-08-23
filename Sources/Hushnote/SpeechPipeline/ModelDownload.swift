@@ -123,6 +123,7 @@ protocol SpeechModelDownloading: Sendable {
     /// - Returns: the folder the model's artifacts are in.
     func download(
         model: SpeechModel,
+        downloadBase: URL?,
         onProgress: @escaping @Sendable (Double, Double?) -> Void
     ) async throws -> URL
 }
@@ -137,10 +138,12 @@ protocol SpeechModelDownloading: Sendable {
 struct WhisperKitModelDownloader: SpeechModelDownloading {
     func download(
         model: SpeechModel,
+        downloadBase: URL?,
         onProgress: @escaping @Sendable (Double, Double?) -> Void
     ) async throws -> URL {
         try await WhisperKit.download(
             variant: model.runtimeIdentifier,
+            downloadBase: downloadBase,
             progressCallback: { progress in
                 onProgress(
                     progress.fractionCompleted,
@@ -201,12 +204,13 @@ struct ModelDownloadRunner: Sendable {
     ///   `.failed` or -- for a cancellation -- `.notInstalled`.
     func run(
         model: SpeechModel,
+        downloadBase: URL? = nil,
         install: @Sendable (URL) async throws -> Void,
         report: @escaping @Sendable (ModelAvailability) -> Void
     ) async {
         let rate = RateBox(totalBytes: model.approximateDownloadBytes)
         do {
-            let folder = try await downloader.download(model: model) { fraction, reported in
+            let folder = try await downloader.download(model: model, downloadBase: downloadBase) { fraction, reported in
                 report(
                     .downloading(
                         ModelDownloadProgress(

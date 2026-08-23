@@ -137,4 +137,163 @@ struct AudioExportTests {
             )
         }
     }
+
+    @Test("The asynchronous original export replaces a destination and keeps its source")
+    func asyncOriginalExport() async throws {
+        let directory = try scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try writeTake(named: "system-0.caf", frames: 24_000, in: directory)
+        let destination = directory.appending(path: "export.caf")
+        try Data("old destination".utf8).write(to: destination)
+        let progress = ProgressCollector()
+
+        try await MeetingAudioExportService().export(
+            source: source,
+            destination: destination,
+            format: .originalCAF,
+            progress: { progress.record($0) }
+        )
+
+        #expect(try AVAudioFile(forReading: destination).length == 24_000)
+        #expect(try AVAudioFile(forReading: source).length == 24_000)
+        #expect(progress.values.first == 0)
+        #expect(progress.values.last == 1)
+        #expect(zip(progress.values, progress.values.dropFirst()).allSatisfy { $0.0 <= $0.1 })
+    }
+
+    @Test("M4A export produces a readable, similarly long recording")
+    func m4aExportIsReadable() async throws {
+        let directory = try scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try writeTake(named: "system-0.caf", frames: 48_000, in: directory)
+        let destination = directory.appending(path: "meeting.m4a")
+        let progress = ProgressCollector()
+
+        try await MeetingAudioExportService().export(
+            source: source,
+            destination: destination,
+            format: .m4a,
+            progress: { progress.record($0) }
+        )
+
+        let exported = try AVAudioFile(forReading: destination)
+        #expect(exported.length > 0)
+        let duration = Double(exported.length) / exported.processingFormat.sampleRate
+        #expect(abs(duration - 1) < 0.1)
+        #expect(try AVAudioFile(forReading: source).length == 48_000)
+        #expect(progress.values.first == 0)
+        #expect(progress.values.last == 1)
+        #expect(progress.values.contains { $0 > 0.05 && $0 < 0.98 })
+    }
+
+    @Test("Missing and empty recordings fail before creating a destination")
+    func invalidSourcesFailEarly() async throws {
+        let directory = try scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appending(path: "meeting.m4a")
+
+        await #expect(throws: MeetingAudioExportError.sourceMissing) {
+            try await MeetingAudioExportService().export(
+                source: directory.appending(path: "missing.caf"),
+                destination: destination,
+                format: .m4a
+            )
+        }
+
+        let empty = directory.appending(path: "empty.caf")
+        _ = try IncrementalCAFWriter(url: empty)
+        await #expect(throws: MeetingAudioExportError.sourceHasNoAudio) {
+            try await MeetingAudioExportService().export(
+                source: empty,
+                destination: destination,
+                format: .m4a
+            )
+        }
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    @Test("A failed conversion leaves an existing destination untouched")
+    func conversionFailurePreservesDestination() async throws {
+        let directory = try scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try writeTake(named: "system-0.caf", frames: 4_800, in: directory)
+        let destination = directory.appending(path: "meeting.m4a")
+        let original = Data("keep this".utf8)
+        try original.write(to: destination)
+
+        await #expect(throws: StubConversionError.failed) {
+            try await MeetingAudioExportService(converter: FailingM4AConverter()).export(
+                source: source,
+                destination: destination,
+                format: .m4a
+            )
+        }
+
+        #expect(try Data(contentsOf: destination) == original)
+        #expect(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @Test("Cancelling conversion leaves an existing destination untouched")
+    func cancellationPreservesDestination() async throws {
+        let directory = try scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try writeTake(named: "system-0.caf", frames: 4_800, in: directory)
+        let destination = directory.appending(path: "meeting.m4a")
+        let original = Data("keep this".utf8)
+        try original.write(to: destination)
+
+        let task = Task {
+            try await MeetingAudioExportService(converter: SuspendedM4AConverter()).export(
+                source: source,
+                destination: destination,
+                format: .m4a
+            )
+        }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+
+        #expect(try Data(contentsOf: destination) == original)
+        #expect(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @Test("Retention is decided by the meeting snapshot")
+    func retentionPolicy() {
+        #expect(!MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(meetingRetainsAudio: true))
+        #expect(MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(meetingRetainsAudio: false))
+    }
+}
+
+private enum StubConversionError: Error {
+    case failed
+}
+
+private struct FailingM4AConverter: MeetingAudioM4AConverting {
+    func convert(
+        source: URL,
+        destination: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        throw StubConversionError.failed
+    }
+}
+
+private struct SuspendedM4AConverter: MeetingAudioM4AConverting {
+    func convert(
+        source: URL,
+        destination: URL,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        try await Task.sleep(for: .seconds(30))
+    }
+}
+
+private final class ProgressCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Double] = []
+
+    var values: [Double] { lock.withLock { storage } }
+
+    func record(_ value: Double) {
+        lock.withLock { storage.append(value) }
+    }
 }

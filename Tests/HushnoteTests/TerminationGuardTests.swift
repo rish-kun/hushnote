@@ -32,4 +32,14 @@ struct TerminationGuardTests {
     func pausedIsNotASafeQuitPoint() {
         #expect(TerminationGuard.decision(for: .paused) != .terminateNow)
     }
+
+    @Test("Unsaved authored summary text blocks an otherwise safe quit")
+    func unsavedSummaryIsGuarded() {
+        #expect(
+            TerminationGuard.decision(
+                for: .idle,
+                hasUnsavedSummaryChanges: true
+            ) == .confirmUnsavedSummary
+        )
+    }
 }

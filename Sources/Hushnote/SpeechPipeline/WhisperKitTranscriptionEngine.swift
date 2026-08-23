@@ -50,6 +50,14 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     )
 
     private var decoder: (any LiveSpeechDecoder)?
+    /// How to build the decoder again. The engine keeps the recipe rather than
+    /// only the result, because the model is released at the end of every
+    /// session and `start` has to be able to put it back without the caller
+    /// having to know it went away.
+    private var makeDecoder: (@Sendable () async throws -> any LiveSpeechDecoder)?
+    /// Rebuilding costs hundreds of megabytes, so two overlapping starts must
+    /// not each pay for one.
+    private var isRebuildingDecoder = false
     private var configuration: TranscriptionSessionConfiguration?
     private var buffers: [AudioSource: SourceBuffer] = [:]
     private var continuation: AsyncThrowingStream<TranscriptDelta, Error>.Continuation?
@@ -63,13 +71,15 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
 
     public init() {}
 
-    /// Test seam. Production code reaches the engine through `load(model:)`.
-    init(decoder: some LiveSpeechDecoder) {
-        self.decoder = decoder
+    /// Test seam. Production code reaches the engine through `load(model:)`,
+    /// which installs a closure of exactly this shape, so a test exercises the
+    /// same release-and-rebuild path a real session does.
+    init(makeDecoder: @escaping @Sendable () async throws -> any LiveSpeechDecoder) {
+        self.makeDecoder = makeDecoder
     }
 
     public func load(model: SpeechModel) async throws {
-        try await load(model: model, modelFolder: nil)
+        try await load(model: model, modelFolder: nil, downloadBase: nil)
     }
 
     /// - Parameter modelFolder: artifacts already fetched by
@@ -78,27 +88,57 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
     ///   the download was buried inside one opaque await that also prewarmed
     ///   and compiled. Given a folder, WhisperKit loads from it and resolves
     ///   nothing over the network.
-    public func load(model: SpeechModel, modelFolder: URL?) async throws {
+    public func load(
+        model: SpeechModel,
+        modelFolder: URL?,
+        downloadBase: URL? = nil
+    ) async throws {
         guard configuration == nil else { throw SpeechPipelineError.sessionAlreadyRunning }
         guard model.provider == .whisperKit else { throw SpeechPipelineError.modelNotLoaded }
 
-        let config = WhisperKitConfig(
+        let build: @Sendable () async throws -> any LiveSpeechDecoder = {
+            let config = Self.modelConfiguration(
+                for: model,
+                modelFolder: modelFolder,
+                downloadBase: downloadBase
+            )
+            return WhisperKitDecoder(kit: try await WhisperKit(config))
+        }
+        // Load eagerly: a caller that asked for a model wants to hear here that
+        // it could not be compiled, not at the start of a meeting.
+        decoder = try await build()
+        makeDecoder = build
+    }
+
+    static func modelConfiguration(
+        for model: SpeechModel,
+        modelFolder: URL?,
+        downloadBase: URL?
+    ) -> WhisperKitConfig {
+        WhisperKitConfig(
             model: modelFolder == nil ? model.runtimeIdentifier : nil,
+            downloadBase: downloadBase,
             modelFolder: modelFolder?.path,
             verbose: false,
             prewarm: true,
             load: true,
             download: modelFolder == nil
         )
-        decoder = WhisperKitDecoder(kit: try await WhisperKit(config))
     }
 
     public func start(
         configuration: TranscriptionSessionConfiguration
     ) async throws -> AsyncThrowingStream<TranscriptDelta, Error> {
-        guard decoder != nil else {
-            throw SpeechPipelineError.modelNotLoaded
+        guard self.configuration == nil, !isRebuildingDecoder else {
+            throw SpeechPipelineError.sessionAlreadyRunning
         }
+        if decoder == nil {
+            guard let makeDecoder else { throw SpeechPipelineError.modelNotLoaded }
+            isRebuildingDecoder = true
+            defer { isRebuildingDecoder = false }
+            decoder = try await makeDecoder()
+        }
+        // Rebuilding suspends, so a session can have been opened meanwhile.
         guard self.configuration == nil else {
             throw SpeechPipelineError.sessionAlreadyRunning
         }
@@ -437,6 +477,12 @@ public actor WhisperKitTranscriptionEngine: TranscriptionEngine {
         // Retiring the token is what makes a decode that is still inside Core ML
         // harmless: it can no longer match, so it cannot write anything back.
         sessionToken = UUID()
+        // The live model is ~600 MB and the final pass loads a different
+        // artifact of its own, so a session that has ended must not keep its
+        // weights resident across finalization. A decode still inside Core ML
+        // captured the instance before its first suspension and finishes on
+        // that; the retired token discards its result exactly as before.
+        decoder = nil
     }
 }
 

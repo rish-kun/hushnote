@@ -43,6 +43,23 @@ private final class FakeClock: @unchecked Sendable {
     }
 }
 
+private final class DownloadBaseRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: URL?
+
+    func record(_ url: URL?) {
+        lock.lock()
+        storage = url
+        lock.unlock()
+    }
+
+    var value: URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 private struct FakeDownloader: SpeechModelDownloading {
     var fractions: [Double] = []
     var clock: FakeClock?
@@ -50,11 +67,14 @@ private struct FakeDownloader: SpeechModelDownloading {
     /// Blocks until the task is cancelled, which is how the cancel path is
     /// exercised without a race.
     var blocks = false
+    var downloadBaseRecorder: DownloadBaseRecorder?
 
     func download(
         model: SpeechModel,
+        downloadBase: URL?,
         onProgress: @escaping @Sendable (Double, Double?) -> Void
     ) async throws -> URL {
+        downloadBaseRecorder?.record(downloadBase)
         for fraction in fractions {
             clock?.advance(1)
             onProgress(fraction, nil)
@@ -89,6 +109,19 @@ struct ModelDownloadRunnerTests {
         let states = collector.values
         #expect(states.last == .ready)
         #expect(states.compactMap(\.progress?.fraction) == [0.25, 0.5, 1])
+    }
+
+    @Test("A download uses the selected cache root")
+    func selectedDownloadBaseReachesTransport() async {
+        let recorder = DownloadBaseRecorder()
+        let base = URL(fileURLWithPath: "/Volumes/Models/Hushnote Models/WhisperKit")
+        let runner = ModelDownloadRunner(
+            downloader: FakeDownloader(downloadBaseRecorder: recorder)
+        )
+
+        await runner.run(model: model, downloadBase: base, install: { _ in }, report: { _ in })
+
+        #expect(recorder.value == base)
     }
 
     @Test("The states carry a measured rate once there is enough to measure")

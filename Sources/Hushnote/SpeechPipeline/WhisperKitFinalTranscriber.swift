@@ -33,19 +33,26 @@ private struct WhisperKitFileDecoder: FinalSpeechDecoder, @unchecked Sendable {
 /// the live engine can be released before finalization begins.
 public actor WhisperKitFinalTranscriber {
     private let injectedDecoder: (any FinalSpeechDecoder)?
+    private let downloadBase: URL?
 
-    public init() {
+    public init(downloadBase: URL? = nil) {
         injectedDecoder = nil
+        self.downloadBase = downloadBase
     }
 
     /// Test seam. Production code always loads a real model.
     init(decoder: some FinalSpeechDecoder) {
         injectedDecoder = decoder
+        downloadBase = nil
     }
 
-    static func modelConfiguration(for model: SpeechModel) -> WhisperKitConfig {
+    static func modelConfiguration(
+        for model: SpeechModel,
+        downloadBase: URL? = nil
+    ) -> WhisperKitConfig {
         WhisperKitConfig(
             model: model.runtimeIdentifier,
+            downloadBase: downloadBase,
             verbose: false,
             // Prewarming halves peak compilation memory at the cost of doubling
             // load time. This model is loaded, used for one pass and released,
@@ -70,7 +77,7 @@ public actor WhisperKitFinalTranscriber {
             decoder = injectedDecoder
         } else {
             decoder = WhisperKitFileDecoder(
-                kit: try await WhisperKit(Self.modelConfiguration(for: model))
+                kit: try await WhisperKit(Self.modelConfiguration(for: model, downloadBase: downloadBase))
             )
         }
         await progress?(.transcribing)
@@ -84,6 +91,12 @@ public actor WhisperKitFinalTranscriber {
                 language: languageCode,
                 skipSpecialTokens: true,
                 wordTimestamps: true,
+                // Left unset this inherits WhisperKit's macOS default of 16,
+                // which is more decoder state than a 16 GB machine has room
+                // for. See `FinalDecodeConcurrency`.
+                concurrentWorkerCount: FinalDecodeConcurrency.workerCount(
+                    physicalMemory: ProcessInfo.processInfo.physicalMemory
+                ),
                 chunkingStrategy: .vad
             )
         )

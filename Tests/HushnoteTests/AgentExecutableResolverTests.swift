@@ -20,6 +20,24 @@ struct AgentExecutableResolverTests {
         #expect(resolved.path.hasPrefix("/"))
     }
 
+    @Test("The first safe installation wins, matching user-scoped CLI precedence")
+    func prefersUserScopedInstallation() throws {
+        let userBin = try makeTemporaryBin()
+        let packageManagerBin = try makeTemporaryBin()
+        defer {
+            try? FileManager.default.removeItem(at: userBin)
+            try? FileManager.default.removeItem(at: packageManagerBin)
+        }
+        let userTool = try makeExecutable(named: "opencode", in: userBin, mode: 0o755)
+        _ = try makeExecutable(named: "opencode", in: packageManagerBin, mode: 0o755)
+
+        let resolved = try AgentExecutableResolver(
+            searchPaths: [userBin, packageManagerBin]
+        ).resolve("opencode")
+
+        #expect(resolved.path == userTool.path)
+    }
+
     @Test("A tool reachable only through PATH is not found")
     func ignoresPATH() throws {
         let bin = try makeTemporaryBin()

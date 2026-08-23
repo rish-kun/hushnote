@@ -26,6 +26,14 @@ final class AppCoordinator {
     var localModelPath = ""
     var localLlamaExecutablePath = AppCoordinator.defaultLlamaServerPath
     var applicationDataPath: String { applicationDataURL.path }
+    private(set) var modelStoragePaths: ModelStoragePaths
+    private(set) var modelStorageMigrationProgress: ModelStorageMigrationProgress?
+    private(set) var isChangingModelStorage = false
+    private(set) var modelStorageStatus: String?
+    private(set) var queuedModelStoragePath: String?
+    private(set) var installedModelFolders: [String: URL] = [:]
+    private(set) var installedModelAllocatedBytes: [String: Int64] = [:]
+    @ObservationIgnored private var storageScanGeneration: UUID?
 
     @ObservationIgnored private let credentials = KeychainCredentialStore()
     @ObservationIgnored private let codexProvider = CodexAppServerInsightProvider()
@@ -43,22 +51,41 @@ final class AppCoordinator {
     @ObservationIgnored private var liveSessionGeneration: UUID?
     @ObservationIgnored private var sequenceNumbers: [AudioSource: Int64] = [:]
     @ObservationIgnored private var assembler: TranscriptAssembler?
+    /// The assembler's snapshot is the whole meeting on every delta; this is
+    /// what keeps the live upsert to the part of it that changed.
+    @ObservationIgnored private var liveWrites = LiveTranscriptWriteSet()
     @ObservationIgnored private var cachedSegments: [UUID: [TranscriptSegment]] = [:]
     @ObservationIgnored private var pendingEditTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingNoteTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private let downloader: any SpeechModelDownloading
+    @ObservationIgnored private let storageAccounting: any StorageAccounting
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let preferences: AppPreferences
     /// One per model, so a download can be cancelled by the row that started it.
     @ObservationIgnored private var downloadTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var queuedModelStorageChange: (destination: ModelStoragePaths, migrate: Bool)?
+    @ObservationIgnored private var meetingLoadGeneration: UUID?
+    @ObservationIgnored private var insightTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var insightGenerations: [UUID: UUID] = [:]
+    @ObservationIgnored private let meetingAudioExporter = MeetingAudioExportService()
+    @ObservationIgnored private var audioExportTasks: [UUID: Task<Void, Never>] = [:]
+    /// Cancellation is cooperative. A replaced export can finish after its
+    /// successor starts, so every UI update is stamped with its own generation.
+    @ObservationIgnored private var audioExportGenerations: [UUID: UUID] = [:]
 
     init(
         state: AppViewState,
         downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
+        storageAccounting: any StorageAccounting = StorageAccountingService(),
         defaults: UserDefaults = .standard
     ) {
         self.state = state
         self.downloader = downloader
+        self.storageAccounting = storageAccounting
         self.defaults = defaults
+        let preferences = AppPreferences(defaults: defaults)
+        self.preferences = preferences
+        self.modelStoragePaths = preferences.modelStoragePaths
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "Hushnote", directoryHint: .isDirectory)
         applicationDataURL = base
@@ -72,16 +99,38 @@ final class AppCoordinator {
         // reads it back, before anything can render the draft.
         SpeechModelDefaults.apply(to: &self.state.draft, from: defaults)
         self.state.liveTranscriptionEnabled = SpeechModelDefaults.liveTranscriptionEnabled(from: defaults)
+        self.state.selectedProvider = preferences.selectedProvider
+        self.state.retainAudio = preferences.retainAudio
+        self.state.meetingWorkspaceTabs = preferences.meetingTabs
+        self.localModelPath = preferences.localModelPath
+        self.localLlamaExecutablePath = preferences.llamaExecutablePath ?? Self.defaultLlamaServerPath
     }
 
     func bootstrap() async {
+        refreshInstalledModels()
+        await refreshInstalledModelSizes()
         do {
+            _ = try await store.failInterruptedProviderRuns()
+            _ = try await store.purgeDeletedMeetings(
+                olderThan: Date().addingTimeInterval(-30 * 24 * 60 * 60)
+            )
             let interrupted = try await store.recoverInterruptedMeetings()
             for meeting in interrupted {
                 try? await registerRecoveryAudio(for: meeting.id)
             }
             let meetings = try await store.meetings()
             state.meetings = meetings.map(Self.listItem)
+            state.recentlyDeletedMeetings = try await store.recentlyDeleted().map(Self.listItem)
+            let ids = Set(meetings.map(\.id))
+            state.meetingWorkspaceTabs = preferences.pruneMeetingTabs(keeping: ids)
+            if let destination = preferences.sidebarDestination {
+                if case .meeting(let id) = destination, !ids.contains(id) {
+                    state.selection = .meetings
+                    preferences.sidebarDestination = .meetings
+                } else {
+                    state.selection = destination
+                }
+            }
         } catch {
             logger.error("Bootstrap failed: \(error.localizedDescription, privacy: .public)")
             state.markFailed(.init(kind: .database, message: "The local meeting database could not be loaded."))
@@ -99,8 +148,8 @@ final class AppCoordinator {
             try await store.saveMeeting(meeting)
             state.meetings.insert(Self.listItem(meeting), at: 0)
             state.meetingNotes[meeting.id] = ""
-            state.selection = .meeting(meeting.id)
-            state.selectedWorkspaceTab = "Notes"
+            setSelection(.meeting(meeting.id))
+            setWorkspaceTab(.notes, for: meeting.id)
         } catch {
             state.markFailed(.init(kind: .database, message: "A new meeting note could not be created: \(error.localizedDescription)"))
         }
@@ -111,6 +160,7 @@ final class AppCoordinator {
         let generation = UUID()
         liveSessionGeneration = generation
         state.recordingPhase = .preparing
+        state.recordingStartupStage = .arming
         var meeting: Meeting
         if let requestedMeetingID, let stored = try? await store.meeting(id: requestedMeetingID) {
             meeting = stored
@@ -118,6 +168,7 @@ final class AppCoordinator {
             meeting.updatedAt = Date()
             meeting.status = .idle
             meeting.errorMessage = nil
+            meeting.retainsAudio = state.retainAudio
         } else {
             meeting = Meeting(
                 title: resolvedTitle,
@@ -136,28 +187,28 @@ final class AppCoordinator {
             } else {
                 state.meetings.insert(item, at: 0)
             }
-            state.selection = .meeting(meeting.id)
+            setSelection(.meeting(meeting.id))
+            state.activeMeetingID = meeting.id
             assembler = TranscriptAssembler(meetingID: meeting.id)
             sequenceNumbers = [:]
+            liveWrites.reset()
 
             let pipeline = AudioPipeline(rootDirectory: applicationDataURL.appending(path: "RecoveryAudio"))
             audioPipeline = pipeline
-            observeAudioEvents(pipeline, meetingID: meeting.id)
+            observeAudioEvents(pipeline, meetingID: meeting.id, generation: generation)
             _ = try await pipeline.start(sessionID: meeting.id)
+            // AudioDeviceStart can deliver its first callback before `start()`
+            // returns. Never regress the ready state that callback established.
+            if state.recordingPhase == .preparing {
+                state.recordingStartupStage = .waitingForFirstBuffer
+            }
             try await store.updateMeetingStatus(id: meeting.id, status: .recording)
             if let index = state.meetings.firstIndex(where: { $0.id == meeting.id }) {
                 state.meetings[index].status = .recording
             }
-            state.markRecordingStarted(meetingID: meeting.id)
-            // With the live pass off, no Whisper model is loaded during capture
-            // at all: the Neural Engine is left alone and the final pass
-            // produces the only transcript. Nothing is announced here -- the
-            // transcript pane's own empty state says it, which is where a
-            // person is already looking. `recordingNotice` stays for the case
-            // it is actually about: a live pass that was asked for and failed.
-            if state.liveTranscriptionEnabled {
-                startLiveTranscription(meetingID: meeting.id, generation: generation)
-            }
+            // The first audio callback promotes Preparing to Recording and only
+            // then begins optional live ASR. The file writer is upstream of
+            // both, so no opening audio waits for a model.
         } catch {
             if let audioPipeline {
                 _ = try? await audioPipeline.stop()
@@ -184,7 +235,11 @@ final class AppCoordinator {
                 let liveModel = self.speechModel(named: self.state.draft.liveModel)
                 let engine = self.speechEngine ?? WhisperKitTranscriptionEngine()
                 if self.loadedModel != liveModel {
-                    try await engine.load(model: liveModel)
+                    try await engine.load(
+                        model: liveModel,
+                        modelFolder: nil,
+                        downloadBase: self.modelStoragePaths.whisperDownloadBase
+                    )
                     guard self.liveSessionGeneration == generation,
                           self.state.activeMeetingID == meetingID,
                           self.state.recordingPhase.isCapturing else {
@@ -245,10 +300,18 @@ final class AppCoordinator {
 
     func stopMeeting() async {
         guard let meetingID = state.activeMeetingID, let audioPipeline else { return }
+        defer {
+            Task { @MainActor [weak self] in
+                await self?.applyQueuedModelStorageChangeIfPossible()
+            }
+        }
         // Invalidate setup before the first suspension. A Whisper model load can
         // outlive cancellation; its late result must never attach to a stopped
         // meeting or a subsequent recording.
         liveSessionGeneration = nil
+        // The final pass replaces this meeting's rows wholesale under new
+        // identifiers, so what the live loop wrote stops describing the database.
+        liveWrites.reset()
         state.markFinalizing(stage: .savingAudio, progress: 0.05)
 
         do {
@@ -288,10 +351,19 @@ final class AppCoordinator {
             transcriptTask?.cancel()
             transcriptTask = nil
             if let liveEngine = speechEngine {
-                // Best-effort cleanup occurs independently. Waiting can block
-                // behind an in-flight Core ML decode, while the final pass owns
-                // a separate engine and can begin safely.
-                Task { await liveEngine.cancel() }
+                // The live model (large-v3-turbo, 616 MB) and the final model
+                // (large-v3, 598 MB) are different artifacts, so an unfinished
+                // teardown leaves both resident exactly at the final pass's peak.
+                // `cancel()` releases the decoder, which makes this wait worth
+                // roughly 600 MB at the moment the machine has least to spare.
+                //
+                // It stays bounded because the risk is real: `cancel()` queues on
+                // the engine actor behind an in-flight Core ML decode. Five
+                // seconds comfortably exceeds one decode of Whisper's 30-second
+                // window on the slowest Mac this ships to, and a wedged decode
+                // then costs a pause in finalization rather than a hang — the
+                // teardown finishes on its own and its memory is merely late.
+                await BoundedWait.finish(within: .seconds(5)) { await liveEngine.cancel() }
             }
 
             let liveSegments = assembler?.snapshot.segments ?? []
@@ -301,7 +373,9 @@ final class AppCoordinator {
             let finalRevision = (assembler?.snapshot.revision ?? 0) + 1
             var finalSegments: [TranscriptSegment]
             do {
-                let finalizer = WhisperKitFinalTranscriber()
+                let finalizer = WhisperKitFinalTranscriber(
+                    downloadBase: modelStoragePaths.whisperDownloadBase
+                )
                 let snapshot = try await finalizer.transcribe(
                     meetingID: meetingID,
                     tracks: [systemTrack],
@@ -334,7 +408,9 @@ final class AppCoordinator {
                 if FileManager.default.fileExists(atPath: target.fileURL.path) {
                     state.updateFinalization(stage: .diarizing, progress: 0.72)
                     do {
-                        let diarizer = diarizationEngine ?? FluidAudioDiarizationEngine()
+                        let diarizer = diarizationEngine ?? FluidAudioDiarizationEngine(
+                            modelsDirectory: modelStoragePaths.diarizationModelsDirectory
+                        )
                         diarizationEngine = diarizer
                         let turns = try await diarizer.diarize(audioFileURL: target.fileURL)
                         finalSegments = SpeakerAttributor.assign(turns: turns, to: finalSegments)
@@ -364,16 +440,20 @@ final class AppCoordinator {
             try await store.saveMeeting(meeting)
             updateListItem(meeting, excerpt: finalSegments.first?.text ?? "Meeting captured locally")
 
-            state.updateFinalization(stage: .generatingInsights, progress: 0.9)
-            await generateAutomaticInsightsIfAvailable(meetingID: meetingID, segments: finalSegments)
-
-            if !state.retainAudio {
+            if MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(
+                meetingRetainsAudio: meeting.retainsAudio
+            ) {
                 try await store.deleteAudioFiles(meetingID: meetingID)
             }
 
             self.audioPipeline = nil
-            state.selectedWorkspaceTab = "Summary"
+            setWorkspaceTab(.summary, for: meetingID)
             state.markFinished()
+            // Insights are useful, but they must not hold the completed meeting
+            // hostage behind a multi-minute CLI or network round trip.
+            Task { [weak self] in
+                await self?.generateInsights(meetingID: meetingID)
+            }
         } catch {
             logger.error("Finalization failed: \(error.localizedDescription, privacy: .public)")
             try? await store.updateMeetingStatus(id: meetingID, status: .interrupted, errorMessage: error.localizedDescription)
@@ -402,29 +482,24 @@ final class AppCoordinator {
             let output = try await InsightPipeline(provider: provider).generateInsights(
                 transcript: segments.map(InsightTranscriptSegment.init(transcriptSegment:))
             )
-            try await store.saveInsightSnapshot(
+            let saved = try await store.saveGeneratedInsights(
                 meetingID: meetingID,
                 providerID: provider.descriptor.id,
                 output: output
             )
-            let insights = output.insights
-            state.insights.summary = insights.overview.text
-            state.insights.topics = insights.topics.map(\.text)
-            state.insights.decisions = insights.decisions.map(\.text)
-            state.insights.actions = insights.actionItems.map { action in
-                [action.text, action.owner.map { "Owner: \($0)" }, action.dueDate.map { "Due: \($0)" }]
-                    .compactMap { $0 }.joined(separator: " · ")
-            }
-            state.insights.openQuestions = insights.openQuestions.map(\.text)
+            applySavedGeneratedInsights(saved, output: output, meetingID: meetingID)
         } catch {
             logger.info("Automatic insights skipped: \(error.localizedDescription, privacy: .public)")
         }
     }
 
     func loadMeeting(_ id: UUID) async {
+        let generation = UUID()
+        meetingLoadGeneration = generation
         do {
             let segments = try await store.segments(meetingID: id)
-            let snapshots = try await store.insightSnapshots(meetingID: id)
+            let versions = try await store.summaryVersions(meetingID: id, limit: 50)
+            let activeVersion = try await store.activeSummaryVersion(meetingID: id)
             if let meeting = try await store.meeting(id: id),
                NoteReloadPolicy.shouldAdopt(
                    stored: meeting.notes,
@@ -433,10 +508,26 @@ final class AppCoordinator {
                ) {
                 state.meetingNotes[id] = meeting.notes
             }
-            if let latest = snapshots.first {
-                applyInsights(latest.output.insights)
-            } else if state.activeMeetingID != id {
-                state.insights = InsightWorkspaceState()
+            guard meetingLoadGeneration == generation,
+                  state.selection == .meeting(id) else {
+                cachedSegments[id] = segments
+                return
+            }
+            if let activeVersion {
+                if !state.insights(for: id).hasUnsavedSummaryChanges {
+                    await applySummaryVersion(activeVersion, meetingID: id)
+                }
+                state.updateInsights(for: id) {
+                    $0.summaryVersions = versions
+                    $0.hasMoreSummaryVersions = versions.count == 50
+                    $0.candidateSummaryVersionID = nil
+                }
+            } else if state.activeMeetingID != id,
+                      !state.insights(for: id).isGenerating {
+                // Navigating away and back starts another load. Do not erase an
+                // in-flight summary's meeting-scoped progress merely because it
+                // has not produced its first durable snapshot yet.
+                state.replaceInsights(InsightWorkspaceState(), for: id)
             }
             cachedSegments[id] = segments
             guard state.activeMeetingID != id else { return }
@@ -463,7 +554,343 @@ final class AppCoordinator {
         }
     }
 
+    // MARK: - Authored meeting content
+
+    func renameMeeting(meetingID: UUID, title: String) async -> Bool {
+        let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty, cleaned.count <= 200 else {
+            state.report(.meetingRename, "Use a meeting name between 1 and 200 characters.")
+            return false
+        }
+        do {
+            try await store.updateMeetingTitle(id: meetingID, title: cleaned)
+            if let index = state.meetings.firstIndex(where: { $0.id == meetingID }) {
+                state.meetings[index].title = cleaned
+            }
+            if let index = state.recentlyDeletedMeetings.firstIndex(where: { $0.id == meetingID }) {
+                state.recentlyDeletedMeetings[index].title = cleaned
+            }
+            return true
+        } catch {
+            state.report(.meetingRename, error.localizedDescription)
+            return false
+        }
+    }
+
+    func promptToRenameMeeting(meetingID: UUID) {
+        let current = state.meetings.first(where: { $0.id == meetingID })?.title
+            ?? state.recentlyDeletedMeetings.first(where: { $0.id == meetingID })?.title
+            ?? "Meeting"
+        let field = NSTextField(string: current)
+        field.placeholderString = "Meeting name"
+        field.frame = NSRect(x: 0, y: 0, width: 340, height: 24)
+        let alert = NSAlert()
+        alert.messageText = "Rename meeting"
+        alert.informativeText = "This name is used throughout Hushnote and for future exports."
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { await renameMeeting(meetingID: meetingID, title: field.stringValue) }
+    }
+
+    func renameSpeaker(segmentID: String, name: String) async -> Bool {
+        let cleaned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return false }
+        do {
+            let cached = cachedSegments.values.lazy.compactMap { segments in
+                segments.first(where: { $0.id == segmentID })
+            }.first
+            let segment: TranscriptSegment?
+            if let cached {
+                segment = cached
+            } else {
+                segment = try await store.segment(id: segmentID)
+            }
+            guard let segment, let speakerID = segment.speakerID else {
+                throw CoordinatorError.providerUnavailable("This transcript line has no speaker identity to rename.")
+            }
+            _ = try await store.renameSpeaker(
+                meetingID: segment.meetingID,
+                speakerID: speakerID,
+                to: cleaned
+            )
+            if var segments = cachedSegments[segment.meetingID] {
+                for index in segments.indices where segments[index].speakerID == speakerID {
+                    segments[index].speakerName = cleaned
+                }
+                cachedSegments[segment.meetingID] = segments
+            }
+            if selectedMeetingID == segment.meetingID {
+                for index in state.transcript.indices
+                where cachedSegments[segment.meetingID]?.contains(where: {
+                    $0.id == state.transcript[index].segmentID && $0.speakerID == speakerID
+                }) == true {
+                    state.transcript[index].speaker = cleaned
+                }
+            }
+            return true
+        } catch {
+            state.report(.speakerRename, error.localizedDescription)
+            return false
+        }
+    }
+
+    func beginSummaryEditing(meetingID: UUID) {
+        state.updateInsights(for: meetingID) {
+            $0.summaryDraft = $0.summary
+            $0.isEditingSummary = true
+            $0.error = nil
+        }
+    }
+
+    func cancelSummaryEditing(meetingID: UUID) {
+        let workspace = state.insights(for: meetingID)
+        if workspace.hasUnsavedSummaryChanges {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Discard summary changes?"
+            alert.informativeText = "Your unsaved summary edits will be lost."
+            alert.addButton(withTitle: "Discard Changes")
+            alert.addButton(withTitle: "Keep Editing")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        discardSummaryChanges(meetingID: meetingID)
+    }
+
+    private func discardSummaryChanges(meetingID: UUID) {
+        state.updateInsights(for: meetingID) {
+            $0.summaryDraft = $0.summary
+            $0.isEditingSummary = false
+            $0.isSavingSummary = false
+        }
+    }
+
+    func saveSummary(meetingID: UUID) async -> Bool {
+        let workspace = state.insights(for: meetingID)
+        let text = workspace.summaryDraft
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard text != workspace.summary else {
+            discardSummaryChanges(meetingID: meetingID)
+            return true
+        }
+        state.updateInsights(for: meetingID) { $0.isSavingSummary = true; $0.error = nil }
+        do {
+            let cachedActive = workspace.summaryVersions.first {
+                $0.id == workspace.activeSummaryVersionID
+            }
+            let active: SummaryVersion?
+            if let cachedActive {
+                active = cachedActive
+            } else {
+                active = try await store.activeSummaryVersion(meetingID: meetingID)
+            }
+            let version = try await store.createSummaryVersion(
+                meetingID: meetingID,
+                kind: .manual,
+                text: text,
+                sourceInsightSnapshotID: active?.sourceInsightSnapshotID,
+                activate: true
+            )
+            state.updateInsights(for: meetingID) {
+                $0.summary = version.text
+                $0.summaryDraft = version.text
+                $0.activeSummaryVersionID = version.id
+                $0.summaryVersions.removeAll { $0.id == version.id }
+                $0.summaryVersions.insert(version, at: 0)
+                $0.isEditingSummary = false
+                $0.isSavingSummary = false
+                $0.summarySaveConfirmation = Date()
+            }
+            return true
+        } catch {
+            state.updateInsights(for: meetingID) {
+                $0.isSavingSummary = false
+            }
+            state.report(.summarySave, error.localizedDescription)
+            return false
+        }
+    }
+
+    func activateSummaryVersion(_ version: SummaryVersion, meetingID: UUID) async {
+        guard await resolveUnsavedSummaryChanges(meetingID: meetingID) else { return }
+        do {
+            try await store.activateSummaryVersion(id: version.id, meetingID: meetingID)
+            await applySummaryVersion(version, meetingID: meetingID)
+            state.updateInsights(for: meetingID) { $0.candidateSummaryVersionID = nil }
+        } catch {
+            state.updateInsights(for: meetingID) { $0.error = error.localizedDescription }
+        }
+    }
+
+    func keepCurrentSummary(meetingID: UUID) {
+        state.updateInsights(for: meetingID) { $0.candidateSummaryVersionID = nil }
+    }
+
+    func loadMoreSummaryVersions(meetingID: UUID) async {
+        let workspace = state.insights(for: meetingID)
+        guard workspace.hasMoreSummaryVersions,
+              !workspace.isLoadingSummaryVersions,
+              let oldest = workspace.summaryVersions.last else { return }
+        state.updateInsights(for: meetingID) { $0.isLoadingSummaryVersions = true }
+        do {
+            let page = try await store.summaryVersions(
+                meetingID: meetingID,
+                limit: 50,
+                before: oldest.createdAt
+            )
+            state.updateInsights(for: meetingID) {
+                let known = Set($0.summaryVersions.map(\.id))
+                $0.summaryVersions.append(contentsOf: page.filter { !known.contains($0.id) })
+                $0.hasMoreSummaryVersions = page.count == 50
+                $0.isLoadingSummaryVersions = false
+            }
+        } catch {
+            state.updateInsights(for: meetingID) { $0.isLoadingSummaryVersions = false }
+            state.report(.meetingLoad, error.localizedDescription)
+        }
+    }
+
+    func copySummary(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private enum UnsavedSummaryDecision {
+        case save
+        case discard
+        case cancel
+    }
+
+    private func unsavedSummaryDecision() -> UnsavedSummaryDecision {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Save summary changes?"
+        alert.informativeText = "You have unsaved edits in the meeting summary."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Discard Changes")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: return .save
+        case .alertSecondButtonReturn: return .discard
+        default: return .cancel
+        }
+    }
+
+    private func resolveUnsavedSummaryChanges(meetingID: UUID) async -> Bool {
+        guard state.insights(for: meetingID).hasUnsavedSummaryChanges else { return true }
+        switch unsavedSummaryDecision() {
+        case .save:
+            return await saveSummary(meetingID: meetingID)
+        case .discard:
+            discardSummaryChanges(meetingID: meetingID)
+            return true
+        case .cancel:
+            return false
+        }
+    }
+
+    private func resolveUnsavedSummaryChangesForNavigation(
+        meetingID: UUID,
+        proceed: @escaping @MainActor () -> Void
+    ) {
+        switch unsavedSummaryDecision() {
+        case .save:
+            Task { [weak self] in
+                guard let self, await self.saveSummary(meetingID: meetingID) else { return }
+                proceed()
+            }
+        case .discard:
+            discardSummaryChanges(meetingID: meetingID)
+            proceed()
+        case .cancel:
+            break
+        }
+    }
+
+    private func applySummaryVersion(_ version: SummaryVersion, meetingID: UUID) async {
+        if let snapshotID = version.sourceInsightSnapshotID,
+           let snapshot = try? await store.insightSnapshot(id: snapshotID) {
+            applyInsights(snapshot.output.insights, meetingID: meetingID)
+        } else {
+            state.updateInsights(for: meetingID) {
+                $0.topics = []
+                $0.decisions = []
+                $0.actions = []
+                $0.openQuestions = []
+            }
+        }
+        state.updateInsights(for: meetingID) {
+            $0.summary = version.text
+            $0.summaryDraft = version.text
+            $0.activeSummaryVersionID = version.id
+            $0.isEditingSummary = false
+            $0.error = nil
+        }
+    }
+
+    // MARK: - Meeting lifecycle
+
+    func softDeleteMeeting(_ id: UUID) async {
+        guard state.activeMeetingID != id else { return }
+        guard await resolveUnsavedSummaryChanges(meetingID: id) else { return }
+        insightTasks[id]?.cancel()
+        audioExportTasks[id]?.cancel()
+        do {
+            try await store.softDeleteMeeting(id: id)
+            guard let index = state.meetings.firstIndex(where: { $0.id == id }) else { return }
+            let item = state.meetings.remove(at: index)
+            state.recentlyDeletedMeetings.insert(item, at: 0)
+            if state.selection == .meeting(id) { setSelection(.meetings) }
+        } catch {
+            state.report(.meetingDelete, error.localizedDescription)
+        }
+    }
+
+    func restoreMeeting(_ id: UUID) async {
+        do {
+            try await store.restoreMeeting(id: id)
+            guard let meeting = try await store.meeting(id: id) else { return }
+            state.recentlyDeletedMeetings.removeAll { $0.id == id }
+            state.meetings.insert(Self.listItem(meeting), at: 0)
+        } catch {
+            state.report(.meetingDelete, error.localizedDescription)
+        }
+    }
+
+    func confirmPermanentDelete(meetingID: UUID) {
+        guard state.activeMeetingID != meetingID else { return }
+        let title = state.recentlyDeletedMeetings.first(where: { $0.id == meetingID })?.title ?? "this meeting"
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete “\(title)” permanently?"
+        alert.informativeText = "Its transcript, summaries, notes, and retained recording will be removed. This cannot be undone."
+        alert.addButton(withTitle: "Delete Permanently")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { await permanentlyDeleteMeeting(meetingID) }
+    }
+
+    private func permanentlyDeleteMeeting(_ id: UUID) async {
+        insightTasks[id]?.cancel()
+        audioExportTasks[id]?.cancel()
+        do {
+            try await store.deleteMeeting(id: id, deleteAudioFiles: true)
+            state.recentlyDeletedMeetings.removeAll { $0.id == id }
+            cachedSegments[id] = nil
+            state.meetingNotes[id] = nil
+            state.meetingWorkspaceTabs[id] = nil
+        } catch {
+            state.report(.meetingDelete, error.localizedDescription)
+        }
+    }
+
     func recoverMeeting(_ id: UUID) async {
+        defer {
+            Task { @MainActor [weak self] in
+                await self?.applyQueuedModelStorageChangeIfPossible()
+            }
+        }
         state.activeMeetingID = id
         state.markFinalizing(stage: .savingAudio, progress: 0.05, detail: "Checking saved audio…")
         do {
@@ -474,7 +901,9 @@ final class AppCoordinator {
             }
             try await store.updateMeetingStatus(id: id, status: .finalizing)
 
-            let finalizer = WhisperKitFinalTranscriber()
+            let finalizer = WhisperKitFinalTranscriber(
+                downloadBase: modelStoragePaths.whisperDownloadBase
+            )
             var final = try await finalizer.transcribe(
                 meetingID: id,
                 tracks: tracks,
@@ -499,7 +928,13 @@ final class AppCoordinator {
             if let systemTrack = tracks.first(where: { $0.source == .system }) {
                 state.updateFinalization(stage: .diarizing, progress: 0.72)
                 do {
-                    let diarizer = FluidAudioDiarizationEngine()
+                    // The same engine as finalization, and for the same reason:
+                    // both ask for the default configuration, which is the one
+                    // whose 21 MB of Core ML models the engine memoizes.
+                    let diarizer = diarizationEngine ?? FluidAudioDiarizationEngine(
+                        modelsDirectory: modelStoragePaths.diarizationModelsDirectory
+                    )
+                    diarizationEngine = diarizer
                     let turns = try await diarizer.diarize(audioFileURL: systemTrack.fileURL)
                     final = SpeakerAttributor.assign(turns: turns, to: final)
                 } catch {
@@ -524,7 +959,11 @@ final class AppCoordinator {
             meeting.errorMessage = nil
             try await store.saveMeeting(meeting)
             updateListItem(meeting, excerpt: final.first?.text ?? "Recovered local transcript")
-            if !meeting.retainsAudio { try await store.deleteAudioFiles(meetingID: id) }
+            if MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(
+                meetingRetainsAudio: meeting.retainsAudio
+            ) {
+                try await store.deleteAudioFiles(meetingID: id)
+            }
             state.markFinished()
         } catch {
             try? await store.updateMeetingStatus(id: id, status: .interrupted, errorMessage: error.localizedDescription)
@@ -579,73 +1018,348 @@ final class AppCoordinator {
     }
 
     func generateInsights(meetingID: UUID) async {
-        state.insights.isGenerating = true
-        state.insights.error = nil
-        defer { state.insights.isGenerating = false }
+        let generation = UUID()
+        insightTasks[meetingID]?.cancel()
+        insightGenerations[meetingID] = generation
+        state.updateInsights(for: meetingID) {
+            $0.isGenerating = true
+            $0.generationStage = .checkingProvider
+            $0.generationProgress = InsightGenerationStage.checkingProvider.progress
+            $0.generationStartedAt = Date()
+            $0.error = nil
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performInsightGeneration(meetingID: meetingID, generation: generation)
+        }
+        insightTasks[meetingID] = task
+        await task.value
+    }
+
+    func cancelInsightGeneration(meetingID: UUID) {
+        insightTasks[meetingID]?.cancel()
+    }
+
+    private func performInsightGeneration(meetingID: UUID, generation: UUID) async {
+        defer {
+            if insightGenerations[meetingID] == generation {
+                insightTasks[meetingID] = nil
+                insightGenerations[meetingID] = nil
+                state.updateInsights(for: meetingID) {
+                    $0.isGenerating = false
+                    $0.generationStage = nil
+                    $0.generationProgress = 0
+                    $0.generationStartedAt = nil
+                }
+            }
+        }
         do {
             let segments = try await transcriptSegments(for: meetingID)
             guard !segments.isEmpty else { throw CoordinatorError.noTranscript }
             let provider = try await selectedInsightProvider()
-            guard case .available = await provider.healthCheck() else {
-                throw CoordinatorError.providerUnavailable("The selected provider is not ready. Check Settings and try again.")
+            let health = await provider.healthCheck()
+            // CLI health checks are non-throwing by protocol and translate a
+            // cancelled probe into "unavailable". Reassert task cancellation
+            // before interpreting that result so Cancel stays a cancellation,
+            // not a misleading provider error.
+            try Task.checkCancellation()
+            switch health {
+            case .available: break
+            case .unavailable(let reason):
+                throw CoordinatorError.providerUnavailable(reason)
             }
+            try Task.checkCancellation()
             let runID = try await store.beginProviderRun(
                 meetingID: meetingID,
                 providerID: provider.descriptor.id,
                 purpose: "meeting-insights"
             )
-            let output: ValidatedMeetingInsights
             do {
-                output = try await InsightPipeline(provider: provider).generateInsights(
-                    transcript: segments.map(InsightTranscriptSegment.init(transcriptSegment:))
+                let output = try await InsightPipeline(provider: provider).generateInsights(
+                    transcript: segments.map(InsightTranscriptSegment.init(transcriptSegment:)),
+                    progress: { [weak self] progress in
+                        await self?.applyInsightProgress(
+                            progress,
+                            meetingID: meetingID,
+                            generation: generation
+                        )
+                    }
                 )
-                try await store.saveInsightSnapshot(
+                try Task.checkCancellation()
+                updateInsightStage(.saving, meetingID: meetingID, generation: generation)
+                let saved = try await store.saveGeneratedInsights(
                     meetingID: meetingID,
                     providerID: provider.descriptor.id,
                     output: output
                 )
                 try await store.finishProviderRun(id: runID, status: .succeeded)
+                guard insightGenerations[meetingID] == generation else { return }
+                applySavedGeneratedInsights(saved, output: output, meetingID: meetingID)
             } catch {
-                try? await store.finishProviderRun(id: runID, status: .failed, errorMessage: error.localizedDescription)
+                try? await store.finishProviderRun(
+                    id: runID,
+                    status: .failed,
+                    errorMessage: error is CancellationError ? "Cancelled by the user." : error.localizedDescription
+                )
                 throw error
             }
-            let insights = output.insights
-            state.insights.summary = insights.overview.text
-            state.insights.topics = insights.topics.map(\.text)
-            state.insights.decisions = insights.decisions.map(\.text)
-            state.insights.actions = insights.actionItems.map { action in
-                [action.text, action.owner.map { "Owner: \($0)" }, action.dueDate.map { "Due: \($0)" }]
-                    .compactMap { $0 }.joined(separator: " · ")
-            }
-            state.insights.openQuestions = insights.openQuestions.map(\.text)
+        } catch is CancellationError {
+            guard insightGenerations[meetingID] == generation else { return }
+            state.updateInsights(for: meetingID) { $0.error = nil }
         } catch {
-            state.insights.error = error.localizedDescription
+            guard insightGenerations[meetingID] == generation else { return }
+            state.updateInsights(for: meetingID) { $0.error = error.localizedDescription }
+        }
+    }
+
+    private func applyInsightProgress(
+        _ progress: InsightPipelineProgress,
+        meetingID: UUID,
+        generation: UUID
+    ) {
+        let stage: InsightGenerationStage? = switch progress {
+        case .preparing: .checkingProvider
+        case .extracting(let current, let total): .extracting(current: current, total: total)
+        case .synthesizing: .synthesizing
+        case .validating: .validating
+        case .completed: nil
+        }
+        if let stage { updateInsightStage(stage, meetingID: meetingID, generation: generation) }
+    }
+
+    private func updateInsightStage(
+        _ stage: InsightGenerationStage,
+        meetingID: UUID,
+        generation: UUID
+    ) {
+        guard insightGenerations[meetingID] == generation else { return }
+        state.updateInsights(for: meetingID) {
+            $0.generationStage = stage
+            $0.generationProgress = stage.progress
         }
     }
 
     func answerQuestion() async {
         guard let meetingID = selectedMeetingID else { return }
-        state.insights.error = nil
+        let question = state.question
+        state.updateInsights(for: meetingID) { $0.error = nil }
         // Without this the Ask button produced no visual change at all for the
         // length of an LLM round trip.
-        state.insights.isGenerating = true
-        defer { state.insights.isGenerating = false }
+        state.updateInsights(for: meetingID) { $0.isGenerating = true }
+        defer { state.updateInsights(for: meetingID) { $0.isGenerating = false } }
         do {
             let segments = try await transcriptSegments(for: meetingID)
             let provider = try await selectedInsightProvider()
             let output = try await InsightPipeline(provider: provider).answer(
-                question: state.question,
+                question: question,
                 transcript: segments.map(InsightTranscriptSegment.init(transcriptSegment:))
             )
-            state.insights.answer = output.answer.answer
-            state.insights.answerTimestamps = output.answer.citations.map { Double($0.startMilliseconds) / 1_000 }
+            state.updateInsights(for: meetingID) {
+                $0.answer = output.answer.answer
+                $0.answerTimestamps = output.answer.citations.map { Double($0.startMilliseconds) / 1_000 }
+            }
         } catch {
-            state.insights.error = error.localizedDescription
+            state.updateInsights(for: meetingID) { $0.error = error.localizedDescription }
         }
     }
 
     /// What the models screen knows about each model, keyed by model id.
     private(set) var modelAvailability: [String: ModelAvailability] = [:]
+
+    var modelStorageDisplayPath: String {
+        modelStoragePaths.managedDirectory?.path ?? "Default system locations"
+    }
+
+    var canChangeModelStorage: Bool {
+        ModelStorageChangePolicy.canApply(
+            recordingIsBusy: state.recordingPhase.isBusy,
+            activeDownloadCount: downloadTasks.count,
+            isMigrating: isChangingModelStorage
+        )
+    }
+
+    func refreshInstalledModels() {
+        let installed = InstalledSpeechModelDiscovery.installedModels(at: modelStoragePaths)
+        installedModelFolders = installed
+        for model in SpeechModelCatalog.all {
+            if modelAvailability[model.id]?.isDownloading == true { continue }
+            modelAvailability[model.id] = installed[model.id] == nil ? .notInstalled : .ready
+        }
+    }
+
+    func refreshInstalledModelSizes() async {
+        let request = StorageScanRequest(models: SpeechModelCatalog.all.compactMap { model in
+            installedModelFolders[model.id].map {
+                ModelStorageScanLocation(modelID: model.id, displayName: model.displayName, url: $0)
+            }
+        })
+        do {
+            let report = try await StorageAccountingService().report(for: request)
+            installedModelAllocatedBytes = Dictionary(
+                uniqueKeysWithValues: report.modelDetails.map { ($0.modelID, $0.allocatedBytes) }
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            logger.info("Model storage size scan skipped: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func installedModelSizeText(_ model: SpeechModel) -> String? {
+        installedModelAllocatedBytes[model.id].map {
+            ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+        }
+    }
+
+    func chooseModelStorageDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a folder for Hushnote models"
+        panel.prompt = "Choose"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = modelStoragePaths.parentDirectory
+        guard panel.runModal() == .OK, let parent = panel.url else { return }
+        promptForModelStorageChange(to: ModelStoragePaths(parentDirectory: parent))
+    }
+
+    func resetModelStorageDirectory() {
+        promptForModelStorageChange(to: ModelStoragePaths())
+    }
+
+    private func promptForModelStorageChange(to destination: ModelStoragePaths) {
+        guard destination != modelStoragePaths else { return }
+        let alert = NSAlert()
+        alert.messageText = "Change model storage location?"
+        alert.informativeText = "Hushnote can copy complete speech and speaker models to the new location, or start using it without copying. Existing files are never deleted automatically."
+        alert.addButton(withTitle: "Copy Models")
+        alert.addButton(withTitle: "Use Without Copying")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        guard response != .alertThirdButtonReturn else { return }
+        let migrate = response == .alertFirstButtonReturn
+        requestModelStorageChange(destination, migrate: migrate)
+    }
+
+    private func requestModelStorageChange(_ destination: ModelStoragePaths, migrate: Bool) {
+        guard canChangeModelStorage else {
+            queuedModelStorageChange = (destination, migrate)
+            queuedModelStoragePath = destination.parentDirectory?.path ?? "Default system locations"
+            modelStorageStatus = "The storage change is queued until recording and downloads finish."
+            return
+        }
+        Task { await applyModelStorageChange(destination, migrate: migrate) }
+    }
+
+    private func applyQueuedModelStorageChangeIfPossible() async {
+        guard canChangeModelStorage, let queued = queuedModelStorageChange else { return }
+        queuedModelStorageChange = nil
+        queuedModelStoragePath = nil
+        await applyModelStorageChange(queued.destination, migrate: queued.migrate)
+    }
+
+    private func applyModelStorageChange(_ destination: ModelStoragePaths, migrate: Bool) async {
+        guard destination != modelStoragePaths, !isChangingModelStorage else { return }
+        isChangingModelStorage = true
+        defer {
+            isChangingModelStorage = false
+            Task { @MainActor [weak self] in
+                await self?.applyQueuedModelStorageChangeIfPossible()
+            }
+        }
+        do {
+            try await ModelStorageOperations().prepare(destination)
+            if migrate {
+                modelStorageStatus = "Copying models…"
+                _ = try await ModelStorageOperations().migrate(
+                    from: modelStoragePaths,
+                    to: destination,
+                    progress: { [weak self] progress in
+                        Task { @MainActor [weak self] in self?.modelStorageMigrationProgress = progress }
+                    }
+                )
+            }
+            modelStorageMigrationProgress = nil
+            modelStoragePaths = destination
+            preferences.modelStorageParentPath = destination.parentDirectory?.path
+            speechEngine = nil
+            loadedModel = nil
+            diarizationEngine = nil
+            refreshInstalledModels()
+            await refreshInstalledModelSizes()
+            modelStorageStatus = migrate
+                ? "Models were copied and the new location is active."
+                : "The new model location is active."
+            if state.selection == .storage { await refreshStorageReport() }
+        } catch {
+            modelStorageMigrationProgress = nil
+            modelStorageStatus = nil
+            state.report(.storage, error.localizedDescription)
+        }
+    }
+
+    func revealModelStorage() {
+        let target = modelStoragePaths.managedDirectory
+            ?? modelStoragePaths.effectiveWhisperDownloadBase
+        if modelStoragePaths.managedDirectory != nil {
+            try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([target])
+    }
+
+    func promptToRemoveModel(_ model: SpeechModel) {
+        guard model.id != SpeechModelResolver.model(named: state.draft.liveModel).id,
+              model.id != SpeechModelResolver.model(named: state.draft.finalModel).id else {
+            state.report(.storage, "Choose a different default model before removing this one.")
+            return
+        }
+        guard canChangeModelStorage else {
+            state.report(.storage, "Wait for recording, downloads, or model copying to finish.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Remove \(model.displayName)?"
+        alert.informativeText = "This removes only this model from the active location. You can download it again later."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            do {
+                try await ModelStorageOperations().removeSpeechModel(model, from: modelStoragePaths)
+                refreshInstalledModels()
+                await refreshInstalledModelSizes()
+                if state.selection == .storage { await refreshStorageReport() }
+            } catch {
+                state.report(.storage, error.localizedDescription)
+            }
+        }
+    }
+
+    func promptToRemoveDiarizationModels() {
+        guard canChangeModelStorage else {
+            state.report(.storage, "Wait for recording, downloads, or model copying to finish.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Remove speaker model?"
+        alert.informativeText = "Speaker labels will be unavailable until Hushnote downloads the diarization model again. Other FluidAudio caches are not touched."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            do {
+                try await ModelStorageOperations().removeDiarizationModels(from: modelStoragePaths)
+                diarizationEngine = nil
+                modelStorageStatus = "The speaker model was removed."
+                if state.selection == .storage { await refreshStorageReport() }
+            } catch {
+                state.report(.storage, error.localizedDescription)
+            }
+        }
+    }
 
     func downloadModel(_ model: SpeechModel) async {
         guard ModelListPolicy.canDownload(
@@ -665,6 +1379,10 @@ final class AppCoordinator {
         downloadTasks[model.id] = task
         await task.value
         downloadTasks[model.id] = nil
+        refreshInstalledModels()
+        await refreshInstalledModelSizes()
+        if state.selection == .storage { await refreshStorageReport() }
+        await applyQueuedModelStorageChangeIfPossible()
     }
 
     /// Stops a download in flight. Not gated on the recording phase: a transfer
@@ -685,6 +1403,186 @@ final class AppCoordinator {
     func setLiveTranscriptionEnabled(_ isEnabled: Bool) {
         state.liveTranscriptionEnabled = isEnabled
         SpeechModelDefaults.store(liveTranscriptionEnabled: isEnabled, in: defaults)
+    }
+
+    func setRetainAudio(_ retainsAudio: Bool) {
+        state.retainAudio = retainsAudio
+        preferences.retainAudio = retainsAudio
+    }
+
+    func setSelectedProvider(_ provider: InsightProviderChoice) {
+        state.selectedProvider = provider
+        preferences.selectedProvider = provider
+    }
+
+    func setLocalLlamaExecutablePath(_ path: String) {
+        localLlamaExecutablePath = path
+        preferences.llamaExecutablePath = path
+    }
+
+    func setLocalModelPath(_ path: String) {
+        localModelPath = path
+        preferences.localModelPath = path
+    }
+
+    func setSelection(_ destination: SidebarDestination?) {
+        if case .meeting(let currentID) = state.selection,
+           state.selection != destination,
+           state.insights(for: currentID).hasUnsavedSummaryChanges {
+            resolveUnsavedSummaryChangesForNavigation(meetingID: currentID) { [weak self] in
+                self?.applySelection(destination)
+            }
+            return
+        }
+        applySelection(destination)
+    }
+
+    private func applySelection(_ destination: SidebarDestination?) {
+        state.selection = destination
+        preferences.sidebarDestination = destination
+    }
+
+    func setWorkspaceTab(_ tab: WorkspaceTab, for meetingID: UUID) {
+        if state.workspaceTab(for: meetingID) == .summary,
+           tab != .summary,
+           state.insights(for: meetingID).hasUnsavedSummaryChanges {
+            resolveUnsavedSummaryChangesForNavigation(meetingID: meetingID) { [weak self] in
+                self?.applyWorkspaceTab(tab, for: meetingID)
+            }
+            return
+        }
+        applyWorkspaceTab(tab, for: meetingID)
+    }
+
+    private func applyWorkspaceTab(_ tab: WorkspaceTab, for meetingID: UUID) {
+        state.setWorkspaceTab(tab, for: meetingID)
+        preferences.meetingTabs = state.meetingWorkspaceTabs
+    }
+
+    func refreshStorageReport() async {
+        let generation = UUID()
+        storageScanGeneration = generation
+        state.isScanningStorage = true
+        defer {
+            if storageScanGeneration == generation { state.isScanningStorage = false }
+        }
+        do {
+            let request = try await storageScanRequest()
+            let report = try await storageAccounting.report(for: request)
+            guard storageScanGeneration == generation else { return }
+            state.storageReport = report
+        } catch is CancellationError {
+            return
+        } catch {
+            guard storageScanGeneration == generation else { return }
+            state.report(.storage, error.localizedDescription)
+        }
+    }
+
+    func canRemoveRecordingAudio(meetingID: UUID) -> Bool {
+        guard let meeting = (state.meetings + state.recentlyDeletedMeetings)
+            .first(where: { $0.id == meetingID }) else { return false }
+        return RecordingStorageCleanupPolicy.canRemove(
+            meetingID: meetingID,
+            status: meeting.status,
+            activeMeetingID: state.activeMeetingID,
+            recordingPhase: state.recordingPhase
+        )
+    }
+
+    /// Removes only retained audio. Notes, transcript, summaries and the
+    /// meeting row remain available; interrupted recordings are refused above.
+    func removeRecordingAudio(meetingID: UUID) async {
+        guard canRemoveRecordingAudio(meetingID: meetingID) else { return }
+        state.storageDeletingRecordingIDs.insert(meetingID)
+        defer { state.storageDeletingRecordingIDs.remove(meetingID) }
+        do {
+            try await store.deleteAudioFiles(meetingID: meetingID)
+            if var meeting = try await store.meeting(id: meetingID) {
+                meeting.retainsAudio = false
+                meeting.updatedAt = Date()
+                try await store.saveMeeting(meeting)
+            }
+            if let index = state.meetings.firstIndex(where: { $0.id == meetingID }) {
+                state.meetings[index].retainsAudio = false
+            }
+            if let index = state.recentlyDeletedMeetings.firstIndex(where: { $0.id == meetingID }) {
+                state.recentlyDeletedMeetings[index].retainsAudio = false
+            }
+            await refreshStorageReport()
+        } catch {
+            state.report(.storage, error.localizedDescription)
+        }
+    }
+
+    private func storageScanRequest() async throws -> StorageScanRequest {
+        let paths = modelStoragePaths
+        let installed = await Task.detached(priority: .utility) {
+            InstalledSpeechModelDiscovery.installedModels(at: paths)
+        }.value
+        var modelLocations = installed.compactMap { modelID, url -> ModelStorageScanLocation? in
+            guard let model = SpeechModelCatalog.model(id: modelID) else { return nil }
+            return .init(modelID: modelID, displayName: model.displayName, url: url)
+        }
+
+        // Keep a cache remainder row after known model folders claim their own
+        // files. It accounts for partial or obsolete downloads without counting
+        // them twice.
+        let whisperRepository = paths.effectiveWhisperDownloadBase
+            .appending(path: "models", directoryHint: .isDirectory)
+            .appending(path: "argmaxinc", directoryHint: .isDirectory)
+            .appending(path: "whisperkit-coreml", directoryHint: .isDirectory)
+        if FileManager.default.fileExists(atPath: whisperRepository.path) {
+            modelLocations.append(.init(
+                modelID: "whisperkit-cache",
+                displayName: "WhisperKit cache remainder",
+                url: whisperRepository
+            ))
+        }
+        if let diarization = ModelStorageOperations.installedDiarizationFolder(
+            at: paths,
+            fileManager: .default
+        ) {
+            modelLocations.append(.init(
+                modelID: "speaker-diarization",
+                displayName: "Speaker identification",
+                url: diarization
+            ))
+        }
+        if !localModelPath.isEmpty {
+            let localGGUF = URL(fileURLWithPath: localModelPath)
+            if FileManager.default.fileExists(atPath: localGGUF.path) {
+                modelLocations.append(.init(
+                    modelID: "local-gguf",
+                    displayName: "Local insights model",
+                    url: localGGUF
+                ))
+            }
+        }
+
+        let currentMeetings = try await store.meetings()
+        let deletedMeetings = try await store.recentlyDeleted()
+        var recordings: [RecordingStorageLocation] = []
+        for meeting in currentMeetings + deletedMeetings {
+            let tracks = try await store.audioTracks(meetingID: meeting.id)
+            guard let track = tracks.first else { continue }
+            let expected = recoveryAudioDirectory(for: meeting.id)
+            let directory = track.fileURL.path.hasPrefix(expected.path + "/")
+                ? expected
+                : track.fileURL.deletingLastPathComponent()
+            recordings.append(.init(meetingID: meeting.id, title: meeting.title, url: directory))
+        }
+
+        return StorageScanRequest(
+            models: modelLocations,
+            recordings: recordings,
+            databaseURLs: [applicationDataURL.appending(path: "hushnote.sqlite")],
+            applicationDataURL: applicationDataURL
+        )
+    }
+
+    func audioAvailable(meetingID: UUID) -> Bool {
+        MeetingAudioExport.source(in: recoveryAudioDirectory(for: meetingID)) != nil
     }
 
     /// Makes a model the one meetings use, and gets it here if it is not.
@@ -709,6 +1607,7 @@ final class AppCoordinator {
         let generation = downloadGeneration
         await ModelDownloadRunner(downloader: downloader).run(
             model: model,
+            downloadBase: modelStoragePaths.whisperDownloadBase,
             install: { [weak self] folder in
                 guard let self else { throw CancellationError() }
                 try await self.installDownloadedModel(model, from: folder)
@@ -748,7 +1647,12 @@ final class AppCoordinator {
         guard let meeting = state.meetings.first(where: { $0.id == meetingID }) else { return }
         let transcript = cachedSegments[meetingID] ?? []
         do {
-            try MeetingExporter.export(meeting: meeting, transcript: transcript, insights: state.insights, format: format)
+            try MeetingExporter.export(
+                meeting: meeting,
+                transcript: transcript,
+                insights: state.insights(for: meetingID),
+                format: format
+            )
         } catch {
             state.report(.export, error.localizedDescription)
         }
@@ -759,17 +1663,58 @@ final class AppCoordinator {
     /// model and the file can be gone anyway -- deleted by a finalization that
     /// finished while this meeting sat on screen. Say so rather than opening a
     /// save panel that would produce nothing.
-    func exportAudio(meetingID: UUID) {
+    func exportAudio(
+        meetingID: UUID,
+        format: MeetingAudioFileFormat = .m4a
+    ) {
         guard let meeting = state.meetings.first(where: { $0.id == meetingID }) else { return }
         guard let source = MeetingAudioExport.source(in: recoveryAudioDirectory(for: meetingID)) else {
             state.report(.export, MeetingAudioExport.missingAudioMessage)
             return
         }
-        do {
-            try MeetingExporter.exportAudio(meeting: meeting, source: source)
-        } catch {
-            state.report(.export, error.localizedDescription)
+        guard let destination = MeetingExporter.audioDestination(meeting: meeting, format: format) else { return }
+        audioExportTasks[meetingID]?.cancel()
+        let generation = UUID()
+        audioExportGenerations[meetingID] = generation
+        let task = Task { [weak self] in
+            guard let self else { return }
+            guard self.audioExportGenerations[meetingID] == generation else { return }
+            self.state.audioExports[meetingID] = .exporting(format: format, progress: 0)
+            do {
+                try await self.meetingAudioExporter.export(
+                    source: source,
+                    destination: destination,
+                    format: format,
+                    progress: { [weak self] progress in
+                        Task { @MainActor in
+                            guard let self,
+                                  self.audioExportGenerations[meetingID] == generation else { return }
+                            self.state.audioExports[meetingID] = .exporting(
+                                format: format,
+                                progress: progress
+                            )
+                        }
+                    }
+                )
+                guard self.audioExportGenerations[meetingID] == generation else { return }
+                self.state.audioExports[meetingID] = .succeeded(destination)
+            } catch is CancellationError {
+                guard self.audioExportGenerations[meetingID] == generation else { return }
+                self.state.audioExports[meetingID] = .idle
+            } catch {
+                guard self.audioExportGenerations[meetingID] == generation else { return }
+                self.state.audioExports[meetingID] = .failed(error.localizedDescription)
+                self.state.report(.export, error.localizedDescription)
+            }
+            guard self.audioExportGenerations[meetingID] == generation else { return }
+            self.audioExportTasks[meetingID] = nil
+            self.audioExportGenerations[meetingID] = nil
         }
+        audioExportTasks[meetingID] = task
+    }
+
+    func cancelAudioExport(meetingID: UUID) {
+        audioExportTasks[meetingID]?.cancel()
     }
 
     /// Whether a key is already in the Keychain, so the field can say so.
@@ -834,7 +1779,11 @@ final class AppCoordinator {
         NSWorkspace.shared.activateFileViewerSelecting([applicationDataURL])
     }
 
-    private func observeAudioEvents(_ pipeline: AudioPipeline, meetingID: UUID) {
+    private func observeAudioEvents(
+        _ pipeline: AudioPipeline,
+        meetingID: UUID,
+        generation: UUID
+    ) {
         eventTask?.cancel()
         eventTask = Task { [weak self] in
             for await event in pipeline.events {
@@ -844,6 +1793,10 @@ final class AppCoordinator {
                     let value = min(1, max(0, Double(level.rms) * 8))
                     self.state.systemLevel = value
                 case .chunk(let chunk):
+                    self.recordingDidReceiveFirstBuffer(
+                        meetingID: meetingID,
+                        generation: generation
+                    )
                     guard let speechEngine = self.speechEngine, self.loadedModel != nil else { continue }
                     let sequence = self.sequenceNumbers[chunk.source, default: 0] + 1
                     self.sequenceNumbers[chunk.source] = sequence
@@ -868,6 +1821,18 @@ final class AppCoordinator {
         }
     }
 
+    /// The chunk is emitted only after its matching frames are in the CAF, so
+    /// this is the first point where "Recording" is a durable statement.
+    private func recordingDidReceiveFirstBuffer(meetingID: UUID, generation: UUID) {
+        guard liveSessionGeneration == generation,
+              state.recordingPhase == .preparing,
+              state.activeMeetingID == meetingID else { return }
+        state.markRecordingStarted(meetingID: meetingID)
+        if state.liveTranscriptionEnabled {
+            startLiveTranscription(meetingID: meetingID, generation: generation)
+        }
+    }
+
     private func observeTranscript(
         _ stream: AsyncThrowingStream<TranscriptDelta, Error>,
         meetingID: UUID,
@@ -887,8 +1852,25 @@ final class AppCoordinator {
                     self.assembler = assembler
                     self.cachedSegments[snapshot.meetingID] = snapshot.segments
                     self.state.transcript = snapshot.segments.map(Self.lineItem)
-                    let stable = snapshot.segments.filter { $0.stability >= .stable }
-                    if !stable.isEmpty { try? await self.store.upsertSegments(stable) }
+                    let pending = self.liveWrites.unwritten(in: snapshot)
+                    guard !pending.isEmpty else { continue }
+                    do {
+                        try await self.store.upsertSegments(pending)
+                        // Stopping resets the ledger while this write is in
+                        // flight, and the final pass then replaces these rows
+                        // under new identifiers. A late confirmation must not
+                        // re-seed the ledger with a transcript that is gone.
+                        guard self.liveSessionGeneration == generation else { return }
+                        // Only a write the store accepted is recorded, so a
+                        // failed transaction is retried by the next delta rather
+                        // than dropped for the rest of the meeting.
+                        self.liveWrites.confirm(pending)
+                    } catch {
+                        self.logger.error("""
+                            Live transcript write failed for \(pending.count, privacy: .public) \
+                            segments: \(error.localizedDescription, privacy: .public)
+                            """)
+                    }
                 }
             } catch {
                 self.logger.error("Live transcription ended: \(error.localizedDescription, privacy: .public)")
@@ -1040,16 +2022,42 @@ final class AppCoordinator {
             .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) ?? ""
     }
 
-    private func applyInsights(_ insights: MeetingInsights) {
-        state.insights.summary = insights.overview.text
-        state.insights.topics = insights.topics.map(\.text)
-        state.insights.decisions = insights.decisions.map(\.text)
-        state.insights.actions = insights.actionItems.map { action in
-            [action.text, action.owner.map { "Owner: \($0)" }, action.dueDate.map { "Due: \($0)" }]
-                .compactMap { $0 }.joined(separator: " · ")
+    private func applyInsights(_ insights: MeetingInsights, meetingID: UUID) {
+        state.updateInsights(for: meetingID) { workspace in
+            workspace.summary = insights.overview.text
+            workspace.topics = insights.topics.map(\.text)
+            workspace.decisions = insights.decisions.map(\.text)
+            workspace.actions = insights.actionItems.map { action in
+                [action.text, action.owner.map { "Owner: \($0)" }, action.dueDate.map { "Due: \($0)" }]
+                    .compactMap { $0 }.joined(separator: " · ")
+            }
+            workspace.openQuestions = insights.openQuestions.map(\.text)
+            workspace.error = nil
         }
-        state.insights.openQuestions = insights.openQuestions.map(\.text)
-        state.insights.error = nil
+    }
+
+    private func applySavedGeneratedInsights(
+        _ saved: SavedGeneratedInsights,
+        output: ValidatedMeetingInsights,
+        meetingID: UUID
+    ) {
+        state.updateInsights(for: meetingID) {
+            $0.summaryVersions.removeAll { $0.id == saved.summaryVersion.id }
+            $0.summaryVersions.insert(saved.summaryVersion, at: 0)
+        }
+        if saved.didActivate {
+            applyInsights(output.insights, meetingID: meetingID)
+            state.updateInsights(for: meetingID) {
+                $0.summary = saved.summaryVersion.text
+                $0.summaryDraft = saved.summaryVersion.text
+                $0.activeSummaryVersionID = saved.summaryVersion.id
+                $0.candidateSummaryVersionID = nil
+            }
+        } else {
+            state.updateInsights(for: meetingID) {
+                $0.candidateSummaryVersionID = saved.summaryVersion.id
+            }
+        }
     }
 
     /// Where a meeting's takes live, whether they are being recovered or

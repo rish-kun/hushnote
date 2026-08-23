@@ -37,13 +37,7 @@ public struct CitationValidator: Sendable {
         func citations(_ proposed: [EvidenceCitation]) -> [EvidenceCitation] {
             proposed.compactMap { citation in
                 guard let segment = index[citation.segmentID],
-                      containsVerbatim(citation.quote, in: segment.text),
-                      // A citation that points at the right segment but the
-                      // wrong moment used to be silently corrected. Disagreement
-                      // is evidence the citation was not derived from the
-                      // segment at all.
-                      citation.startMilliseconds == segment.startMilliseconds,
-                      citation.endMilliseconds == segment.endMilliseconds else {
+                      containsVerbatim(citation.quote, in: segment.text) else {
                     rejectedCitations += 1
                     return nil
                 }
@@ -58,47 +52,95 @@ public struct CitationValidator: Sendable {
 
         func claim(_ proposed: CitedInsight) -> CitedInsight? {
             let validCitations = citations(proposed.citations)
-            guard isAcceptableClaim(
+            if isAcceptableClaim(
                 proposed.text,
                 limit: Self.maximumClaimCharacters,
                 citations: validCitations
+            ) {
+                return CitedInsight(id: proposed.id, text: proposed.text, citations: validCitations)
+            }
+            // A model may paraphrase more freely than the lexical grounding
+            // gate allows even while pointing at real, verbatim evidence. Do
+            // not keep that prose, but do not throw away the evidence either:
+            // present only the transcript's own words as an extractive fact.
+            guard let extractive = extractiveText(
+                from: validCitations,
+                limit: Self.maximumClaimCharacters
             ) else {
                 rejectedClaims += 1
                 return nil
             }
-            return CitedInsight(id: proposed.id, text: proposed.text, citations: validCitations)
+            rejectedClaims += 1
+            return CitedInsight(id: proposed.id, text: extractive, citations: validCitations)
         }
 
         func action(_ proposed: ActionItemInsight) -> ActionItemInsight? {
             let validCitations = citations(proposed.citations)
-            guard isAcceptableClaim(
+            if isAcceptableClaim(
                 proposed.text,
                 limit: Self.maximumClaimCharacters,
                 citations: validCitations
             ),
-                  isWithinLimit(proposed.owner),
-                  isWithinLimit(proposed.dueDate) else {
+               isWithinLimit(proposed.owner),
+               isWithinLimit(proposed.dueDate) {
+                return ActionItemInsight(
+                    id: proposed.id,
+                    text: proposed.text,
+                    owner: proposed.owner,
+                    dueDate: proposed.dueDate,
+                    citations: validCitations
+                )
+            }
+            guard let extractive = extractiveText(
+                from: validCitations,
+                limit: Self.maximumClaimCharacters
+            ) else {
                 rejectedClaims += 1
                 return nil
             }
+            // Owner and due date are model-authored attributes. When the claim
+            // itself failed grounding, retaining them would make the fallback
+            // look more certain than its evidence.
+            rejectedClaims += 1
             return ActionItemInsight(
                 id: proposed.id,
-                text: proposed.text,
-                owner: proposed.owner,
-                dueDate: proposed.dueDate,
+                text: extractive,
+                owner: nil,
+                dueDate: nil,
                 citations: validCitations
             )
         }
 
-        guard let overview = claim(insights.overview) else { return nil }
+        let overview = claim(insights.overview)
+        let keyPoints = insights.keyPoints.compactMap(claim)
+        let decisions = insights.decisions.compactMap(claim)
+        let actionItems = insights.actionItems.compactMap(action)
+        let openQuestions = insights.openQuestions.compactMap(claim)
+        let risks = insights.risks.compactMap(claim)
+        let topics = insights.topics.compactMap(claim)
+
+        // An overview is a presentation requirement, not a reason to throw away
+        // independently grounded facts. If the provider's overview was too
+        // loosely paraphrased, promote the first validated claim verbatim. The
+        // fallback carries exactly the evidence that already passed every gate.
+        let fallbackOverview = keyPoints.first
+            ?? decisions.first
+            ?? openQuestions.first
+            ?? topics.first
+            ?? risks.first
+            ?? actionItems.first.map {
+                CitedInsight(id: $0.id, text: $0.text, citations: $0.citations)
+            }
+        guard let resolvedOverview = overview ?? fallbackOverview else { return nil }
+
         let validated = MeetingInsights(
-            overview: overview,
-            keyPoints: insights.keyPoints.compactMap(claim),
-            decisions: insights.decisions.compactMap(claim),
-            actionItems: insights.actionItems.compactMap(action),
-            openQuestions: insights.openQuestions.compactMap(claim),
-            risks: insights.risks.compactMap(claim),
-            topics: insights.topics.compactMap(claim)
+            overview: resolvedOverview,
+            keyPoints: keyPoints,
+            decisions: decisions,
+            actionItems: actionItems,
+            openQuestions: openQuestions,
+            risks: risks,
+            topics: topics
         )
         return ValidatedMeetingInsights(
             insights: validated,
@@ -117,9 +159,7 @@ public struct CitationValidator: Sendable {
         var rejected = 0
         let valid = answer.citations.compactMap { citation -> EvidenceCitation? in
             guard let segment = index[citation.segmentID],
-                  containsVerbatim(citation.quote, in: segment.text),
-                  citation.startMilliseconds == segment.startMilliseconds,
-                  citation.endMilliseconds == segment.endMilliseconds else {
+                  containsVerbatim(citation.quote, in: segment.text) else {
                 rejected += 1
                 return nil
             }
@@ -158,6 +198,27 @@ public struct CitationValidator: Sendable {
     private func isWithinLimit(_ value: String?) -> Bool {
         guard let value else { return true }
         return value.count <= Self.maximumAttributeCharacters
+    }
+
+    private func extractiveText(
+        from citations: [EvidenceCitation],
+        limit: Int
+    ) -> String? {
+        var seen: Set<String> = []
+        var parts: [String] = []
+        var length = 0
+        for citation in citations {
+            let quote = citation.quote.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !quote.isEmpty, seen.insert(quote.lowercased()).inserted else { continue }
+            let separatorLength = parts.isEmpty ? 0 : 3
+            let room = limit - length - separatorLength
+            guard room > 0 else { break }
+            let part = quote.count <= room ? quote : String(quote.prefix(room))
+            parts.append(part)
+            length += separatorLength + part.count
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " — ")
     }
 
     /// Whether a claim's own words come from the evidence it cites.

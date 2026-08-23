@@ -54,6 +54,7 @@ public struct SubprocessAgentProcessRunner: AgentProcessRunner {
     public init() {}
 
     public func run(_ invocation: AgentProcessInvocation) async throws -> AgentProcessResult {
+        try Task.checkCancellation()
         let process = Process()
         let inputPipe = Pipe()
         let outputPipe = Pipe()
@@ -73,6 +74,7 @@ public struct SubprocessAgentProcessRunner: AgentProcessRunner {
                 "Unable to run \(invocation.executableURL.lastPathComponent): \(error.localizedDescription)"
             )
         }
+        let lifetime = AgentProcessLifetime(process: process)
 
         let stdin = Data(invocation.standardInput.utf8)
         let writer = DispatchQueue(label: "app.hushnote.agent-stdin")
@@ -100,11 +102,25 @@ public struct SubprocessAgentProcessRunner: AgentProcessRunner {
             try? await Task.sleep(for: invocation.timeout)
             await outcome.send(false)
         }
-        let terminated = await outcome.value()
+        let terminated = await withTaskCancellationHandler {
+            await outcome.value()
+        } onCancel: {
+            lifetime.stop()
+            Task { await outcome.send(false) }
+        }
         timer.cancel()
 
+        // Termination and cancellation can arrive in either order. Cancellation
+        // still wins even if the child's termination handler won the one-shot
+        // race by a few microseconds.
+        if Task.isCancelled {
+            lifetime.stop()
+            drain.cancel()
+            throw CancellationError()
+        }
+
         guard terminated else {
-            escalateTermination(of: process)
+            lifetime.stop()
             drain.cancel()
             throw InsightProviderError.timedOut
         }
@@ -117,13 +133,35 @@ public struct SubprocessAgentProcessRunner: AgentProcessRunner {
         )
     }
 
-    /// Ask, then insist. An agent that ignores SIGTERM would otherwise keep the
-    /// user's transcript in memory in a process nobody is watching.
-    private func escalateTermination(of process: Process) {
+}
+
+/// A synchronous, Sendable cancellation handle around Foundation's non-Sendable
+/// `Process`. Both the timeout and Swift task cancellation can race to stop the
+/// same child; the lock makes termination idempotent.
+private final class AgentProcessLifetime: @unchecked Sendable {
+    private let process: Process
+    private let lock = NSLock()
+    private var didStop = false
+
+    init(process: Process) {
+        self.process = process
+    }
+
+    /// Ask, then insist. An agent that ignores SIGTERM must not keep a transcript
+    /// in memory after its owning task is gone.
+    func stop() {
+        lock.lock()
+        guard !didStop else {
+            lock.unlock()
+            return
+        }
+        didStop = true
+        lock.unlock()
+
         guard process.isRunning else { return }
         process.terminate()
         let deadline = DispatchTime.now() + .milliseconds(500)
-        DispatchQueue.global().asyncAfter(deadline: deadline) {
+        DispatchQueue.global().asyncAfter(deadline: deadline) { [process] in
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
     }

@@ -57,6 +57,17 @@ struct FinalTranscriberTests {
         // model is loaded, used once and thrown away, so the trade is all cost.
         #expect(configuration.prewarm == false)
     }
+
+    @Test("The final pass uses the selected download cache")
+    func customDownloadBase() {
+        let folder = URL(fileURLWithPath: "/Volumes/Models/Hushnote Models/WhisperKit")
+        let configuration = WhisperKitFinalTranscriber.modelConfiguration(
+            for: SpeechModelCatalog.whisperSmall,
+            downloadBase: folder
+        )
+
+        #expect(configuration.downloadBase == folder)
+    }
 }
 
 // MARK: - Fixtures

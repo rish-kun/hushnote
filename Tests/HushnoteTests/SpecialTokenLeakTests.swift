@@ -33,7 +33,7 @@ struct SpecialTokenLeakTests {
                 ),
             ]
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: SpecialTokenFixture.configuration(meetingID: meetingID)
         )
@@ -65,7 +65,7 @@ struct SpecialTokenLeakTests {
                 )
             ]
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: SpecialTokenFixture.configuration(meetingID: meetingID)
         )
@@ -103,7 +103,7 @@ struct SpecialTokenLeakTests {
                 )
             ]
         ])
-        let engine = WhisperKitTranscriptionEngine(decoder: decoder)
+        let engine = WhisperKitTranscriptionEngine(makeDecoder: { decoder })
         let stream = try await engine.start(
             configuration: SpecialTokenFixture.configuration(meetingID: meetingID)
         )

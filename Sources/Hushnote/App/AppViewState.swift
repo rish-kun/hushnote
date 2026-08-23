@@ -4,8 +4,34 @@ import Observation
 enum SidebarDestination: Hashable {
     case meetings
     case models
+    case storage
     case settings
     case meeting(UUID)
+}
+
+enum WorkspaceTab: String, Codable, CaseIterable, Identifiable, Sendable {
+    case notes = "Notes"
+    case transcript = "Transcript"
+    case summary = "Summary"
+    case ask = "Ask"
+
+    var id: Self { self }
+}
+
+enum RecordingStartupStage: Equatable, Sendable {
+    case idle
+    case arming
+    case waitingForFirstBuffer
+    case ready
+
+    var title: String {
+        switch self {
+        case .idle: "Ready"
+        case .arming: "Arming audio…"
+        case .waitingForFirstBuffer: "Waiting for audio…"
+        case .ready: "Recording"
+        }
+    }
 }
 
 enum MeetingTemplate: String, CaseIterable, Codable, Sendable, Identifiable {
@@ -191,7 +217,7 @@ enum LiveTranscriptionPolicy {
     nonisolated static func stages(isEnabled: Bool) -> [FinalizationStage] {
         var stages: [FinalizationStage] = [.savingAudio]
         if isEnabled { stages.append(.stoppingLiveTranscription) }
-        stages.append(contentsOf: [.loadingFinalModel, .transcribing, .diarizing, .generatingInsights])
+        stages.append(contentsOf: [.loadingFinalModel, .transcribing, .diarizing])
         return stages
     }
 
@@ -329,6 +355,20 @@ struct TranscriptLineItem: Identifiable, Equatable {
 
 struct InsightWorkspaceState: Equatable {
     var summary = ""
+    /// The durable version currently supplying `summary` and the structured
+    /// insight lists below it.
+    var activeSummaryVersionID: UUID?
+    /// Newest first. History is loaded in pages so opening a well-used meeting
+    /// never decodes every provider response it has ever produced.
+    var summaryVersions: [SummaryVersion] = []
+    var hasMoreSummaryVersions = false
+    var isLoadingSummaryVersions = false
+    /// A generated version that has not replaced the user's current summary.
+    var candidateSummaryVersionID: UUID?
+    var summaryDraft = ""
+    var isEditingSummary = false
+    var isSavingSummary = false
+    var summarySaveConfirmation: Date?
     var topics: [String] = []
     var decisions: [String] = []
     var actions: [String] = []
@@ -336,7 +376,60 @@ struct InsightWorkspaceState: Equatable {
     var answer = ""
     var answerTimestamps: [TimeInterval] = []
     var isGenerating = false
+    var generationStage: InsightGenerationStage?
+    var generationProgress = 0.0
+    var generationStartedAt: Date?
     var error: String?
+
+    var hasUnsavedSummaryChanges: Bool {
+        isEditingSummary && summaryDraft != summary
+    }
+
+    var candidateSummaryVersion: SummaryVersion? {
+        guard let candidateSummaryVersionID else { return nil }
+        return summaryVersions.first { $0.id == candidateSummaryVersionID }
+    }
+}
+
+enum AudioExportState: Equatable, Sendable {
+    case idle
+    case exporting(format: MeetingAudioFileFormat, progress: Double)
+    case succeeded(URL)
+    case failed(String)
+
+    var isExporting: Bool {
+        if case .exporting = self { return true }
+        return false
+    }
+}
+
+enum InsightGenerationStage: Equatable, Sendable {
+    case checkingProvider
+    case extracting(current: Int, total: Int)
+    case synthesizing
+    case validating
+    case saving
+
+    var title: String {
+        switch self {
+        case .checkingProvider: "Checking provider…"
+        case .extracting(let current, let total): "Reading transcript \(current) of \(total)…"
+        case .synthesizing: "Writing summary…"
+        case .validating: "Checking citations…"
+        case .saving: "Saving summary…"
+        }
+    }
+
+    var progress: Double {
+        switch self {
+        case .checkingProvider: 0.05
+        case .extracting(let current, let total):
+            0.1 + 0.55 * Double(current) / Double(max(1, total))
+        case .synthesizing: 0.72
+        case .validating: 0.88
+        case .saving: 0.96
+        }
+    }
 }
 
 enum InsightProviderChoice: String, CaseIterable, Identifiable {
@@ -350,6 +443,31 @@ enum InsightProviderChoice: String, CaseIterable, Identifiable {
 
     var id: Self { self }
     var isLocal: Bool { self == .local }
+
+    var stableID: String {
+        switch self {
+        case .local: "local-gguf"
+        case .openAI: "openai"
+        case .anthropic: "anthropic"
+        case .chatGPT: "chatgpt-codex-app-server"
+        case .claudeCLI: "cli-claude"
+        case .codexCLI: "cli-codex"
+        case .opencodeCLI: "cli-opencode"
+        }
+    }
+
+    init?(stableID: String) {
+        switch stableID {
+        case "local-gguf": self = .local
+        case "openai": self = .openAI
+        case "anthropic": self = .anthropic
+        case "chatgpt-codex-app-server": self = .chatGPT
+        case "cli-claude": self = .claudeCLI
+        case "cli-codex": self = .codexCLI
+        case "cli-opencode": self = .opencodeCLI
+        default: return nil
+        }
+    }
 
     /// The coding-agent CLI this choice drives, for the choices that are one.
     /// These reuse a sign-in the user already has, so they need no API key.
@@ -373,8 +491,13 @@ struct AppAlert: Equatable {
 /// The operations that can fail in front of the user.
 enum FailureKind: Equatable {
     case meetingLoad
+    case meetingRename
+    case meetingDelete
     case noteSave
+    case summarySave
+    case speakerRename
     case transcriptEditSave
+    case storage
     case insightGeneration
     case questionAnswering
     case export
@@ -393,8 +516,13 @@ enum FailureRoute: Equatable {
     nonisolated static func route(for kind: FailureKind) -> FailureRoute {
         switch kind {
         case .meetingLoad: .appAlert(title: "This meeting could not be opened")
+        case .meetingRename: .appAlert(title: "The meeting name was not saved")
+        case .meetingDelete: .appAlert(title: "The meeting could not be deleted")
         case .noteSave: .appAlert(title: "Your notes are not being saved")
+        case .summarySave: .appAlert(title: "Your summary was not saved")
+        case .speakerRename: .appAlert(title: "The speaker name was not saved")
         case .transcriptEditSave: .appAlert(title: "Your transcript correction was not saved")
+        case .storage: .appAlert(title: "Storage could not be updated")
         case .export: .appAlert(title: "The export did not finish")
         case .insightGeneration, .questionAnswering: .insightWorkspace
         }
@@ -426,27 +554,101 @@ final class AppViewState {
     var selection: SidebarDestination? = .meetings
     var draft = MeetingDraft()
     var meetings: [MeetingListItem] = []
+    var recentlyDeletedMeetings: [MeetingListItem] = []
     var transcript: [TranscriptLineItem] = []
-    var insights = InsightWorkspaceState()
+    private var meetingInsights: [UUID: InsightWorkspaceState] = [:]
+    private var unscopedInsights = InsightWorkspaceState()
     var recordingPhase = RecordingPhase.idle
     var elapsed: TimeInterval = 0
     var systemLevel = 0.0
     var searchText = ""
     var searchMatchedMeetingIDs: Set<UUID>?
     var selectedProvider = InsightProviderChoice.local
-    var retainAudio = false
+    var retainAudio = true
     /// Whether the meeting is transcribed while it happens. Off trades the live
     /// feed for not paying the Neural Engine twice; the final pass then
     /// produces the only transcript. See `LiveTranscriptionPolicy`.
     var liveTranscriptionEnabled = true
     var activeMeetingID: UUID?
-    var selectedWorkspaceTab = "Notes"
+    var meetingWorkspaceTabs: [UUID: WorkspaceTab] = [:]
+    var recordingStartupStage = RecordingStartupStage.idle
     var question = ""
     var recordingNotice: String?
     var meetingNotes: [UUID: String] = [:]
     var finalizationStage: FinalizationStage?
     var finalizationDetail: String?
     var alert: AppAlert?
+    var audioExports: [UUID: AudioExportState] = [:]
+    var storageReport: StorageReport?
+    var isScanningStorage = false
+    var storageDeletingRecordingIDs: Set<UUID> = []
+
+    private var displayedInsightMeetingID: UUID? {
+        if case .meeting(let id) = selection { return id }
+        return activeMeetingID
+    }
+
+    /// Compatibility accessor for views showing the selected meeting. Durable
+    /// async work should use `updateInsights(for:)` so a late completion cannot
+    /// write into whichever meeting happens to be selected at that moment.
+    var insights: InsightWorkspaceState {
+        get {
+            guard let id = displayedInsightMeetingID else { return unscopedInsights }
+            return meetingInsights[id, default: InsightWorkspaceState()]
+        }
+        set {
+            guard let id = displayedInsightMeetingID else {
+                unscopedInsights = newValue
+                return
+            }
+            meetingInsights[id] = newValue
+        }
+    }
+
+    func insights(for meetingID: UUID) -> InsightWorkspaceState {
+        meetingInsights[meetingID, default: InsightWorkspaceState()]
+    }
+
+    func updateInsights(
+        for meetingID: UUID,
+        _ update: (inout InsightWorkspaceState) -> Void
+    ) {
+        var workspace = meetingInsights[meetingID, default: InsightWorkspaceState()]
+        update(&workspace)
+        meetingInsights[meetingID] = workspace
+    }
+
+    func replaceInsights(_ workspace: InsightWorkspaceState, for meetingID: UUID) {
+        meetingInsights[meetingID] = workspace
+    }
+
+    /// Summary work is meeting-scoped and may continue after navigation. Quit
+    /// protection therefore cannot look only at `insights`, which follows the
+    /// currently displayed meeting.
+    var hasInsightWork: Bool {
+        unscopedInsights.isGenerating || meetingInsights.values.contains(where: \.isGenerating)
+    }
+
+    var hasUnsavedSummaryChanges: Bool {
+        unscopedInsights.hasUnsavedSummaryChanges
+            || meetingInsights.values.contains(where: \.hasUnsavedSummaryChanges)
+    }
+
+    var unsavedSummaryMeetingID: UUID? {
+        if let displayedInsightMeetingID,
+           meetingInsights[displayedInsightMeetingID]?.hasUnsavedSummaryChanges == true {
+            return displayedInsightMeetingID
+        }
+        return meetingInsights.first(where: { $0.value.hasUnsavedSummaryChanges })?.key
+    }
+
+    func workspaceTab(for meetingID: UUID) -> WorkspaceTab {
+        meetingWorkspaceTabs[meetingID] ?? .notes
+    }
+
+    func setWorkspaceTab(_ tab: WorkspaceTab, for meetingID: UUID) {
+        meetingWorkspaceTabs[meetingID] = tab
+    }
 
     /// Sends a failure to the channel it belongs to. The two channels are
     /// independent: a failed export must not replace a summary the user still
@@ -500,10 +702,11 @@ final class AppViewState {
         recordingPhase = .recording
         elapsed = 0
         transcript.removeAll()
-        insights = InsightWorkspaceState()
+        meetingInsights[meetingID] = InsightWorkspaceState()
         recordingNotice = nil
         finalizationStage = nil
         finalizationDetail = nil
+        recordingStartupStage = .ready
         startElapsedTimer()
     }
 
@@ -542,12 +745,14 @@ final class AppViewState {
         self.activeMeetingID = nil
         finalizationStage = nil
         finalizationDetail = nil
+        recordingStartupStage = .idle
     }
 
     func markFailed(_ failure: RecordingFailure) {
         recordingPhase = .failed(failure)
         recordingNotice = nil
         finalizationDetail = nil
+        recordingStartupStage = .idle
         elapsedTask?.cancel()
     }
 

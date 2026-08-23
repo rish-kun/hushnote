@@ -10,6 +10,8 @@ enum TerminationDecision: Equatable {
     case confirmCapture
     /// ASR, diarization, or summary work is running and would be discarded.
     case confirmFinalizing
+    /// Authored summary text exists only in the editor buffer.
+    case confirmUnsavedSummary
 }
 
 /// `NSApp.terminate` tears the process down immediately: `IncrementalCAFWriter.finish()`
@@ -18,16 +20,21 @@ enum TerminationDecision: Equatable {
 /// Both ⌘Q and the menu-bar Quit item reach it, and the menu-bar item sits one
 /// click away while the recording pill is on screen.
 enum TerminationGuard {
-    static func decision(for phase: RecordingPhase) -> TerminationDecision {
+    static func decision(
+        for phase: RecordingPhase,
+        hasInsightWork: Bool = false,
+        hasUnsavedSummaryChanges: Bool = false
+    ) -> TerminationDecision {
         switch phase {
         case .idle, .failed:
-            .terminateNow
+            if hasInsightWork { return .confirmFinalizing }
+            return hasUnsavedSummaryChanges ? .confirmUnsavedSummary : .terminateNow
         case .preparing, .recording, .paused:
             // `.preparing` counts as live capture: the pipeline may already hold
             // an open take by the time the user reaches for ⌘Q.
-            .confirmCapture
+            return .confirmCapture
         case .finalizing:
-            .confirmFinalizing
+            return .confirmFinalizing
         }
     }
 }
@@ -44,7 +51,11 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let state = Self.state else { return .terminateNow }
 
-        switch TerminationGuard.decision(for: state.recordingPhase) {
+        switch TerminationGuard.decision(
+            for: state.recordingPhase,
+            hasInsightWork: state.hasInsightWork,
+            hasUnsavedSummaryChanges: state.hasUnsavedSummaryChanges
+        ) {
         case .terminateNow:
             return .terminateNow
 
@@ -75,6 +86,28 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
             alert.addButton(withTitle: "Keep Finalizing")
             alert.addButton(withTitle: "Quit Anyway")
             return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+
+        case .confirmUnsavedSummary:
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Save summary changes before quitting?"
+            alert.informativeText = "Your edited meeting summary has not been saved."
+            alert.addButton(withTitle: "Save and Quit")
+            alert.addButton(withTitle: "Keep Editing")
+            alert.addButton(withTitle: "Quit Without Saving")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                guard let meetingID = state.unsavedSummaryMeetingID else { return .terminateCancel }
+                Task { @MainActor in
+                    let saved = await Self.coordinator?.saveSummary(meetingID: meetingID) == true
+                    NSApp.reply(toApplicationShouldTerminate: saved)
+                }
+                return .terminateLater
+            case .alertThirdButtonReturn:
+                return .terminateNow
+            default:
+                return .terminateCancel
+            }
         }
     }
 }
