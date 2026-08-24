@@ -1217,7 +1217,7 @@ final class AppCoordinator {
 
     func answerQuestion() async {
         guard let meetingID = selectedMeetingID else { return }
-        let question = state.question
+        let question = state.insights.question
         state.updateInsights(for: meetingID) { $0.error = nil }
         // Without this the Ask button produced no visual change at all for the
         // length of an LLM round trip.
@@ -1232,7 +1232,8 @@ final class AppCoordinator {
             )
             state.updateInsights(for: meetingID) {
                 $0.answer = output.answer.answer
-                $0.answerTimestamps = output.answer.citations.map { Double($0.startMilliseconds) / 1_000 }
+                $0.answerCitations = output.answer.citations
+                $0.rejectedCitations = output.validation.rejectedCitations
             }
         } catch {
             state.updateInsights(for: meetingID) { $0.error = error.localizedDescription }
@@ -1499,6 +1500,15 @@ final class AppCoordinator {
     func setLocalModelPath(_ path: String) {
         localModelPath = path
         preferences.localModelPath = path
+    }
+
+    /// Brings one segment of the meeting already on screen into view, and
+    /// switches to the transcript to show it.
+    func revealTranscriptSegment(_ segmentID: String) {
+        if let meetingID = selectedMeetingID {
+            setWorkspaceTab(.transcript, for: meetingID)
+        }
+        state.transcriptJumpRequest = TranscriptJumpRequest(segmentID: segmentID)
     }
 
     /// Opens a meeting at one transcript moment.

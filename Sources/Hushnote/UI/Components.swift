@@ -392,6 +392,12 @@ enum DurationText {
 
     /// "1 hour 5 minutes 12 seconds", not "one hundred thirty five colon zero
     /// zero". Empty components are dropped rather than spoken as zeroes.
+    /// A rounded length, for prose rather than for a readout.
+    nonisolated static func approximateMinutes(_ seconds: TimeInterval) -> String {
+        let minutes = max(0, Int((seconds / 60).rounded()))
+        return minutes <= 1 ? "under a minute" : "\(minutes) min"
+    }
+
     nonisolated static func spoken(_ seconds: TimeInterval) -> String {
         let (hours, minutes, secs) = components(seconds)
         var parts: [String] = []

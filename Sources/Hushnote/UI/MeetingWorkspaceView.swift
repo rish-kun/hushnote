@@ -409,7 +409,7 @@ struct CompletedMeetingView: View {
                 isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
                 horizontalInset: policy.gutter
             )
-        case .ask: AskMeetingView(horizontalInset: policy.gutter)
+        case .ask: AskMeetingView(horizontalInset: policy.gutter, policy: policy)
         }
     }
 
@@ -1648,6 +1648,7 @@ enum TranscriptFollow {
 
 struct AskMeetingView: View {
     let horizontalInset: CGFloat
+    var policy: AdaptiveLayoutPolicy = .regular
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
@@ -1655,97 +1656,322 @@ struct AskMeetingView: View {
         @Bindable var state = state
 
         ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("Ask the meeting")
-                        .font(HushnoteTheme.Font.sectionTitle)
-                    Text("Answers are grounded in the transcript, with timestamps when available.")
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                    ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
-                        .padding(.top, 2)
-                }
+            HStack(alignment: .top, spacing: policy.showsRightRail ? 44 : 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    heading
+                    field(state: state)
 
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Your question")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                    TextField("What did we agree to ship?", text: $state.question, axis: .vertical)
-                        .textFieldStyle(.plain)
-                        .font(.body)
-                        .lineLimit(2...5)
-                        .padding(13)
-                        .background(HushnoteTheme.controlSurface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                .stroke(HushnoteTheme.rule.opacity(0.9))
-                        }
-                        .onSubmit { Task { await coordinator.answerQuestion() } }
-                    HStack {
-                        Button(state.insights.isGenerating ? "Asking…" : "Ask meeting") {
-                            Task { await coordinator.answerQuestion() }
-                        }
-                        .hushnoteButton(.primary)
-                        .disabled(
-                            state.insights.isGenerating
-                                || state.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        )
-                        if state.insights.isGenerating {
-                            ProgressView().controlSize(.small)
-                        }
-                        Spacer()
+                    if !policy.showsRightRail {
+                        disclosure.padding(.top, 26)
+                    }
+
+                    if let error = state.insights.error {
+                        // Answering writes to `insights.error`, which only the
+                        // summary workspace used to render -- so a question
+                        // that failed looked exactly like one never asked.
+                        HushnoteStatusLine(text: error, tone: .warning)
+                            .padding(.top, 22)
+                    }
+
+                    if state.insights.answer.isEmpty {
+                        suggestions.padding(.top, 32)
+                    } else {
+                        answer.padding(.top, 26)
                     }
                 }
-                .padding(16)
-                .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .stroke(HushnoteTheme.rule.opacity(0.72))
-                }
+                .frame(maxWidth: AdaptiveLayoutPolicy.readingMeasure, alignment: .leading)
 
-                // Answering writes to `insights.error`, which only the summary
-                // workspace used to render — so a question that failed looked
-                // exactly like one that was never asked.
-                if let error = state.insights.error {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.callout)
-                        .foregroundStyle(HushnoteTheme.vermilionInk)
-                }
-
-                if !state.insights.answer.isEmpty {
-                    VStack(alignment: .leading, spacing: 14) {
-                        Text("Answer")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(HushnoteTheme.secondaryInk)
-                        Text(state.insights.answer)
-                            .font(HushnoteTheme.Font.reading)
-                            .textSelection(.enabled)
-                            .lineSpacing(5)
-                        if !state.insights.answerTimestamps.isEmpty {
-                            HushnoteRule(opacity: 0.6)
-                            VStack(alignment: .leading, spacing: 7) {
-                                Text("Evidence")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(HushnoteTheme.secondaryInk)
-                                HStack(spacing: 8) {
-                                    ForEach(state.insights.answerTimestamps, id: \.self) { time in
-                                        TimestampButton(seconds: time)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .padding(18)
-                    .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 11, style: .continuous)
-                            .stroke(HushnoteTheme.moss.opacity(0.52))
-                    }
+                if policy.showsRightRail {
+                    rail.frame(width: 232, alignment: .leading)
                 }
             }
-            .frame(maxWidth: HushnoteTheme.transcriptMeasure, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, horizontalInset)
             .padding(.vertical, 30)
         }
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Ask this meeting")
+                .font(HushnoteTheme.Font.sectionTitle)
+                .foregroundStyle(HushnoteTheme.ink)
+            // The differentiator, stated once, where it retires as soon as
+            // there is an answer on screen to make the point instead.
+            if state.insights.answer.isEmpty {
+                Text("Every answer is quoted from the transcript. Nothing that can't be quoted is shown.")
+                    .font(.callout)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.bottom, 22)
+    }
+
+    private func field(state: AppViewState) -> some View {
+        @Bindable var state = state
+
+        return VStack(alignment: .leading, spacing: 10) {
+            // The one raised surface on the page: an editor well, which is a
+            // use the design language explicitly permits. The card that used to
+            // wrap the label, the field and the button is gone.
+            TextField(
+                state.insights.answer.isEmpty ? "What did we agree to ship?" : "Ask another question…",
+                text: $state.insights.question,
+                axis: .vertical
+            )
+            .textFieldStyle(.plain)
+            .focusEffectDisabled()
+            .font(.body)
+            .lineLimit(2...5)
+            .hushnoteField()
+            .accessibilityLabel("Your question")
+
+            HStack(spacing: 10) {
+                Button(state.insights.isGenerating ? "Asking…" : "Ask") {
+                    Task { await coordinator.answerQuestion() }
+                }
+                .hushnoteButton(.primary)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(isAskDisabled)
+
+                // `.onSubmit` on a vertical-axis field inserts a newline as
+                // often as it submits, so the shortcut is advertised instead.
+                Text("⌘↩")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+
+                if state.insights.isGenerating {
+                    HushnoteStatusLine(text: "Checking every quote against the transcript…", tone: .working)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var isAskDisabled: Bool {
+        state.insights.isGenerating
+            || state.insights.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || state.transcript.isEmpty
+    }
+
+    // MARK: - Where to start
+
+    private var suggestionList: [AskSuggestionPolicy.Suggestion] {
+        AskSuggestionPolicy.suggestions(
+            openQuestions: state.insights.openQuestions,
+            topics: state.insights.topics,
+            decisions: state.insights.decisions,
+            speakers: AskSuggestionPolicy.namedSpeakers(
+                lineCountsBySpeaker: state.transcript.reduce(into: [:]) { counts, line in
+                    counts[line.speaker, default: 0] += 1
+                }
+            ),
+            template: state.draft.template
+        )
+    }
+
+    @ViewBuilder
+    private var suggestions: some View {
+        if state.transcript.isEmpty {
+            HushnoteEmptyState(
+                title: "Nothing to ask yet",
+                message: "This meeting has no transcript. Record it, or finalize the recovery, and everything said becomes answerable here.",
+                policy: policy
+            ) {
+                HushnoteGlyph(systemName: "text.magnifyingglass")
+            }
+        } else {
+            let suggestions = suggestionList
+            VStack(alignment: .leading, spacing: 0) {
+                HushnoteEyebrow("Where to start")
+                    .padding(.bottom, 14)
+
+                ForEach(suggestions) { suggestion in
+                    Button {
+                        state.insights.question = suggestion.text
+                        Task { await coordinator.answerQuestion() }
+                    } label: {
+                        HStack {
+                            Text(suggestion.text)
+                                .font(.callout)
+                                .foregroundStyle(HushnoteTheme.ink)
+                                .multilineTextAlignment(.leading)
+                            Spacer(minLength: 12)
+                            Image(systemName: "return")
+                                .font(.caption)
+                                .foregroundStyle(HushnoteTheme.secondaryInk)
+                        }
+                        .padding(.vertical, 14)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .hushnoteBottomRule(opacity: 0.5)
+                }
+
+                Text(AskSuggestionPolicy.caption(for: suggestions))
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .padding(.top, 14)
+            }
+        }
+    }
+
+    // MARK: - The finding
+
+    private var answer: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(state.insights.question.isEmpty ? "Answer" : state.insights.question)
+                .font(HushnoteTheme.Font.subsectionTitle)
+                .foregroundStyle(HushnoteTheme.ink)
+                .padding(.bottom, 12)
+
+            Text(state.insights.answer)
+                .font(HushnoteTheme.Font.reading)
+                .foregroundStyle(HushnoteTheme.ink)
+                .lineSpacing(6)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if state.insights.rejectedCitations > 0 {
+                // The app's whole thesis, demonstrated. This count was computed
+                // and thrown away; it is the opposite of alarming.
+                HushnoteStatusLine(
+                    text: rejectedCitationsMessage,
+                    tone: .warning
+                )
+                .padding(.top, 22)
+            }
+
+            if !state.insights.answerCitations.isEmpty {
+                HushnoteEyebrow("Evidence")
+                    .padding(.top, 28)
+                    .padding(.bottom, 14)
+
+                ForEach(state.insights.answerCitations, id: \.segmentID) { citation in
+                    AskEvidenceBlock(citation: citation) {
+                        // The evidence is already on this meeting's transcript,
+                        // so the jump only has to change tab and scroll.
+                        coordinator.revealTranscriptSegment(citation.segmentID)
+                    }
+                    .padding(.bottom, 16)
+                }
+            }
+
+            HushnoteRule(opacity: 0.45).padding(.top, 8)
+
+            HStack(spacing: 10) {
+                Text(state.selectedProvider.displayName)
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                Spacer(minLength: 12)
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(state.insights.answer, forType: .string)
+                }
+                Button("Ask again") { Task { await coordinator.answerQuestion() } }
+                    .disabled(state.insights.isGenerating)
+            }
+            .hushnoteButton(.quiet)
+            .padding(.top, 14)
+        }
+    }
+
+    private var rejectedCitationsMessage: String {
+        let count = state.insights.rejectedCitations
+        return count == 1
+            ? "1 quote the model offered wasn't in the transcript and was removed."
+            : "\(count) quotes the model offered weren't in the transcript and were removed."
+    }
+
+    // MARK: - Disclosure
+
+    private var disclosureValue: AskDisclosurePolicy.Disclosure {
+        AskDisclosurePolicy.disclosure(
+            provider: state.selectedProvider,
+            model: nil,
+            transcriptDuration: state.transcript.last?.end ?? 0,
+            wordCount: state.transcript.reduce(0) { $0 + $1.text.split(separator: " ").count }
+        )
+    }
+
+    private var disclosure: some View {
+        let disclosure = disclosureValue
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HushnoteBadge(
+                title: disclosure.badge,
+                tone: disclosure.reach == .onDevice ? .positive : .alert
+            )
+            Text(disclosure.providerLine)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(HushnoteTheme.ink)
+            Text(disclosure.detail)
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
+            Button(disclosure.actionTitle) { coordinator.setSelection(.settings) }
+                .hushnoteButton(.quiet)
+                .padding(.leading, -10)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(disclosure.badge). \(disclosure.providerLine). \(disclosure.detail)")
+    }
+
+    private var rail: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            VStack(alignment: .leading, spacing: 10) {
+                HushnoteEyebrow("Asks")
+                disclosure
+            }
+
+            if !state.transcript.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HushnoteEyebrow("This meeting")
+                    Text(DurationText.clock(state.transcript.last?.end ?? 0))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                    Text("\(state.transcript.count) lines")
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                    Text(state.insights.answer.isEmpty ? "No summary yet" : "Summary generated")
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+            }
+        }
+    }
+}
+
+/// One quote behind an answer: when it was said, and the words themselves,
+/// already proven present in the transcript by `CitationValidator`.
+private struct AskEvidenceBlock: View {
+    let citation: EvidenceCitation
+    let reveal: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Rectangle()
+                .fill(HushnoteTheme.moss.opacity(0.55))
+                .frame(width: 2)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 8) {
+                TimestampButton(
+                    seconds: TimeInterval(citation.startMilliseconds) / 1_000,
+                    action: reveal
+                )
+                Text(citation.quote)
+                    .font(HushnoteTheme.Font.quotation)
+                    .foregroundStyle(HushnoteTheme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                Button("Show in transcript", action: reveal)
+                    .hushnoteButton(.quiet)
+                    .font(.caption)
+                    .padding(.leading, -10)
+            }
+        }
+        .accessibilityElement(children: .contain)
     }
 }

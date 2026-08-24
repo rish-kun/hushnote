@@ -377,8 +377,16 @@ struct InsightWorkspaceState: Equatable {
     var decisions: [String] = []
     var actions: [String] = []
     var openQuestions: [String] = []
+    var question = ""
     var answer = ""
-    var answerTimestamps: [TimeInterval] = []
+    /// The quotes behind the answer, each already proven word-for-word present
+    /// in the transcript by `CitationValidator`. These used to be reduced to
+    /// bare start times and the quotes thrown away -- which discarded the one
+    /// thing that makes a grounded answer checkable.
+    var answerCitations: [EvidenceCitation] = []
+    /// Quotes the model offered that were *not* in the transcript, and were
+    /// removed. Worth showing: it is the product's whole thesis, demonstrated.
+    var rejectedCitations = 0
     var isGenerating = false
     var generationStage: InsightGenerationStage?
     var generationProgress = 0.0
@@ -447,6 +455,13 @@ enum InsightProviderChoice: String, CaseIterable, Identifiable {
 
     var id: Self { self }
     var isLocal: Bool { self == .local }
+    var displayName: String { rawValue }
+
+    /// A coding-agent CLI runs on this Mac and then sends the transcript
+    /// onward. "Local command" is not "local", and the disclosure has to say so.
+    var isAgentCLI: Bool {
+        self == .claudeCLI || self == .codexCLI || self == .opencodeCLI
+    }
 
     var stableID: String {
         switch self {

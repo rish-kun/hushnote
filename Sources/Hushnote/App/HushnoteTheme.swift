@@ -161,6 +161,10 @@ enum HushnoteTheme {
         static let readingLarge = SwiftUI.Font.system(size: 18, design: .serif)
         /// An empty state's headline.
         static let emptyStateTitle = SwiftUI.Font.system(size: 20, weight: .medium)
+        /// Speech quoted inside an answer. Serif, because it is transcript
+        /// prose; smaller than `reading`, because it supports the answer
+        /// rather than competing with it.
+        static let quotation = SwiftUI.Font.system(size: 15, design: .serif)
         /// A section label. Uppercased at the call site by `.textCase`, never
         /// by shouting in the string literal -- that does not translate.
         static let eyebrow = SwiftUI.Font.caption2.weight(.bold)
