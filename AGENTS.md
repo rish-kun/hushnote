@@ -108,8 +108,61 @@ layer that knows about all three.
 - **`UI/`** — SwiftUI views only. Pure decision logic lives in testable
   `enum` policy types beside the views (`ModelListPolicy`,
   `TranscriptEditPolicy`, `TranscriptGrouping`, `LiveTranscriptionPolicy`,
-  `AdaptiveLayoutPolicy`), which is how UI behaviour gets covered without
-  driving a view hierarchy.
+  `AdaptiveLayoutPolicy`, `NotesPagePolicy`, `AskSuggestionPolicy`), which is
+  how UI behaviour gets covered without driving a view hierarchy.
+
+### The workspace reading spread
+
+`TranscriptLayout` (`UI/TranscriptGrouping.swift`) is the geometry the meeting
+workspace reads on, shared by the Transcript and Notes tabs so switching
+between them never slides the text sideways. Ask composes the same measure and
+rail gap by hand.
+
+    gutter · margin (64) · gap (24) · measure (704) · railGap (44) · rail (232) · gutter
+
+Container-aware rather than tier-aware: the apparatus margin appears at 856pt
+and the index at 1180pt, neither of which is an `AdaptiveLayoutPolicy`
+boundary.
+
+**`readerWidth` is load-bearing.** It is finite exactly when an index sits
+beside the prose, and the reading pane must be capped to it. Letting the reader
+expand to the pane while the index stayed pinned to the trailing edge is what
+put ~470pt of nothing between a paragraph and the entry indexing it at a
+1650pt window, and stranded the reader's scroll indicator mid-page. The surplus
+belongs *outside* the spread as page margin, not inside it. Never widen
+`measure` to fill a container either — 704 is why the transcript is readable,
+and `TranscriptLayoutTests` asserts it does not move.
+
+Two more rules the transcript encodes:
+
+- **The opening chapter draws no header.** `TranscriptChapterHeader(isOpening:)`
+  renders a zero-height anchor instead of its rule and clock. A document begins
+  rather than being ruled off from what is above it, and the first paragraph's
+  margin already carries `00:00`. The anchor must stay: `ChapterOffsetKey` and
+  `TranscriptChapterVisibility` still measure the reader's position from it.
+- **The index is one line per chapter** — time, then opening words. It carried
+  a `TimestampButton` capsule nested inside `HushnoteSelectableRow`'s own
+  button (two hit targets doing one thing) plus a speaker list and two lines of
+  preview prose, which made it a second column of body copy competing with the
+  transcript. Voices survive as a count in the rail's foot.
+
+### The notes page
+
+`MeetingNotesView` writes directly on the page: no fill, no stroke, no corner
+radius. The stroked, raised `RoundedRectangle` it used to sit in was the last
+unmistakably-platform control in the app, on the one route whose whole purpose
+is writing. Its apparatus margin is deliberately empty — it exists only to
+align notes prose with transcript prose.
+
+`AppViewState.notesSaving` carries `AppCoordinator`'s in-flight debounced write
+out to the view, so the page reports "Saving…" / "Saved" instead of printing
+the standing promise "Saved automatically to this meeting". `NotesPagePolicy`
+holds that decision and the word count.
+
+Known gap, deliberately not closed here: **Notes is unreachable while a meeting
+is recording.** `MeetingWorkspaceView` routes to `ActiveMeetingView`, which has
+no tab bar. Until that changes the placeholder must not advertise writing
+during a meeting.
 
 ### Meeting management: folders, unfiled, and Recently Deleted
 
@@ -397,9 +450,10 @@ gradients, glass dashboards, uniform card grids, and generic chatbot styling.
 Use `HushnoteTheme` tokens (paper, ink, vermilion, moss, rule, canvas,
 navigationSurface, controlSurface, selectionSurface); never raw colors.
 
-`docs/plans/` holds dated design documents for major features. The two current
-ones — `2026-08-23-folders-responsive-redesign-design.md` and
-`2026-08-24-unified-sidebar-meeting-canvas-design.md` — describe the folder/
-Recently Deleted information architecture and the single-detail-canvas surface
-contract respectively; the second explicitly supplements rather than replaces
-the first.
+`docs/plans/` holds dated design documents for major features. The three
+current ones — `2026-08-23-folders-responsive-redesign-design.md`,
+`2026-08-24-unified-sidebar-meeting-canvas-design.md` and
+`2026-08-25-notes-and-transcript-reading-design.md` — describe the folder/
+Recently Deleted information architecture, the single-detail-canvas surface
+contract, and the workspace reading spread respectively. Each supplements
+rather than replaces the one before it.

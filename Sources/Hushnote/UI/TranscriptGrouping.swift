@@ -362,6 +362,10 @@ enum TranscriptChapterVisibility {
 
 /// Where the reading column, its apparatus margin, and the index sit.
 ///
+/// The workspace's reading spread, shared by the transcript and the notes page
+/// so that switching between those tabs never moves the text sideways. Ask
+/// composes the same measure and rail gap by hand.
+///
 /// Container-aware rather than tier-aware: the margin appears as soon as there
 /// is room for it, which happens partway through the regular tier rather than
 /// at one of `AdaptiveLayoutPolicy`'s boundaries.
@@ -373,17 +377,31 @@ struct TranscriptLayout: Equatable, Sendable {
     var measure: CGFloat
     var showsIndexRail: Bool
     var railWidth: CGFloat
+    var railGap: CGFloat
 
     static let margin: CGFloat = 64
     static let marginGap: CGFloat = 24
     static let rail: CGFloat = 232
-    static let railMinimumGap: CGFloat = 40
+    /// Matches the gap `AskMeetingView` puts between its column and its rail,
+    /// because the two are the same spread seen on two tabs.
+    static let railGap: CGFloat = 44
 
     var hasMargin: Bool { marginWidth > 0 }
 
     /// The reading column plus whatever apparatus hangs beside it.
     var columnWidth: CGFloat {
         hasMargin ? marginWidth + marginGap + measure : measure
+    }
+
+    /// How wide the reading pane may grow, or `nil` for "take what is left".
+    ///
+    /// Finite exactly when an index sits beside the prose. Letting the reader
+    /// expand while the index was pinned to the trailing edge put roughly 470
+    /// points of nothing between a paragraph and the entry that indexes it,
+    /// and stranded the reader's own scroll indicator in the middle of the
+    /// page. The surplus belongs outside the spread, as page margin.
+    var readerWidth: CGFloat? {
+        showsIndexRail ? gutter + columnWidth + railGap : nil
     }
 
     nonisolated static func resolve(availableWidth: CGFloat) -> Self {
@@ -395,7 +413,7 @@ struct TranscriptLayout: Equatable, Sendable {
         let content = availableWidth - 2 * gutter
         let fitsMargin = content >= marginCost + measure
         let fitsRail = policy.showsRightRail
-            && content >= marginCost + measure + railMinimumGap + rail
+            && content >= marginCost + measure + railGap + rail
 
         return TranscriptLayout(
             gutter: gutter,
@@ -405,7 +423,8 @@ struct TranscriptLayout: Equatable, Sendable {
             // fills a narrow window rather than leaving a ragged right edge.
             measure: policy == .compact ? .infinity : measure,
             showsIndexRail: fitsRail,
-            railWidth: rail
+            railWidth: rail,
+            railGap: railGap
         )
     }
 }

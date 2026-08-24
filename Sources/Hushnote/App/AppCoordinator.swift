@@ -602,6 +602,7 @@ final class AppCoordinator {
 
     func queueMeetingNotes(meetingID: UUID, text: String) {
         state.meetingNotes[meetingID] = text
+        state.notesSaving.insert(meetingID)
         pendingNoteTasks[meetingID]?.cancel()
         pendingNoteTasks[meetingID] = Task { [weak self] in
             do {
@@ -609,9 +610,13 @@ final class AppCoordinator {
                 guard let self else { return }
                 try await self.store.updateMeetingNotes(id: meetingID, notes: text)
                 self.pendingNoteTasks[meetingID] = nil
+                self.state.notesSaving.remove(meetingID)
             } catch is CancellationError {
+                // Superseded by a later keystroke, which is still unwritten:
+                // the flag belongs to the successor now, not to this task.
                 return
             } catch {
+                self?.state.notesSaving.remove(meetingID)
                 self?.state.report(.noteSave, error.localizedDescription)
             }
         }
@@ -942,6 +947,7 @@ final class AppCoordinator {
             state.recentlyDeletedMeetings.removeAll { $0.id == id }
             cachedSegments[id] = nil
             state.meetingNotes[id] = nil
+            state.notesSaving.remove(id)
             state.meetingWorkspaceTabs[id] = nil
         } catch {
             state.report(.meetingDelete, error.localizedDescription)

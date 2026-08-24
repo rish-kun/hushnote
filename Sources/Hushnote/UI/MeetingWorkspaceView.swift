@@ -402,7 +402,7 @@ struct CompletedMeetingView: View {
     @ViewBuilder
     private func workspaceTab(_ policy: AdaptiveLayoutPolicy) -> some View {
         switch state.workspaceTab(for: meetingID) {
-        case .notes: MeetingNotesView(meetingID: meetingID, horizontalInset: policy.gutter)
+        case .notes: MeetingNotesView(meetingID: meetingID)
         case .summary: summaryWorkspace(policy)
         case .transcript:
             TranscriptView(
@@ -838,57 +838,142 @@ private struct InsightGenerationStatusView: View {
     }
 }
 
+/// The page you write on.
+///
+/// It used to be a `TextEditor` fenced in a stroked, raised rounded rectangle
+/// floating on the shell's paper -- the last unmistakably-platform control in
+/// the app, and the only one on a route whose entire purpose is writing. A box
+/// with a border says "fill this in". Every other route in Hushnote writes
+/// directly on the page, and so does this one now.
+///
+/// It resolves the same `TranscriptLayout` the transcript does, so notes prose
+/// and transcript prose begin at the same x and switching tabs never slides
+/// the text sideways. The apparatus margin is deliberately left empty: there
+/// is no per-line apparatus for a note, and the column costs nothing but the
+/// alignment it buys.
 struct MeetingNotesView: View {
     let meetingID: UUID
-    let horizontalInset: CGFloat
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
+    private var notes: String { state.meetingNotes[meetingID, default: ""] }
+
     var body: some View {
-        @Bindable var state = state
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Working notes")
-                        .font(HushnoteTheme.Font.sectionTitle)
-                    Text("Saved automatically to this meeting")
+        GeometryReader { proxy in
+            let layout = TranscriptLayout.resolve(availableWidth: proxy.size.width)
+
+            HStack(alignment: .top, spacing: 0) {
+                page(layout)
+                    .frame(maxWidth: layout.readerWidth ?? .infinity, alignment: .leading)
+
+                if layout.showsIndexRail {
+                    rail
+                        .frame(width: layout.railWidth, alignment: .leading)
+                        .padding(.top, 34)
+                        .padding(.trailing, layout.gutter)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private func page(_ layout: TranscriptLayout) -> some View {
+        HStack(alignment: .top, spacing: layout.marginGap) {
+            if layout.hasMargin {
+                // Empty, and kept: it is what puts the first character of a
+                // note directly under the first character of the transcript.
+                Color.clear
+                    .frame(width: layout.marginWidth, height: 0)
+                    .accessibilityHidden(true)
+            }
+            editor
+                .frame(maxWidth: layout.measure, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.horizontal, layout.gutter)
+        .padding(.top, 30)
+        .padding(.bottom, 32)
+    }
+
+    private var editor: some View {
+        TextEditor(text: Binding(
+            get: { notes },
+            set: { coordinator.queueMeetingNotes(meetingID: meetingID, text: $0) }
+        ))
+        .font(HushnoteTheme.Font.reading)
+        .lineSpacing(6)
+        .textEditorStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .frame(maxHeight: .infinity)
+        .overlay(alignment: .topLeading) {
+            if notes.isEmpty {
+                // Deliberately no longer "Write notes while the meeting
+                // runs…": while a meeting runs `MeetingWorkspaceView` routes
+                // to `ActiveMeetingView`, which has no tab bar and therefore
+                // no Notes tab. The old copy advertised something the
+                // navigation cannot reach.
+                Text("Anything worth keeping about this meeting…")
+                    .font(HushnoteTheme.Font.reading)
+                    .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.55))
+                    // Clears `NSTextView`'s own line-fragment padding, so the
+                    // placeholder sits under the caret rather than beside it.
+                    .padding(.leading, 5)
+                    .allowsHitTesting(false)
+            }
+        }
+        .accessibilityLabel("Meeting notes")
+    }
+
+    // MARK: - Rail
+
+    /// The same two sections Ask's rail carries, so the two tabs agree about
+    /// what a meeting's facts are and where they live.
+    private var rail: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            VStack(alignment: .leading, spacing: 8) {
+                HushnoteEyebrow("Notes")
+                saveLine
+                if !notes.isEmpty {
+                    Text(NotesPagePolicy.wordCountLabel(NotesPagePolicy.wordCount(notes)))
                         .font(.caption)
                         .foregroundStyle(HushnoteTheme.secondaryInk)
                 }
-                Spacer()
-                Image(systemName: "square.and.pencil")
-                    .foregroundStyle(HushnoteTheme.moss)
             }
-            TextEditor(text: Binding(
-                get: { state.meetingNotes[meetingID, default: ""] },
-                set: { coordinator.queueMeetingNotes(meetingID: meetingID, text: $0) }
-            ))
-            .font(HushnoteTheme.Font.reading)
-            .lineSpacing(6)
-            .scrollContentBackground(.hidden)
-            .padding(14)
-            .frame(minHeight: 320, maxHeight: .infinity)
-            .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(HushnoteTheme.rule.opacity(0.9))
-            }
-            .overlay(alignment: .topLeading) {
-                if state.meetingNotes[meetingID, default: ""].isEmpty {
-                    Text("Write notes while the meeting runs…")
-                        .font(HushnoteTheme.Font.reading)
-                        .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.62))
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 22)
-                        .allowsHitTesting(false)
+
+            if !state.transcript.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    HushnoteEyebrow("This meeting")
+                    Text(DurationText.clock(state.transcript.last?.end ?? 0))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                    Text("\(state.transcript.count) lines")
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                    Text(state.insights.summary.isEmpty ? "No summary yet" : "Summary generated")
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
                 }
             }
-            .accessibilityLabel("Meeting notes")
         }
-        .frame(maxWidth: HushnoteTheme.transcriptMeasure, maxHeight: .infinity, alignment: .topLeading)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, horizontalInset)
-        .padding(.vertical, 28)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("About these notes")
+    }
+
+    @ViewBuilder
+    private var saveLine: some View {
+        switch NotesPagePolicy.saveState(
+            text: notes,
+            isSaving: state.notesSaving.contains(meetingID)
+        ) {
+        case .blank:
+            Text("Nothing written yet")
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+        case .saving:
+            HushnoteStatusLine(text: "Saving…", tone: .working)
+        case .saved:
+            HushnoteStatusLine(text: "Saved to this meeting", tone: .good)
+        }
     }
 }
 
@@ -1010,6 +1095,10 @@ struct TranscriptView: View {
                     liveParagraph: liveParagraph,
                     layout: layout
                 )
+                // Capped where an index follows, so the index stays beside the
+                // prose instead of being pinned to the window edge with a hole
+                // between the two. See `TranscriptLayout.readerWidth`.
+                .frame(maxWidth: layout.readerWidth ?? .infinity, alignment: .leading)
 
                 if layout.showsIndexRail, !chapters.isEmpty {
                     TranscriptIndexRail(
@@ -1055,19 +1144,26 @@ struct TranscriptView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(paragraphs) { paragraph in
                         if paragraph.opensSection, let start = paragraph.timestamp {
-                            TranscriptChapterHeader(start: start, layout: layout)
-                                .id(chapterHeaderID(paragraph.id))
-                                // Reports where this chapter sits relative to
-                                // the top edge, which is what tells the rail
-                                // where the reader is.
-                                .background {
-                                    GeometryReader { header in
-                                        Color.clear.preference(
-                                            key: ChapterOffsetKey.self,
-                                            value: [paragraph.id: header.frame(in: .named(scrollSpace)).minY]
-                                        )
-                                    }
+                            TranscriptChapterHeader(
+                                start: start,
+                                layout: layout,
+                                isOpening: paragraph.id == paragraphs.first?.id
+                            )
+                            .id(chapterHeaderID(paragraph.id))
+                            // Reports where this chapter sits relative to the
+                            // top edge, which is what tells the rail where the
+                            // reader is. Kept even for the opening chapter,
+                            // whose header draws nothing: a zero-height anchor
+                            // still reports, so the index still measures from
+                            // the start of the meeting.
+                            .background {
+                                GeometryReader { header in
+                                    Color.clear.preference(
+                                        key: ChapterOffsetKey.self,
+                                        value: [paragraph.id: header.frame(in: .named(scrollSpace)).minY]
+                                    )
                                 }
+                            }
                         }
 
                         TranscriptParagraphView(
@@ -1229,8 +1325,23 @@ private struct ChapterOffsetKey: PreferenceKey {
 private struct TranscriptChapterHeader: View {
     let start: TimeInterval
     let layout: TranscriptLayout
+    /// The first chapter of the meeting, which is not drawn.
+    var isOpening = false
 
     var body: some View {
+        if isOpening {
+            // A document begins; it is not ruled off from whatever is above
+            // it. Drawing this one put a rule across the top of every
+            // transcript with nothing over it, and printed `00:00` seventy
+            // points above the identical `00:00` in the first paragraph's
+            // margin. The anchor survives so the index can still point here.
+            Color.clear.frame(height: 0)
+        } else {
+            rule
+        }
+    }
+
+    private var rule: some View {
         HStack(alignment: .firstTextBaseline, spacing: layout.marginGap) {
             if layout.hasMargin {
                 Text(DurationText.clock(start))
@@ -1329,31 +1440,42 @@ private struct TranscriptIndexRail: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(chapters) { chapter in
+                        let isCurrent = chapter.id == currentChapterID
+
                         HushnoteSelectableRow(
-                            isSelected: chapter.id == currentChapterID,
+                            isSelected: isCurrent,
                             select: { state.transcriptJumpRequest = .init(paragraphID: chapter.id) }
                         ) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 7) {
-                                    // A capsule here, unlike the margin: this
-                                    // one really does go somewhere.
-                                    TimestampButton(seconds: chapter.start) {
-                                        state.transcriptJumpRequest = .init(paragraphID: chapter.id)
-                                    }
-                                    if !chapter.speakers.isEmpty {
-                                        Text(chapter.speakers.joined(separator: ", "))
-                                            .font(.caption2)
-                                            .foregroundStyle(HushnoteTheme.secondaryInk)
-                                            .lineLimit(1)
-                                    }
-                                }
+                            // One line, the way an index line is: a number and
+                            // a heading. It used to carry a timestamp capsule,
+                            // the speaker list and two lines of preview prose,
+                            // which made seven of them a second column of body
+                            // copy competing with the one being read. The
+                            // speaker lists in particular said
+                            // "Speaker 1, Speaker 2 / Speaker 2 / Speaker 2,
+                            // Speaker 1" -- repetition, not information. The
+                            // voices survive in the foot, counted.
+                            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                                Text(DurationText.clock(chapter.start))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(
+                                        isCurrent ? HushnoteTheme.ink : HushnoteTheme.secondaryInk
+                                    )
                                 Text(chapter.opening)
                                     .font(.caption)
-                                    .foregroundStyle(HushnoteTheme.secondaryInk)
-                                    .lineLimit(2)
-                                    .multilineTextAlignment(.leading)
+                                    .foregroundStyle(
+                                        isCurrent ? HushnoteTheme.ink : HushnoteTheme.secondaryInk
+                                    )
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
                             }
                         }
+                        // The row is the target. A `TimestampButton` nested
+                        // inside `HushnoteSelectableRow`'s own button gave one
+                        // entry two overlapping hit areas doing the same thing.
+                        .accessibilityLabel(
+                            "\(DurationText.spoken(chapter.start)). \(chapter.opening)"
+                        )
                     }
                 }
             }
@@ -1934,7 +2056,7 @@ struct AskMeetingView: View {
                     Text("\(state.transcript.count) lines")
                         .font(.caption)
                         .foregroundStyle(HushnoteTheme.secondaryInk)
-                    Text(state.insights.answer.isEmpty ? "No summary yet" : "Summary generated")
+                    Text(state.insights.summary.isEmpty ? "No summary yet" : "Summary generated")
                         .font(.caption)
                         .foregroundStyle(HushnoteTheme.secondaryInk)
                 }

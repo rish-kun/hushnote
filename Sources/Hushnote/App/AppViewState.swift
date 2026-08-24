@@ -612,6 +612,11 @@ final class AppViewState {
     var question = ""
     var recordingNotice: String?
     var meetingNotes: [UUID: String] = [:]
+    /// Meetings whose notes have a keystroke that has not reached the database
+    /// yet. The debounce and the write already existed in `AppCoordinator`;
+    /// only the page had no way to see them, so it printed the standing
+    /// promise "Saved automatically to this meeting" instead of the state.
+    var notesSaving: Set<UUID> = []
     var finalizationStage: FinalizationStage?
     var finalizationDetail: String?
     var alert: AppAlert?
