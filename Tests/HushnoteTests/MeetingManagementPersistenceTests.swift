@@ -6,6 +6,7 @@ import XCTest
 
 final class MeetingManagementPersistenceTests: XCTestCase {
     private static let beforeSummaryVersions = "v6_repair_transcript_pollution"
+    private static let beforeFolders = "v7_summary_versions_and_trash"
 
     private func output(_ summary: String) -> ValidatedMeetingInsights {
         ValidatedMeetingInsights(
@@ -35,6 +36,141 @@ final class MeetingManagementPersistenceTests: XCTestCase {
         }
         await XCTAssertThrowsErrorAsync {
             try await store.updateMeetingTitle(id: meeting.id, title: String(repeating: "x", count: 201))
+        }
+    }
+
+    func testFoldersNormalizeNamesSortAndProvideBulkCounts() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let zeta = try await store.createMeetingFolder(name: "  Žeta  ")
+        let alpha = try await store.createMeetingFolder(name: "Alpha")
+        let empty = try await store.createMeetingFolder(name: "Empty")
+
+        let folders = try await store.meetingFolders()
+        XCTAssertEqual(folders.map(\.id), [alpha.id, empty.id, zeta.id])
+        do {
+            _ = try await store.createMeetingFolder(name: "zeta")
+            XCTFail("Expected case- and diacritic-insensitive duplicate rejection")
+        } catch let error as Hushnote.PersistenceError {
+            XCTAssertEqual(error, .duplicateFolderName("zeta"))
+        }
+        for invalid in [" \n", String(repeating: "a", count: 81)] {
+            do {
+                _ = try await store.createMeetingFolder(name: invalid)
+                XCTFail("Expected folder name validation")
+            } catch let error as Hushnote.PersistenceError {
+                if case .invalidFolderName = error { } else { XCTFail("Unexpected \(error)") }
+            }
+        }
+
+        let one = Meeting(title: "One", folderID: alpha.id)
+        let two = Meeting(title: "Two", folderID: alpha.id)
+        let three = Meeting(title: "Three", folderID: zeta.id)
+        try await store.saveMeeting(one)
+        try await store.saveMeeting(two)
+        try await store.saveMeeting(three)
+        try await store.softDeleteMeeting(id: two.id)
+
+        let bulk = try await store.meetings(inFolders: [alpha.id, empty.id, zeta.id])
+        XCTAssertEqual(bulk[alpha.id]?.map(\.id), [one.id])
+        XCTAssertEqual(bulk[empty.id], [])
+        XCTAssertEqual(bulk[zeta.id]?.map(\.id), [three.id])
+        let counts = try await store.meetingFolderCounts(folderIDs: [alpha.id, empty.id, zeta.id])
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: counts.map { ($0.folderID, $0.meetingCount) }), [
+            alpha.id: 1,
+            empty.id: 0,
+            zeta.id: 1,
+        ])
+    }
+
+    func testMovingRecordingMeetingDoesNotChangeTimestampAndSoftDeleteRetainsFolder() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let folder = try await store.createMeetingFolder(name: "Clients")
+        let originalDate = Date(timeIntervalSince1970: 123)
+        let meeting = Meeting(title: "Live", updatedAt: originalDate, status: .recording)
+        try await store.saveMeeting(meeting)
+
+        try await store.moveMeeting(id: meeting.id, toFolder: folder.id)
+        let moved = try await store.meeting(id: meeting.id)
+        var stored = try XCTUnwrap(moved)
+        XCTAssertEqual(stored.folderID, folder.id)
+        XCTAssertEqual(stored.updatedAt, originalDate)
+        XCTAssertEqual(stored.status, .recording)
+
+        try await store.softDeleteMeeting(id: meeting.id, at: Date(timeIntervalSince1970: 456))
+        try await store.restoreMeeting(id: meeting.id, at: Date(timeIntervalSince1970: 789))
+        let restored = try await store.meeting(id: meeting.id)
+        stored = try XCTUnwrap(restored)
+        XCTAssertEqual(stored.folderID, folder.id)
+        XCTAssertNil(stored.deletedAt)
+    }
+
+    func testDeletingFolderUnfilesActiveAndDeletedMeetingsWithoutDeletingThem() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let folder = try await store.createMeetingFolder(name: "Archive")
+        let active = Meeting(title: "Active", folderID: folder.id)
+        let deleted = Meeting(title: "Deleted", folderID: folder.id)
+        try await store.saveMeeting(active)
+        try await store.saveMeeting(deleted)
+        try await store.softDeleteMeeting(id: deleted.id)
+
+        try await store.deleteMeetingFolder(id: folder.id)
+
+        let activeFolder = try await store.meetingFolder(id: folder.id)
+        let deletedFolder = try await store.meetingFolder(id: folder.id, includeDeleted: true)
+        let activeMeeting = try await store.meeting(id: active.id)
+        let deletedMeeting = try await store.meeting(id: deleted.id)
+        let unfiled = try await store.unfiledMeetings()
+        let unfiledCount = try await store.unfiledMeetingCount()
+        let recentlyDeleted = try await store.recentlyDeleted()
+        XCTAssertNil(activeFolder)
+        XCTAssertNotNil(deletedFolder)
+        XCTAssertNil(activeMeeting?.folderID)
+        XCTAssertNil(deletedMeeting?.folderID)
+        XCTAssertEqual(unfiled.map(\.id), [active.id])
+        XCTAssertEqual(unfiledCount, 1)
+        XCTAssertEqual(recentlyDeleted.map(\.id), [deleted.id])
+
+        try await store.restoreMeetingFolder(id: folder.id)
+        let restoredFolder = try await store.meetingFolder(id: folder.id)
+        let restoredMeeting = try await store.meeting(id: active.id)
+        XCTAssertNotNil(restoredFolder)
+        XCTAssertNil(restoredMeeting?.folderID)
+    }
+
+    func testFolderMigrationLeavesLegacyMeetingsUnfiledAndCreatesIndexes() throws {
+        let queue = try DatabaseQueue()
+        try HushnoteDatabaseMigrations.migrator.migrate(queue, upTo: Self.beforeFolders)
+        let meetingID = UUID()
+        try queue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO meetings (id, title, notes, createdAt, updatedAt, status, retainsAudio)
+                    VALUES (?, 'Legacy', '', ?, ?, 'ready', 0)
+                    """,
+                arguments: [meetingID.uuidString, Date(timeIntervalSince1970: 0), Date(timeIntervalSince1970: 0)]
+            )
+        }
+
+        try HushnoteDatabaseMigrations.migrator.migrate(queue)
+
+        try queue.read { db in
+            let folderID: String? = try String.fetchOne(
+                db,
+                sql: "SELECT folderID FROM meetings WHERE id = ?",
+                arguments: [meetingID.uuidString]
+            )
+            XCTAssertNil(folderID)
+            let indexes = try String.fetchAll(
+                db,
+                sql: "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('meetings', 'meetingFolders')"
+            )
+            XCTAssertTrue(indexes.contains("meetings_on_folderID"))
+            XCTAssertTrue(indexes.contains("meetings_on_folderID_deletedAt_updatedAt"))
+            XCTAssertTrue(indexes.contains("meetingFolders_active_alphabetical"))
+            let foreignKeys = try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(meetings)")
+            XCTAssertTrue(foreignKeys.contains {
+                ($0["from"] as String) == "folderID" && ($0["on_delete"] as String).uppercased() == "SET NULL"
+            })
         }
     }
 

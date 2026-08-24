@@ -1,5 +1,23 @@
 import Foundation
 
+/// The app-level appearance override. System leaves the palette under macOS'
+/// control; the other values explicitly override it for every Hushnote scene.
+enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
+    case system
+    case light
+    case dark
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+}
+
 /// Durable, non-secret application preferences.
 ///
 /// Credentials deliberately do not have a representation here; they remain in
@@ -13,7 +31,13 @@ struct AppPreferences {
         static let sidebarDestination = "workspace.sidebarDestination"
         static let meetingTabs = "workspace.meetingTabs"
         static let modelStorageParentPath = "models.storage.parentPath"
+        static let appearance = "appearance.mode"
     }
+
+    /// Shared with the root scene and Settings' observing `@AppStorage`.
+    /// Keeping one key here prevents the UI preference from becoming a second
+    /// persistence system beside `AppPreferences`.
+    static let appearanceUserDefaultsKey = "appearance.mode"
 
     private let defaults: UserDefaults
 
@@ -66,27 +90,47 @@ struct AppPreferences {
         ModelStoragePaths(parentDirectory: modelStorageParentPath.map(URL.init(fileURLWithPath:)))
     }
 
+    /// Missing and malformed values are deliberately treated as System so an
+    /// existing install follows macOS without a migration prompt.
+    var appearance: AppearanceMode {
+        get {
+            guard let raw = defaults.string(forKey: Key.appearance),
+                  let mode = AppearanceMode(rawValue: raw) else { return .system }
+            return mode
+        }
+        nonmutating set { defaults.set(newValue.rawValue, forKey: Key.appearance) }
+    }
+
     var sidebarDestination: SidebarDestination? {
         get {
             guard let raw = defaults.string(forKey: Key.sidebarDestination) else { return nil }
             switch raw {
             case "meetings": return .meetings
+            case "unfiled": return .unfiled
+            case "recentlyDeleted": return .recentlyDeleted
             case "models": return .models
             case "settings": return .settings
             case "storage": return .storage
             default:
-                guard raw.hasPrefix("meeting:"),
-                      let id = UUID(uuidString: String(raw.dropFirst("meeting:".count))) else { return nil }
-                return .meeting(id)
+                if raw.hasPrefix("meeting:"),
+                   let id = UUID(uuidString: String(raw.dropFirst("meeting:".count))) {
+                    return .meeting(id)
+                }
+                guard raw.hasPrefix("folder:"),
+                      let id = UUID(uuidString: String(raw.dropFirst("folder:".count))) else { return nil }
+                return .folder(id)
             }
         }
         nonmutating set {
             let raw: String? = switch newValue {
             case .meetings: "meetings"
+            case .unfiled: "unfiled"
+            case .recentlyDeleted: "recentlyDeleted"
             case .models: "models"
             case .settings: "settings"
             case .storage: "storage"
             case .meeting(let id): "meeting:\(id.uuidString)"
+            case .folder(let id): "folder:\(id.uuidString)"
             case nil: nil
             }
             defaults.set(raw, forKey: Key.sidebarDestination)

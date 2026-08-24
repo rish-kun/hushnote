@@ -17,6 +17,7 @@ struct AppPreferencesTests {
         #expect(preferences.retainAudio)
         #expect(preferences.selectedProvider == .local)
         #expect(preferences.modelStorageParentPath == nil)
+        #expect(preferences.appearance == .system)
     }
 
     @Test("Explicit settings survive a fresh preferences value")
@@ -27,6 +28,7 @@ struct AppPreferencesTests {
         preferences.localModelPath = "/models/quiet.gguf"
         preferences.llamaExecutablePath = "/usr/local/bin/llama-server"
         preferences.modelStorageParentPath = "/Volumes/Models/../Models"
+        preferences.appearance = .dark
 
         let restored = AppPreferences(defaults: defaults)
         #expect(restored.retainAudio == false)
@@ -35,6 +37,20 @@ struct AppPreferencesTests {
         #expect(restored.llamaExecutablePath == "/usr/local/bin/llama-server")
         #expect(restored.modelStorageParentPath == "/Volumes/Models")
         #expect(restored.modelStoragePaths.whisperDownloadBase?.path == "/Volumes/Models/Hushnote Models/WhisperKit")
+        #expect(restored.appearance == .dark)
+    }
+
+    @Test("Malformed appearance values fall back to System")
+    func appearanceFallback() {
+        let (defaults, preferences) = scratch()
+        defaults.set("sepia", forKey: AppPreferences.appearanceUserDefaultsKey)
+        #expect(preferences.appearance == .system)
+
+        for mode in AppearanceMode.allCases {
+            preferences.appearance = mode
+            #expect(AppPreferences(defaults: defaults).appearance == mode)
+            #expect(defaults.string(forKey: AppPreferences.appearanceUserDefaultsKey) == mode.rawValue)
+        }
     }
 
     @Test("Provider storage uses stable identifiers and rejects unknown values")
@@ -62,5 +78,20 @@ struct AppPreferencesTests {
         #expect(restored.meetingTabs[kept] == .summary)
         #expect(restored.pruneMeetingTabs(keeping: [kept]) == [kept: .summary])
         #expect(restored.meetingTabs[removed] == nil)
+    }
+
+    @Test("Folder, Unfiled, and Recently Deleted destinations round-trip")
+    func folderDestinations() {
+        let (defaults, preferences) = scratch()
+        let folderID = UUID()
+
+        preferences.sidebarDestination = .folder(folderID)
+        #expect(AppPreferences(defaults: defaults).sidebarDestination == .folder(folderID))
+        #expect(defaults.string(forKey: "workspace.sidebarDestination") == "folder:\(folderID.uuidString)")
+
+        preferences.sidebarDestination = .unfiled
+        #expect(AppPreferences(defaults: defaults).sidebarDestination == .unfiled)
+        preferences.sidebarDestination = .recentlyDeleted
+        #expect(AppPreferences(defaults: defaults).sidebarDestination == .recentlyDeleted)
     }
 }

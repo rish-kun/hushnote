@@ -35,6 +35,9 @@ public actor MeetingStore {
 
     public func saveMeeting(_ meeting: Meeting) throws {
         try database.write { db in
+            if let folderID = meeting.folderID {
+                try Self.requireActiveFolder(folderID, in: db)
+            }
             try MeetingRecord(meeting).save(db)
         }
     }
@@ -52,6 +55,213 @@ public actor MeetingStore {
                 .order(Column("updatedAt").desc)
             if let limit { request = request.limit(limit) }
             return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    /// Active meetings in one folder. Passing no folder is intentionally not
+    /// supported here: `meetings()` is the global list and `unfiledMeetings()`
+    /// names the null-folder query at its call site.
+    public func meetings(inFolder folderID: UUID, limit: Int? = nil) throws -> [Meeting] {
+        try database.read { db in
+            var request = MeetingRecord
+                .filter(Column("deletedAt") == nil)
+                .filter(Column("folderID") == folderID.uuidString)
+                .order(Column("updatedAt").desc)
+            if let limit { request = request.limit(limit) }
+            return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    public func unfiledMeetings(limit: Int? = nil) throws -> [Meeting] {
+        try database.read { db in
+            var request = MeetingRecord
+                .filter(Column("deletedAt") == nil)
+                .filter(Column("folderID") == nil)
+                .order(Column("updatedAt").desc)
+            if let limit { request = request.limit(limit) }
+            return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    /// Fetches several folder lists in one read transaction. Empty folders are
+    /// represented with an empty array so callers can render every requested
+    /// folder without joining their result back to the input themselves.
+    public func meetings(inFolders folderIDs: Set<UUID>) throws -> [UUID: [Meeting]] {
+        guard !folderIDs.isEmpty else { return [:] }
+        return try database.read { db in
+            let ids = folderIDs.map(\.uuidString)
+            let records = try MeetingRecord
+                .filter(Column("deletedAt") == nil)
+                .filter(ids.contains(Column("folderID")))
+                .order(Column("folderID"), Column("updatedAt").desc)
+                .fetchAll(db)
+            var grouped = Dictionary(uniqueKeysWithValues: folderIDs.map { ($0, [Meeting]()) })
+            for record in records {
+                let meeting = try record.model()
+                if let folderID = meeting.folderID { grouped[folderID, default: []].append(meeting) }
+            }
+            return grouped
+        }
+    }
+
+    // MARK: - Meeting folders
+
+    public func meetingFolder(id: UUID, includeDeleted: Bool = false) throws -> MeetingFolder? {
+        try database.read { db in
+            var request = MeetingFolderRecord.filter(key: id.uuidString)
+            if !includeDeleted { request = request.filter(Column("deletedAt") == nil) }
+            return try request.fetchOne(db)?.model()
+        }
+    }
+
+    /// Active folders in durable alphabetical order. The normal form is used
+    /// for sorting too, so names with accents do not jump to a separate group.
+    public func meetingFolders(includeDeleted: Bool = false) throws -> [MeetingFolder] {
+        try database.read { db in
+            var request = MeetingFolderRecord.order(Column("normalizedName"), Column("id"))
+            if !includeDeleted { request = request.filter(Column("deletedAt") == nil) }
+            return try request.fetchAll(db).map { try $0.model() }
+        }
+    }
+
+    @discardableResult
+    public func createMeetingFolder(
+        name: String,
+        id: UUID = UUID(),
+        at date: Date = Date()
+    ) throws -> MeetingFolder {
+        let name = try Self.validatedFolderName(name)
+        let normalizedName = Self.normalizedFolderName(name)
+        let folder = MeetingFolder(id: id, name: name, createdAt: date, updatedAt: date)
+        try database.write { db in
+            guard try MeetingFolderRecord
+                .filter(Column("normalizedName") == normalizedName)
+                .fetchOne(db) == nil
+            else {
+                throw PersistenceError.duplicateFolderName(name)
+            }
+            try MeetingFolderRecord(folder, normalizedName: normalizedName).insert(db)
+        }
+        return folder
+    }
+
+    public func renameMeetingFolder(
+        id: UUID,
+        name: String,
+        at date: Date = Date()
+    ) throws {
+        let name = try Self.validatedFolderName(name)
+        let normalizedName = Self.normalizedFolderName(name)
+        try database.write { db in
+            guard try MeetingFolderRecord
+                .filter(key: id.uuidString)
+                .filter(Column("deletedAt") == nil)
+                .fetchOne(db) != nil
+            else { throw PersistenceError.folderNotFound(id) }
+            guard try MeetingFolderRecord
+                .filter(Column("normalizedName") == normalizedName)
+                .filter(Column("id") != id.uuidString)
+                .fetchOne(db) == nil
+            else { throw PersistenceError.duplicateFolderName(name) }
+            _ = try MeetingFolderRecord
+                .filter(key: id.uuidString)
+                .updateAll(
+                    db,
+                    Column("name").set(to: name),
+                    Column("normalizedName").set(to: normalizedName),
+                    Column("updatedAt").set(to: date)
+                )
+        }
+    }
+
+    /// Deletion is intentionally folder-only: every associated meeting remains
+    /// in the database and becomes Unfiled, including meetings in the trash.
+    public func deleteMeetingFolder(id: UUID, at date: Date = Date()) throws {
+        try database.write { db in
+            let changed = try MeetingFolderRecord
+                .filter(key: id.uuidString)
+                .filter(Column("deletedAt") == nil)
+                .updateAll(
+                    db,
+                    Column("deletedAt").set(to: date),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.folderNotFound(id) }
+            // Do not touch `updatedAt`: moving organizational metadata must not
+            // reorder a meeting, and deletion is a bulk move to Unfiled.
+            _ = try MeetingRecord
+                .filter(Column("folderID") == id.uuidString)
+                .updateAll(db, Column("folderID").set(to: nil))
+        }
+    }
+
+    public func restoreMeetingFolder(id: UUID, at date: Date = Date()) throws {
+        try database.write { db in
+            let changed = try MeetingFolderRecord
+                .filter(key: id.uuidString)
+                .filter(Column("deletedAt") != nil)
+                .updateAll(
+                    db,
+                    Column("deletedAt").set(to: nil),
+                    Column("updatedAt").set(to: date)
+                )
+            guard changed == 1 else { throw PersistenceError.folderNotFound(id) }
+        }
+    }
+
+    /// Updates exactly the association. It deliberately does not change a
+    /// meeting's `updatedAt`, so this is safe while recording and stable in
+    /// chronological lists.
+    public func moveMeeting(id: UUID, toFolder folderID: UUID?) throws {
+        try database.write { db in
+            if let folderID { try Self.requireActiveFolder(folderID, in: db) }
+            let changed = try MeetingRecord
+                .filter(key: id.uuidString)
+                .updateAll(db, Column("folderID").set(to: folderID?.uuidString))
+            guard changed == 1 else { throw PersistenceError.meetingNotFound(id) }
+        }
+    }
+
+    /// Counts only active meetings. Unlike a SQL join, this also produces a
+    /// zero for each requested empty folder.
+    public func meetingFolderCounts(folderIDs: Set<UUID>? = nil) throws -> [MeetingFolderCount] {
+        try database.read { db in
+            var requested = MeetingFolderRecord.filter(Column("deletedAt") == nil)
+            if let folderIDs {
+                guard !folderIDs.isEmpty else { return [] }
+                requested = requested.filter(folderIDs.map(\.uuidString).contains(Column("id")))
+            }
+            let folders = try requested.order(Column("normalizedName"), Column("id")).fetchAll(db)
+            guard !folders.isEmpty else { return [] }
+            let ids = folders.map(\.id)
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT folderID, COUNT(*) AS meetingCount
+                    FROM meetings
+                    WHERE deletedAt IS NULL AND folderID IN (\(ids.map { _ in "?" }.joined(separator: ", ")))
+                    GROUP BY folderID
+                    """,
+                arguments: StatementArguments(ids)
+            )
+            let counts = Dictionary(uniqueKeysWithValues: rows.map {
+                (($0["folderID"] as String), ($0["meetingCount"] as Int))
+            })
+            return try folders.map { record in
+                guard let id = UUID(uuidString: record.id) else {
+                    throw PersistenceError.corruptRecord("meeting folder \(record.id)")
+                }
+                return MeetingFolderCount(folderID: id, meetingCount: counts[record.id, default: 0])
+            }
+        }
+    }
+
+    public func unfiledMeetingCount() throws -> Int {
+        try database.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM meetings WHERE deletedAt IS NULL AND folderID IS NULL"
+            ) ?? 0
         }
     }
 
@@ -842,6 +1052,35 @@ public actor MeetingStore {
                 throw PersistenceError.invalidSegment("invalid timing or revision for \(segment.id)")
             }
         }
+    }
+
+    private static func validatedFolderName(_ raw: String) throws -> String {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            throw PersistenceError.invalidFolderName("Enter at least one non-whitespace character.")
+        }
+        guard name.count <= 80 else {
+            throw PersistenceError.invalidFolderName("Use 80 characters or fewer.")
+        }
+        return name
+    }
+
+    /// This form is stored in SQLite and is therefore the source of truth for
+    /// uniqueness. `localizedStandardCompare` is unsuitable here because it
+    /// can change with the user's locale between two writes.
+    private static func normalizedFolderName(_ name: String) -> String {
+        name.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        ).lowercased()
+    }
+
+    private static func requireActiveFolder(_ id: UUID, in db: Database) throws {
+        guard try MeetingFolderRecord
+            .filter(key: id.uuidString)
+            .filter(Column("deletedAt") == nil)
+            .fetchOne(db) != nil
+        else { throw PersistenceError.folderNotFound(id) }
     }
 
     private static func ftsMatchQuery(_ rawQuery: String) throws -> String {

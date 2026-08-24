@@ -3,6 +3,9 @@ import Observation
 
 enum SidebarDestination: Hashable {
     case meetings
+    case unfiled
+    case folder(UUID)
+    case recentlyDeleted
     case models
     case storage
     case settings
@@ -339,6 +342,7 @@ struct MeetingListItem: Identifiable, Equatable {
     /// on. Carried on the item so the export menu can decide what to offer
     /// without listing a directory on every render. See `MeetingAudioExport`.
     var retainsAudio: Bool = false
+    var folderID: UUID?
 }
 
 struct TranscriptLineItem: Identifiable, Equatable {
@@ -493,6 +497,7 @@ enum FailureKind: Equatable {
     case meetingLoad
     case meetingRename
     case meetingDelete
+    case folderManagement
     case noteSave
     case summarySave
     case speakerRename
@@ -518,6 +523,7 @@ enum FailureRoute: Equatable {
         case .meetingLoad: .appAlert(title: "This meeting could not be opened")
         case .meetingRename: .appAlert(title: "The meeting name was not saved")
         case .meetingDelete: .appAlert(title: "The meeting could not be deleted")
+        case .folderManagement: .appAlert(title: "The folder could not be updated")
         case .noteSave: .appAlert(title: "Your notes are not being saved")
         case .summarySave: .appAlert(title: "Your summary was not saved")
         case .speakerRename: .appAlert(title: "The speaker name was not saved")
@@ -555,6 +561,10 @@ final class AppViewState {
     var draft = MeetingDraft()
     var meetings: [MeetingListItem] = []
     var recentlyDeletedMeetings: [MeetingListItem] = []
+    var folders: [MeetingFolder] = []
+    /// Active-meeting counts, keyed by folder, for sidebar badges.
+    var folderMeetingCounts: [UUID: Int] = [:]
+    var unfiledMeetingCount = 0
     var transcript: [TranscriptLineItem] = []
     private var meetingInsights: [UUID: InsightWorkspaceState] = [:]
     private var unscopedInsights = InsightWorkspaceState()
@@ -689,6 +699,30 @@ final class AppViewState {
             $0.title.localizedStandardContains(searchText)
                 || $0.excerpt.localizedStandardContains(searchText)
                 || searchMatchedMeetingIDs?.contains($0.id) == true
+        }
+    }
+
+    var selectedFolderID: UUID? {
+        if case .folder(let id) = selection { return id }
+        return nil
+    }
+
+    /// A persisted meeting or folder can disappear between launches. Resolve
+    /// it before SwiftUI renders the destination so a stale UUID never becomes
+    /// an empty, unreachable workspace.
+    nonisolated static func resolvedSidebarDestination(
+        _ destination: SidebarDestination?,
+        meetingIDs: Set<UUID>,
+        folderIDs: Set<UUID>
+    ) -> SidebarDestination {
+        switch destination {
+        case .meeting(let id) where !meetingIDs.contains(id),
+             .folder(let id) where !folderIDs.contains(id):
+            .meetings
+        case let destination?:
+            destination
+        case nil:
+            .meetings
         }
     }
 

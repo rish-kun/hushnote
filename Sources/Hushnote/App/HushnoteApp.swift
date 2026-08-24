@@ -2,6 +2,8 @@ import SwiftUI
 
 @main
 struct HushnoteApp: App {
+    @AppStorage(AppPreferences.appearanceUserDefaultsKey)
+    private var appearanceRawValue = AppearanceMode.system.rawValue
     @State private var state: AppViewState
     @State private var coordinator: AppCoordinator
     @State private var recordingPanel: FloatingRecordingPanelController
@@ -29,12 +31,25 @@ struct HushnoteApp: App {
             AppShellView()
                 .environment(state)
                 .environment(coordinator)
-                .frame(minWidth: 940, minHeight: 650)
+                // The shell can intentionally collapse its detail canvas, but
+                // never below a usable keyboard and sidebar target size.
+                .frame(minWidth: 760, minHeight: 560)
+                .preferredColorScheme(preferredColorScheme)
                 .task { await coordinator.bootstrap() }
         }
-        .defaultSize(width: 1180, height: 760)
+        .defaultSize(width: 1_240, height: 800)
+        .windowResizability(.contentMinSize)
         .commands {
             HushnoteAboutCommands()
+            // The toggle itself lives in a titlebar accessory so it cannot
+            // drift as the split view collapses, and a hosted titlebar view is
+            // outside the menu responder chain. The shortcut belongs here.
+            CommandGroup(after: .sidebar) {
+                Button("Toggle Sidebar") {
+                    NotificationCenter.default.post(name: .hushnoteToggleSidebar, object: nil)
+                }
+                .keyboardShortcut("s", modifiers: [.command, .option])
+            }
             CommandGroup(after: .newItem) {
                 if state.recordingPhase.isCapturing {
                     Button(state.recordingPhase == .paused ? "Resume recording" : "Pause recording") {
@@ -46,6 +61,14 @@ struct HushnoteApp: App {
                     Button("New Meeting Note") { Task { await coordinator.createMeetingNote() } }
                         .keyboardShortcut("n", modifiers: [.command])
                 }
+                Button("New Folder") {
+                    NotificationCenter.default.post(name: .hushnoteNewFolder, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Search Meetings") {
+                    NotificationCenter.default.post(name: .hushnoteSearchMeetings, object: nil)
+                }
+                .keyboardShortcut("k", modifiers: .command)
             }
         }
 
@@ -66,9 +89,18 @@ struct HushnoteApp: App {
 
         Window("About Hushnote", id: AboutHushnoteView.windowID) {
             AboutHushnoteView()
+                .preferredColorScheme(preferredColorScheme)
         }
         .defaultPosition(.center)
         .windowResizability(.contentSize)
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        switch AppearanceMode(rawValue: appearanceRawValue) ?? .system {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
+        }
     }
 }
 

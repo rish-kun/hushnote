@@ -3,6 +3,49 @@ import XCTest
 
 @MainActor
 final class AppViewStateTests: XCTestCase {
+    func testSelectedFolderIDTracksOnlyFolderDestinations() {
+        let state = AppViewState()
+        let folderID = UUID()
+
+        state.selection = .folder(folderID)
+        XCTAssertEqual(state.selectedFolderID, folderID)
+        state.selection = .unfiled
+        XCTAssertNil(state.selectedFolderID)
+        state.selection = .meeting(UUID())
+        XCTAssertNil(state.selectedFolderID)
+    }
+
+    func testStaleFolderAndMeetingDestinationsFallBackToMeetings() {
+        let existingMeeting = UUID()
+        let existingFolder = UUID()
+
+        XCTAssertEqual(
+            AppViewState.resolvedSidebarDestination(
+                .folder(UUID()), meetingIDs: [existingMeeting], folderIDs: [existingFolder]
+            ),
+            .meetings
+        )
+        XCTAssertEqual(
+            AppViewState.resolvedSidebarDestination(
+                .meeting(UUID()), meetingIDs: [existingMeeting], folderIDs: [existingFolder]
+            ),
+            .meetings
+        )
+        XCTAssertEqual(
+            AppViewState.resolvedSidebarDestination(
+                .folder(existingFolder), meetingIDs: [existingMeeting], folderIDs: [existingFolder]
+            ),
+            .folder(existingFolder)
+        )
+    }
+
+    func testFolderManagementFailuresUseTheirOwnAlertRoute() {
+        XCTAssertEqual(
+            FailureRoute.route(for: .folderManagement),
+            .appAlert(title: "The folder could not be updated")
+        )
+    }
+
     func testRecordingPhaseBusyAndCapturingSemantics() {
         XCTAssertFalse(RecordingPhase.idle.isBusy)
         XCTAssertTrue(RecordingPhase.preparing.isBusy)

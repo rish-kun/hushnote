@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct StorageDashboardView: View {
@@ -7,31 +8,31 @@ struct StorageDashboardView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                header
-                if let report = state.storageReport {
-                    categoryCards(report)
-                    if report.isPartial { partialScanNotice(report) }
-                    ModelStorageLocationCard()
-                    modelDetails(report.modelDetails)
-                    recordingDetails(report.recordingDetails)
-                    localDataDetails(report)
-                } else if state.isScanningStorage {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Calculating allocated storage…")
-                            .foregroundStyle(.secondary)
+            AdaptivePageScaffold { policy in
+                VStack(alignment: .leading, spacing: policy == .compact ? 24 : 30) {
+                    header(policy: policy)
+                    if let report = state.storageReport {
+                        storageOverview(report, policy: policy)
+                        cleanupInventory(report, policy: policy)
+                    } else if state.isScanningStorage {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Calculating allocated storage…")
+                                .foregroundStyle(HushnoteTheme.secondaryInk)
+                        }
+                        .padding(.vertical, 30)
+                    } else {
+                        HushnoteEmptyState(
+                            title: "Storage has not been calculated",
+                            message: "Refresh to measure models, retained recordings, and local app data.",
+                            policy: policy
+                        ) {
+                            HushnoteGlyph(systemName: "internaldrive")
+                        }
                     }
-                    .padding(.vertical, 30)
-                } else {
-                    ContentUnavailableView(
-                        "Storage has not been calculated",
-                        systemImage: "internaldrive",
-                        description: Text("Refresh to measure models, retained recordings, and local app data.")
-                    )
                 }
             }
-            .pageChrome()
+            .padding(.vertical, 36)
         }
         .task {
             coordinator.refreshInstalledModels()
@@ -55,26 +56,13 @@ struct StorageDashboardView: View {
         }
     }
 
-    private var header: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .firstTextBaseline, spacing: 18) {
-                headerText
-                Spacer(minLength: 18)
-                refreshButton
-            }
-            VStack(alignment: .leading, spacing: 14) {
-                headerText
-                refreshButton
-            }
-        }
-    }
-
-    private var headerText: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Storage")
-                .font(HushnoteTheme.Font.pageTitle)
-            Text("Allocated space used by local models, recordings, and meeting data.")
-                .foregroundStyle(.secondary)
+    private func header(policy: AdaptiveLayoutPolicy) -> some View {
+        HushnotePageHeader(
+            title: "Storage",
+            subtitle: "Allocated space used by local models, recordings, and meeting data.",
+            policy: policy
+        ) {
+            refreshButton
         }
     }
 
@@ -88,46 +76,98 @@ struct StorageDashboardView: View {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
         }
-        .buttonStyle(.bordered)
+        .hushnoteButton(.secondary)
         .disabled(state.isScanningStorage)
     }
 
-    private func categoryCards(_ report: StorageReport) -> some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
-            StorageCategoryCard(title: "Models", symbol: "cpu", usage: report.models)
-            StorageCategoryCard(title: "Recordings", symbol: "waveform", usage: report.recordings)
-            StorageCategoryCard(title: "Database", symbol: "cylinder", usage: report.database)
-            StorageCategoryCard(title: "Other", symbol: "folder", usage: report.other)
+    @ViewBuilder
+    private func storageOverview(_ report: StorageReport, policy: AdaptiveLayoutPolicy) -> some View {
+        if policy == .wide {
+            HStack(alignment: .top, spacing: 42) {
+                allocationSummary(report)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 18) {
+                    ModelStorageLocationCard()
+                    scanHealth(report)
+                }
+                .frame(width: 330, alignment: .leading)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 24) {
+                allocationSummary(report)
+                ModelStorageLocationCard()
+                scanHealth(report)
+            }
+        }
+    }
+
+    private func allocationSummary(_ report: StorageReport) -> some View {
+        let total = report.models.allocatedBytes
+            + report.recordings.allocatedBytes
+            + report.database.allocatedBytes
+            + report.other.allocatedBytes
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HushnoteEyebrow("Allocated on this Mac")
+            HushnoteMetric(value: StorageByteText.string(total))
+            StorageAllocationBar(
+                total: total,
+                categories: [
+                    StorageAllocation(title: "Models", usage: report.models, color: HushnoteTheme.moss),
+                    StorageAllocation(title: "Recordings", usage: report.recordings, color: HushnoteTheme.vermilion),
+                    StorageAllocation(title: "Database", usage: report.database, color: HushnoteTheme.inkFill),
+                    StorageAllocation(title: "Other", usage: report.other, color: HushnoteTheme.rule)
+                ]
+            )
+            Text("Includes local models, retained recordings, the meeting database, and support files.")
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+        }
+        .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private func scanHealth(_ report: StorageReport) -> some View {
+        if report.isPartial {
+            partialScanNotice(report)
+        } else {
+            HushnoteStatusLine(text: "Last scan could read every Hushnote folder.", tone: .good)
         }
     }
 
     private func partialScanNotice(_ report: StorageReport) -> some View {
-        Label {
-            Text("Some folders could not be read. Totals include everything Hushnote could inspect and may be lower than the space actually used.")
-        } icon: {
-            Image(systemName: "exclamationmark.triangle")
-        }
-        .font(.callout)
-        .foregroundStyle(HushnoteTheme.vermilionInk)
-        .padding(12)
-        .background(HushnoteTheme.vermilion.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+        HushnoteStatusLine(
+            text: "Some folders could not be read. Totals include everything Hushnote could inspect and may be lower than the space actually used.",
+            tone: .warning
+        )
+        .padding(.vertical, 9)
         .accessibilityHint("The scan reported (report.issues.count) access issues")
     }
 
+    private func cleanupInventory(_ report: StorageReport, policy: AdaptiveLayoutPolicy) -> some View {
+        VStack(alignment: .leading, spacing: 22) {
+            HushnoteEyebrow("Cleanup inventory")
+            modelDetails(report.modelDetails, policy: policy)
+            recordingDetails(report.recordingDetails, policy: policy)
+            localDataDetails(report, policy: policy)
+        }
+        .padding(.top, 6)
+    }
+
     @ViewBuilder
-    private func modelDetails(_ details: [ModelStorageUsage]) -> some View {
+    private func modelDetails(_ details: [ModelStorageUsage], policy: AdaptiveLayoutPolicy) -> some View {
         let visible = details.filter { $0.allocatedBytes > 0 || $0.isPartial }
             .sorted { $0.allocatedBytes > $1.allocatedBytes }
         if !visible.isEmpty {
-            StorageSection(title: "MODEL STORAGE") {
+            HushnoteSection(title: "Model storage") {
                 ForEach(visible, id: \.modelID) { model in
-                    HStack(alignment: .center, spacing: 14) {
-                        StorageDetailRow(
-                            title: model.displayName,
-                            detail: model.url.path,
-                            allocatedBytes: model.allocatedBytes,
-                            isPartial: model.isPartial
-                        )
+                    detailRow(
+                        title: model.displayName,
+                        detail: model.url.path,
+                        allocatedBytes: model.allocatedBytes,
+                        isPartial: model.isPartial,
+                        policy: policy
+                    ) {
                         modelCleanupControl(model)
                     }
                 }
@@ -141,44 +181,45 @@ struct StorageDashboardView: View {
             let isActive = model.id == SpeechModelResolver.model(named: state.draft.liveModel).id
                 || model.id == SpeechModelResolver.model(named: state.draft.finalModel).id
             if isActive {
-                Text("ACTIVE")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(HushnoteTheme.moss)
+                // `.active` badge tone is reserved for the meeting recording right
+                // now (filled vermilion); "the model currently in use" is a
+                // different, calmer state, so it takes `.positive` instead.
+                HushnoteBadge(title: "Active", tone: .positive)
             } else {
                 Button("Remove…", role: .destructive) { coordinator.promptToRemoveModel(model) }
-                    .buttonStyle(.bordered)
+                    .hushnoteButton(.destructive)
                     .disabled(!coordinator.canChangeModelStorage)
             }
         } else if usage.modelID == "speaker-diarization" {
             Button("Remove…", role: .destructive) { coordinator.promptToRemoveDiarizationModels() }
-                .buttonStyle(.bordered)
+                .hushnoteButton(.destructive)
                 .disabled(!coordinator.canChangeModelStorage)
         }
     }
 
     @ViewBuilder
-    private func recordingDetails(_ details: [RecordingStorageUsage]) -> some View {
+    private func recordingDetails(_ details: [RecordingStorageUsage], policy: AdaptiveLayoutPolicy) -> some View {
         let visible = details.sorted { $0.allocatedBytes > $1.allocatedBytes }
-        StorageSection(title: "RETAINED RECORDINGS") {
+        HushnoteSection(title: "Retained recordings") {
             if visible.isEmpty {
                 Text("No retained or recoverable recordings are using storage.")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
             } else {
                 ForEach(visible, id: \.meetingID) { recording in
-                    HStack(alignment: .center, spacing: 14) {
-                        StorageDetailRow(
-                            title: recording.title,
-                            detail: recording.url.path,
-                            allocatedBytes: recording.allocatedBytes,
-                            isPartial: recording.isPartial
-                        )
+                    detailRow(
+                        title: recording.title,
+                        detail: recording.url.path,
+                        allocatedBytes: recording.allocatedBytes,
+                        isPartial: recording.isPartial,
+                        policy: policy
+                    ) {
                         if state.storageDeletingRecordingIDs.contains(recording.meetingID) {
                             ProgressView().controlSize(.small)
                         } else {
                             Button("Remove Audio…", role: .destructive) {
                                 recordingPendingRemoval = recording
                             }
-                            .buttonStyle(.bordered)
+                            .hushnoteButton(.destructive)
                             .disabled(!coordinator.canRemoveRecordingAudio(meetingID: recording.meetingID))
                             .help(cleanupHelp(for: recording.meetingID))
                         }
@@ -188,25 +229,73 @@ struct StorageDashboardView: View {
         }
     }
 
-    private func localDataDetails(_ report: StorageReport) -> some View {
-        StorageSection(title: "LOCAL APP DATA") {
+    private func localDataDetails(_ report: StorageReport, policy: AdaptiveLayoutPolicy) -> some View {
+        HushnoteSection(title: "Local app data") {
             if let database = report.databaseDetails.first {
-                StorageDetailRow(
+                detailRow(
                     title: "Meeting database",
                     detail: database.databaseURL.path,
                     allocatedBytes: database.allocatedBytes,
-                    isPartial: database.isPartial
+                    isPartial: database.isPartial,
+                    policy: policy
                 )
             }
-            StorageDetailRow(
+            detailRow(
                 title: "Other Application Support files",
                 detail: coordinator.applicationDataPath,
                 allocatedBytes: report.other.allocatedBytes,
-                isPartial: report.other.isPartial
+                isPartial: report.other.isPartial,
+                policy: policy
             )
             Text("Other excludes the database and recording folders listed above.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+        }
+    }
+
+    /// A cleanup-inventory row with no trailing action, e.g. the database entry.
+    private func detailRow(
+        title: String,
+        detail: String,
+        allocatedBytes: Int64,
+        isPartial: Bool,
+        policy: AdaptiveLayoutPolicy
+    ) -> some View {
+        detailRow(title: title, detail: detail, allocatedBytes: allocatedBytes, isPartial: isPartial, policy: policy) {
+            EmptyView()
+        }
+    }
+
+    private func detailRow<Trailing: View>(
+        title: String,
+        detail: String,
+        allocatedBytes: Int64,
+        isPartial: Bool,
+        policy: AdaptiveLayoutPolicy,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HushnoteInventoryRow(policy: policy) {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(HushnoteTheme.ink)
+                        if isPartial {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(HushnoteTheme.vermilionInk)
+                        }
+                    }
+                    Spacer(minLength: 10)
+                    Text(StorageByteText.string(allocatedBytes))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+                HushnotePathDisclosure(path: detail)
+            }
+        } trailing: {
+            trailing()
         }
     }
 
@@ -221,80 +310,95 @@ struct StorageDashboardView: View {
     }
 }
 
-private struct StorageCategoryCard: View {
+private struct StorageAllocation: Identifiable {
     let title: String
-    let symbol: String
     let usage: StorageCategoryUsage
+    let color: Color
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: symbol)
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(StorageByteText.string(usage.allocatedBytes))
-                .font(.title2.weight(.semibold).monospacedDigit())
-            Text(usage.isPartial ? "Partial total" : itemText)
-                .font(.caption)
-                .foregroundStyle(usage.isPartial ? HushnoteTheme.vermilionInk : .secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(16)
-        .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 10))
-        .overlay { RoundedRectangle(cornerRadius: 10).stroke(HushnoteTheme.rule.opacity(0.7)) }
-    }
-
-    private var itemText: String {
-        usage.itemCount == 1 ? "1 item" : "\(usage.itemCount) items"
-    }
+    var id: String { title }
 }
 
-private struct StorageDetailRow: View {
-    let title: String
-    let detail: String
-    let allocatedBytes: Int64
-    let isPartial: Bool
+private struct StorageAllocationBar: View {
+    let total: Int64
+    let categories: [StorageAllocation]
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(title).font(.callout.weight(.medium))
-                    if isPartial {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(HushnoteTheme.vermilionInk)
+        VStack(alignment: .leading, spacing: 10) {
+            GeometryReader { proxy in
+                HStack(spacing: 2) {
+                    ForEach(categories.filter { $0.usage.allocatedBytes > 0 }) { category in
+                        Rectangle()
+                            .fill(category.color)
+                            .frame(width: segmentWidth(category, in: proxy.size.width))
                     }
                 }
-                Text(detail)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
+                .clipShape(Capsule(style: .continuous))
             }
-            Spacer(minLength: 12)
-            Text(StorageByteText.string(allocatedBytes))
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
+            .frame(height: 12)
+            .background(HushnoteTheme.rule.opacity(0.32), in: Capsule(style: .continuous))
+
+            FlowLayout(spacing: 12) {
+                ForEach(categories) { category in
+                    HStack(spacing: 5) {
+                        Circle().fill(category.color).frame(width: 7, height: 7)
+                        Text("\(category.title) \(StorageByteText.string(category.usage.allocatedBytes))")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 5)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityText)
+    }
+
+    private func segmentWidth(_ category: StorageAllocation, in available: CGFloat) -> CGFloat {
+        guard total > 0 else { return 0 }
+        return available * CGFloat(Double(category.usage.allocatedBytes) / Double(total))
+    }
+
+    private var accessibilityText: String {
+        let values = categories.map { "\($0.title), \(StorageByteText.string($0.usage.allocatedBytes))" }
+        return "Storage allocation. " + values.joined(separator: ". ")
     }
 }
 
-private struct StorageSection<Content: View>: View {
-    let title: String
-    @ViewBuilder let content: Content
+private struct FlowLayout: Layout {
+    var spacing: CGFloat
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.caption2.weight(.bold))
-                .tracking(1.3)
-                .foregroundStyle(.secondary)
-            content
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .greatestFiniteMagnitude
+        var lineWidth: CGFloat = 0
+        var height: CGFloat = 0
+        var lineHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if lineWidth > 0, lineWidth + spacing + size.width > width {
+                height += lineHeight + spacing
+                lineWidth = 0
+                lineHeight = 0
+            }
+            lineWidth += (lineWidth == 0 ? 0 : spacing) + size.width
+            lineHeight = max(lineHeight, size.height)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        return CGSize(width: proposal.width ?? lineWidth, height: height + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var point = bounds.origin
+        var lineHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if point.x > bounds.minX, point.x + spacing + size.width > bounds.maxX {
+                point.x = bounds.minX
+                point.y += lineHeight + spacing
+                lineHeight = 0
+            }
+            if point.x > bounds.minX { point.x += spacing }
+            subview.place(at: point, proposal: ProposedViewSize(size))
+            point.x += size.width
+            lineHeight = max(lineHeight, size.height)
+        }
     }
 }
 

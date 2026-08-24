@@ -16,6 +16,7 @@ struct MeetingRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
     var retainsAudio: Bool
     var activeSummaryVersionID: String?
     var deletedAt: Date?
+    var folderID: String?
 
     init(_ meeting: Meeting) {
         id = meeting.id.uuidString
@@ -30,6 +31,7 @@ struct MeetingRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
         retainsAudio = meeting.retainsAudio
         activeSummaryVersionID = meeting.activeSummaryVersionID?.uuidString
         deletedAt = meeting.deletedAt
+        folderID = meeting.folderID?.uuidString
     }
 
     func model() throws -> Meeting {
@@ -48,6 +50,42 @@ struct MeetingRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
             errorMessage: errorMessage,
             retainsAudio: retainsAudio,
             activeSummaryVersionID: activeSummaryVersionID.flatMap(UUID.init(uuidString:)),
+            deletedAt: deletedAt,
+            folderID: folderID.flatMap(UUID.init(uuidString:))
+        )
+    }
+}
+
+struct MeetingFolderRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "meetingFolders"
+
+    var id: String
+    var name: String
+    /// A folded form of `name` that enforces case- and diacritic-insensitive
+    /// uniqueness even if another process writes the SQLite database.
+    var normalizedName: String
+    var createdAt: Date
+    var updatedAt: Date
+    var deletedAt: Date?
+
+    init(_ folder: MeetingFolder, normalizedName: String) {
+        id = folder.id.uuidString
+        name = folder.name
+        self.normalizedName = normalizedName
+        createdAt = folder.createdAt
+        updatedAt = folder.updatedAt
+        deletedAt = folder.deletedAt
+    }
+
+    func model() throws -> MeetingFolder {
+        guard let id = UUID(uuidString: id) else {
+            throw PersistenceError.corruptRecord("meeting folder \(self.id)")
+        }
+        return MeetingFolder(
+            id: id,
+            name: name,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
             deletedAt: deletedAt
         )
     }
@@ -342,6 +380,9 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     case invalidProviderRun(String)
     case invalidSummary(String)
     case invalidMeetingTitle(String)
+    case folderNotFound(UUID)
+    case invalidFolderName(String)
+    case duplicateFolderName(String)
 
     public var errorDescription: String? {
         switch self {
@@ -352,6 +393,9 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
         case .invalidProviderRun(let reason): "Invalid provider run: \(reason)"
         case .invalidSummary(let reason): "Invalid summary: \(reason)"
         case .invalidMeetingTitle(let reason): "Invalid meeting title: \(reason)"
+        case .folderNotFound(let id): "Folder \(id) does not exist."
+        case .invalidFolderName(let reason): "Invalid folder name: \(reason)"
+        case .duplicateFolderName(let name): "A folder named “\(name)” already exists."
         }
     }
 }

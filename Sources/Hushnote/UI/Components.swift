@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The one wording for each recording state.
@@ -82,7 +83,7 @@ struct RecordingPill: View {
 
             Text(RecordingStatusText.label(for: state.recordingPhase))
                 .font(.callout.weight(.semibold))
-                .foregroundStyle(isPaused ? AnyShapeStyle(.secondary) : AnyShapeStyle(HushnoteTheme.vermilionInk))
+                .foregroundStyle(isPaused ? HushnoteTheme.secondaryInk : HushnoteTheme.vermilionInk)
 
             Text(DurationText.clock(state.elapsed))
                 .font(.callout.monospacedDigit().weight(.medium))
@@ -157,12 +158,12 @@ private struct MiniAudioLevel: View {
         HStack(spacing: 4) {
             Image(systemName: systemImage)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
 
             HStack(alignment: .center, spacing: 2) {
                 ForEach(0..<barCount, id: \.self) { index in
                     Capsule(style: .continuous)
-                        .fill(isActive(index) ? tint : Color.secondary.opacity(0.16))
+                        .fill(isActive(index) ? tint : HushnoteTheme.rule.opacity(0.55))
                         .frame(width: 2.5, height: CGFloat(5 + index * 2))
                 }
             }
@@ -183,12 +184,11 @@ private extension View {
         padding(.leading, 10)
             .padding(.trailing, 8)
             .padding(.vertical, 7)
-            .background(.regularMaterial, in: Capsule(style: .continuous))
+            .background(HushnoteTheme.controlSurface, in: Capsule(style: .continuous))
             .overlay {
                 Capsule(style: .continuous)
-                    .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+                    .stroke(HushnoteTheme.rule.opacity(0.72), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
     }
 }
 
@@ -235,13 +235,13 @@ struct LevelMeter: View {
         HStack(spacing: 8) {
             Text(label)
                 .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
                 .frame(width: 48, alignment: .leading)
 
             HStack(alignment: .center, spacing: 3) {
                 ForEach(0..<bars, id: \.self) { index in
                     Capsule(style: .continuous)
-                        .fill(LevelMeterModel.isBarActive(index, level: level, count: bars) ? tint : Color.secondary.opacity(0.15))
+                        .fill(LevelMeterModel.isBarActive(index, level: level, count: bars) ? tint : HushnoteTheme.rule.opacity(0.55))
                         .frame(width: 3, height: CGFloat(5 + (index % 4) * 3))
                 }
             }
@@ -297,8 +297,8 @@ struct FinalizationBanner: View {
         .padding(.horizontal, 30)
         .padding(.vertical, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .background(HushnoteTheme.controlSurface)
+        .hushnoteBottomRule(opacity: 0.65)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Finalizing this meeting. \(state.finalizationLabel)")
     }
@@ -423,6 +423,809 @@ struct ProviderDisclosure: View {
         )
         .font(.caption)
         .foregroundStyle(isLocal ? HushnoteTheme.moss : .secondary)
+    }
+}
+
+// MARK: - Editorial utility controls
+
+/// A compact, semantic button treatment for product-owned surfaces. It leaves
+/// SwiftUI's `Button` intact, preserving keyboard activation, focus rings, and
+/// VoiceOver semantics while avoiding platform-blue tints in the app chrome.
+enum HushnoteButtonKind {
+    case primary
+    case secondary
+    case quiet
+    case recording
+    /// A destructive action. `Button(role: .destructive)` otherwise falls back
+    /// to the platform treatment, which is how four delete actions ended up
+    /// looking like stock AppKit.
+    case destructive
+}
+
+struct HushnoteButtonStyle: ButtonStyle {
+    let kind: HushnoteButtonKind
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, kind == .quiet ? 10 : 13)
+            .padding(.vertical, 8)
+            .background(background.opacity(configuration.isPressed ? 0.78 : 1), in: Capsule(style: .continuous))
+            .overlay {
+                if kind == .secondary || kind == .destructive {
+                    Capsule(style: .continuous)
+                        .stroke(strokeColor, lineWidth: 1)
+                }
+            }
+            .contentShape(Capsule(style: .continuous))
+    }
+
+    private var foreground: Color {
+        switch kind {
+        case .primary, .recording: .white
+        case .secondary, .quiet: HushnoteTheme.ink
+        case .destructive: HushnoteTheme.vermilionInk
+        }
+    }
+
+    private var strokeColor: Color {
+        kind == .destructive
+            ? HushnoteTheme.vermilionInk.opacity(0.5)
+            : HushnoteTheme.rule.opacity(0.85)
+    }
+
+    private var background: Color {
+        switch kind {
+        case .primary: HushnoteTheme.inkFill
+        case .secondary: HushnoteTheme.controlSurface
+        case .quiet, .destructive: .clear
+        case .recording: HushnoteTheme.vermilion
+        }
+    }
+}
+
+extension View {
+    /// Deliberately on `View`, not `Button`: the narrower form could not be
+    /// applied after `.disabled()`, nor to a `Menu`, nor to a stack of related
+    /// buttons -- which is why so many call sites fell back to `.bordered`.
+    func hushnoteButton(_ kind: HushnoteButtonKind = .primary) -> some View {
+        buttonStyle(HushnoteButtonStyle(kind: kind))
+    }
+}
+
+/// The field chrome's measurements.
+///
+/// `TextFieldStyle._body` is nonisolated, so it cannot route through a
+/// `ViewModifier` under strict concurrency -- the configuration would have to
+/// cross an actor boundary. The chrome is therefore applied in two places, and
+/// these constants are what keep them identical.
+enum HushnoteFieldMetrics {
+    static let cornerRadius: CGFloat = 8
+    static let horizontalPadding: CGFloat = 11
+    static let verticalPadding: CGFloat = 9
+    static let borderOpacity: Double = 0.88
+
+    static var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+}
+
+/// The field chrome as a modifier, for the controls a `TextFieldStyle` cannot
+/// reach: `SecureField`, `TextEditor`, and `TextField(axis:)`. Those fell back
+/// to `.roundedBorder` and read as system controls beside app-styled ones.
+struct HushnoteFieldChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(.callout)
+            .padding(.horizontal, HushnoteFieldMetrics.horizontalPadding)
+            .padding(.vertical, HushnoteFieldMetrics.verticalPadding)
+            .background(HushnoteTheme.controlSurface, in: HushnoteFieldMetrics.shape)
+            .overlay {
+                HushnoteFieldMetrics.shape
+                    .stroke(HushnoteTheme.rule.opacity(HushnoteFieldMetrics.borderOpacity), lineWidth: 1)
+            }
+    }
+}
+
+extension View {
+    func hushnoteField() -> some View { modifier(HushnoteFieldChrome()) }
+}
+
+struct HushnoteFieldStyle: TextFieldStyle {
+    func _body(configuration: TextField<Self._Label>) -> some View {
+        configuration
+            .font(.callout)
+            .padding(.horizontal, HushnoteFieldMetrics.horizontalPadding)
+            .padding(.vertical, HushnoteFieldMetrics.verticalPadding)
+            .background(HushnoteTheme.controlSurface, in: HushnoteFieldMetrics.shape)
+            .overlay {
+                HushnoteFieldMetrics.shape
+                    .stroke(HushnoteTheme.rule.opacity(HushnoteFieldMetrics.borderOpacity), lineWidth: 1)
+            }
+    }
+}
+
+struct HushnoteToggleStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            ZStack(alignment: configuration.isOn ? .trailing : .leading) {
+                Capsule(style: .continuous)
+                    .fill(configuration.isOn ? HushnoteTheme.moss : HushnoteTheme.rule.opacity(0.8))
+                    .frame(width: 42, height: 24)
+                Circle()
+                    .fill(HushnoteTheme.paperRaised)
+                    .frame(width: 18, height: 18)
+                    .padding(3)
+            }
+            .animation(.easeOut(duration: 0.16), value: configuration.isOn)
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(configuration.isOn ? "On" : "Off")
+    }
+}
+
+/// A lightweight segmented control for two to four mutually exclusive choices.
+/// Each segment remains a real `Button`, making it reachable with keyboard and
+/// assistive technology without depending on a platform control tint.
+struct HushnoteSegmentedControl<Selection: Hashable, Label: View>: View {
+    let options: [Selection]
+    @Binding var selection: Selection
+    let label: (Selection) -> Label
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(options, id: \.self) { option in
+                Button {
+                    selection = option
+                } label: {
+                    label(option)
+                        .font(.callout.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(selection == option ? HushnoteTheme.selectionSurface : .clear, in: Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selection == option ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(HushnoteTheme.controlSurface, in: Capsule(style: .continuous))
+        .overlay {
+            Capsule(style: .continuous)
+                .stroke(HushnoteTheme.rule.opacity(0.75), lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - Rules
+
+/// The app's one hairline.
+///
+/// `Divider()` renders the platform separator colour, which is a cooler grey
+/// than `rule` and does not follow the palette. Five call sites were drawing
+/// separators at four different opacities, half of them platform-coloured.
+struct HushnoteRule: View {
+    var opacity: Double = 0.62
+
+    var body: some View {
+        Rectangle()
+            .fill(HushnoteTheme.rule.opacity(opacity))
+            .frame(height: 1)
+            .allowsHitTesting(false)
+    }
+}
+
+extension View {
+    func hushnoteBottomRule(opacity: Double = 0.62) -> some View {
+        overlay(alignment: .bottom) { HushnoteRule(opacity: opacity) }
+    }
+}
+
+// MARK: - Labels
+
+/// A section label. The string is written in sentence case and uppercased by
+/// `textCase`, because a literal `"CLEANUP INVENTORY"` cannot be translated.
+struct HushnoteEyebrow: View {
+    let text: String
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text)
+            .font(HushnoteTheme.Font.eyebrow)
+            .tracking(HushnoteTheme.eyebrowTracking)
+            .textCase(.uppercase)
+            .foregroundStyle(HushnoteTheme.secondaryInk)
+    }
+}
+
+/// A small state marker. The three hand-written variants disagreed on font,
+/// weight and whether there was a pill at all.
+enum HushnoteBadgeTone {
+    /// Filled vermilion. Reserved for the meeting being recorded right now.
+    case active
+    case neutral
+    case positive
+    case alert
+}
+
+struct HushnoteBadge: View {
+    let title: String
+    var tone: HushnoteBadgeTone = .neutral
+
+    var body: some View {
+        Text(title)
+            .font(HushnoteTheme.Font.eyebrow)
+            .tracking(HushnoteTheme.eyebrowTracking)
+            .textCase(.uppercase)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .foregroundStyle(foreground)
+            .background(Capsule(style: .continuous).fill(background))
+            .overlay {
+                Capsule(style: .continuous)
+                    .strokeBorder(border, lineWidth: 0.8)
+            }
+    }
+
+    private var foreground: Color {
+        switch tone {
+        case .active: HushnoteTheme.paperRaised
+        case .neutral: HushnoteTheme.secondaryInk
+        case .positive: HushnoteTheme.moss
+        case .alert: HushnoteTheme.vermilionInk
+        }
+    }
+
+    private var background: Color {
+        tone == .active ? HushnoteTheme.vermilion : .clear
+    }
+
+    private var border: Color {
+        switch tone {
+        case .active: .clear
+        case .neutral: HushnoteTheme.rule.opacity(0.8)
+        case .positive: HushnoteTheme.moss.opacity(0.55)
+        case .alert: HushnoteTheme.vermilionInk.opacity(0.55)
+        }
+    }
+}
+
+/// One line of machine state: a scan result, a verification outcome, a health
+/// check. Three files said this in three fonts, one of them with a bare
+/// `ProgressView` and no label alignment.
+enum HushnoteStatusTone {
+    case neutral
+    case working
+    case good
+    case warning
+}
+
+struct HushnoteStatusLine: View {
+    let text: String
+    var tone: HushnoteStatusTone = .neutral
+    var systemImage: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            switch tone {
+            case .working:
+                ProgressView().controlSize(.small).scaleEffect(0.72)
+            default:
+                if let symbol {
+                    Image(systemName: symbol).font(.caption)
+                }
+            }
+            Text(text)
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(foreground)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var symbol: String? {
+        if let systemImage { return systemImage }
+        switch tone {
+        case .good: return "checkmark.circle"
+        case .warning: return "exclamationmark.triangle"
+        case .neutral, .working: return nil
+        }
+    }
+
+    private var foreground: Color {
+        switch tone {
+        case .good: HushnoteTheme.moss
+        case .warning: HushnoteTheme.vermilionInk
+        case .neutral, .working: HushnoteTheme.secondaryInk
+        }
+    }
+}
+
+/// A symbol standing in for an illustration in an empty state.
+struct HushnoteGlyph: View {
+    let systemName: String
+    var tone: Color = HushnoteTheme.secondaryInk
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 28, weight: .light))
+            .foregroundStyle(tone)
+            .accessibilityHidden(true)
+    }
+}
+
+/// A headline figure. The one previous instance was 37pt semibold rounded --
+/// the only rounded face in the app, and larger than any page title.
+struct HushnoteMetric: View {
+    let value: String
+    var caption: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(value)
+                .font(HushnoteTheme.Font.metric)
+                .foregroundStyle(HushnoteTheme.ink)
+            if let caption {
+                Text(caption)
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+            }
+        }
+    }
+}
+
+// MARK: - Sections
+
+struct HushnoteSectionAction {
+    let title: String
+    var systemImage: String?
+    let perform: () -> Void
+
+    init(title: String, systemImage: String? = nil, perform: @escaping () -> Void) {
+        self.title = title
+        self.systemImage = systemImage
+        self.perform = perform
+    }
+}
+
+/// An eyebrow, an optional trailing action, and content. Three files carried a
+/// near-identical private copy of this at three different spacings.
+struct HushnoteSection<Content: View>: View {
+    let title: String
+    var action: HushnoteSectionAction?
+    var spacing: CGFloat = 13
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            HStack(alignment: .firstTextBaseline) {
+                HushnoteEyebrow(title)
+                Spacer(minLength: 8)
+                if let action {
+                    Button(action: action.perform) {
+                        if let symbol = action.systemImage {
+                            Label(action.title, systemImage: symbol)
+                                .labelStyle(.iconOnly)
+                        } else {
+                            Text(action.title)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .help(action.title)
+                    .accessibilityLabel(action.title)
+                }
+            }
+            content
+        }
+    }
+}
+
+// MARK: - Inventory
+
+/// The date column shared by every meeting-bearing row. The three hand-rolled
+/// versions used 66pt, 70pt and 70pt, so their titles did not line up.
+struct HushnoteRowDate: View {
+    let date: Date
+    /// Deleted rows show the year instead of a time, because the retention
+    /// window is what matters there.
+    var showsTime = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(date.formatted(.dateTime.day().month(.abbreviated)))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(HushnoteTheme.ink)
+            Text(
+                showsTime
+                    ? date.formatted(date: .omitted, time: .shortened)
+                    : date.formatted(.dateTime.year())
+            )
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(HushnoteTheme.secondaryInk)
+        }
+        .frame(width: 70, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Title, a controlled excerpt, and a dot-joined metadata line.
+struct HushnoteRowIdentity<Accessory: View>: View {
+    let title: String
+    var excerpt: String?
+    var metadata: [String] = []
+    @ViewBuilder let accessory: Accessory
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(HushnoteTheme.ink)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                accessory
+            }
+            if let excerpt, !excerpt.isEmpty {
+                Text(excerpt)
+                    .font(.callout)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !metadata.isEmpty {
+                Text(metadata.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+extension HushnoteRowIdentity where Accessory == EmptyView {
+    init(title: String, excerpt: String? = nil, metadata: [String] = []) {
+        self.init(title: title, excerpt: excerpt, metadata: metadata) { EmptyView() }
+    }
+}
+
+/// How an inventory row arranges its leading column. Extracted so the compact
+/// adaptation is a value a test can assert, rather than a branch buried in a
+/// view body.
+enum InventoryRowLayout: Equatable, Sendable {
+    /// Leading column beside the content.
+    case columns
+    /// Leading column stacked above the content.
+    case stacked
+
+    nonisolated static func arrangement(for policy: AdaptiveLayoutPolicy) -> Self {
+        policy == .compact ? .stacked : .columns
+    }
+
+    nonisolated static func verticalPadding(for policy: AdaptiveLayoutPolicy) -> CGFloat {
+        policy == .compact ? 16 : 18
+    }
+
+    nonisolated static func columnSpacing(for policy: AdaptiveLayoutPolicy) -> CGFloat {
+        policy == .compact ? 12 : 22
+    }
+}
+
+/// One ruled inventory row: meetings, deleted meetings, search results, models,
+/// storage entries. Seven different vertical cadences and four divider
+/// treatments collapse into this.
+///
+/// The row owns its own bottom rule, so call sites stop interleaving
+/// `Divider()` between elements of a `ForEach`.
+struct HushnoteInventoryRow<Leading: View, Content: View, Trailing: View>: View {
+    let policy: AdaptiveLayoutPolicy
+    /// Non-nil makes the leading and content region one plain button. Trailing
+    /// actions stay outside it, so a menu is not swallowed by the row's tap
+    /// target.
+    var open: (() -> Void)?
+    @ViewBuilder let leading: Leading
+    @ViewBuilder let content: Content
+    @ViewBuilder let trailing: Trailing
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            if let open {
+                Button(action: open) {
+                    body(isInteractive: true)
+                }
+                .buttonStyle(.plain)
+            } else {
+                body(isInteractive: false)
+            }
+
+            trailing
+        }
+        .padding(.vertical, InventoryRowLayout.verticalPadding(for: policy))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .hushnoteBottomRule()
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private func body(isInteractive: Bool) -> some View {
+        let spacing = InventoryRowLayout.columnSpacing(for: policy)
+
+        Group {
+            switch InventoryRowLayout.arrangement(for: policy) {
+            case .columns:
+                HStack(alignment: .top, spacing: spacing) {
+                    leading
+                    content
+                }
+            case .stacked:
+                VStack(alignment: .leading, spacing: 8) {
+                    leading
+                    content
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+}
+
+extension HushnoteInventoryRow where Leading == EmptyView {
+    init(
+        policy: AdaptiveLayoutPolicy,
+        open: (() -> Void)? = nil,
+        @ViewBuilder content: () -> Content,
+        @ViewBuilder trailing: () -> Trailing
+    ) {
+        self.init(policy: policy, open: open, leading: { EmptyView() }, content: content, trailing: trailing)
+    }
+}
+
+extension HushnoteInventoryRow where Trailing == EmptyView {
+    init(
+        policy: AdaptiveLayoutPolicy,
+        open: (() -> Void)? = nil,
+        @ViewBuilder leading: () -> Leading,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.init(policy: policy, open: open, leading: leading, content: content, trailing: { EmptyView() })
+    }
+}
+
+extension HushnoteInventoryRow where Leading == EmptyView, Trailing == EmptyView {
+    init(
+        policy: AdaptiveLayoutPolicy,
+        open: (() -> Void)? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.init(
+            policy: policy,
+            open: open,
+            leading: { EmptyView() },
+            content: content,
+            trailing: { EmptyView() }
+        )
+    }
+}
+
+/// The selectable list row behind the sidebar, the provider inventory and
+/// search results. Those three drew the same affordance at corner radius 6, 7
+/// and 8, and disagreed about whether a trailing count sat inside the button.
+///
+/// The count and any menu belong in `trailing`, outside the button, so numbers
+/// land on the same x in every section.
+struct HushnoteSelectableRow<Label: View, Trailing: View>: View {
+    let isSelected: Bool
+    let select: () -> Void
+    @ViewBuilder let label: Label
+    @ViewBuilder let trailing: Trailing
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: select) {
+                label
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            trailing
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background {
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isSelected ? HushnoteTheme.selectionSurface : .clear)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+extension HushnoteSelectableRow where Trailing == EmptyView {
+    init(isSelected: Bool, select: @escaping () -> Void, @ViewBuilder label: () -> Label) {
+        self.init(isSelected: isSelected, select: select, label: label, trailing: { EmptyView() })
+    }
+}
+
+// MARK: - Page structure
+
+/// One page header for every route. There were four, with three subtitle
+/// colours, two spacings, and one page carrying no subtitle at all.
+struct HushnotePageHeader<Actions: View>: View {
+    let title: String
+    var subtitle: String?
+    let policy: AdaptiveLayoutPolicy
+    @ViewBuilder let actions: Actions
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 18) {
+                heading
+                Spacer(minLength: 18)
+                actions
+            }
+            VStack(alignment: .leading, spacing: 14) {
+                heading
+                actions
+            }
+        }
+        .padding(.bottom, policy == .compact ? 24 : 26)
+        .hushnoteBottomRule(opacity: 0.68)
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(HushnoteTheme.Font.pageTitle)
+                .foregroundStyle(HushnoteTheme.ink)
+            if let subtitle {
+                Text(subtitle)
+                    .font(.callout)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .frame(maxWidth: 640, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+extension HushnotePageHeader where Actions == EmptyView {
+    init(title: String, subtitle: String? = nil, policy: AdaptiveLayoutPolicy) {
+        self.init(title: title, subtitle: subtitle, policy: policy) { EmptyView() }
+    }
+}
+
+/// The app's empty state. `ContentUnavailableView` was used in three places and
+/// is unmistakably a system control on a page that is otherwise not.
+struct HushnoteEmptyState<Illustration: View, Action: View>: View {
+    let title: String
+    let message: String
+    var policy: AdaptiveLayoutPolicy = .regular
+    @ViewBuilder let illustration: Illustration
+    @ViewBuilder let action: Action
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 44) {
+                illustration
+                copy
+            }
+            VStack(alignment: .leading, spacing: 28) {
+                illustration
+                copy
+            }
+        }
+        .padding(.vertical, policy == .compact ? 46 : 68)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var copy: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(HushnoteTheme.Font.emptyStateTitle)
+                .foregroundStyle(HushnoteTheme.ink)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+                .lineSpacing(3)
+                .frame(maxWidth: 390, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            action.padding(.top, 4)
+        }
+    }
+}
+
+extension HushnoteEmptyState where Action == EmptyView {
+    init(
+        title: String,
+        message: String,
+        policy: AdaptiveLayoutPolicy = .regular,
+        @ViewBuilder illustration: () -> Illustration
+    ) {
+        self.init(
+            title: title,
+            message: message,
+            policy: policy,
+            illustration: illustration,
+            action: { EmptyView() }
+        )
+    }
+}
+
+/// A path with Copy and Reveal. Two files carried the same block, one calling
+/// it a card.
+struct HushnotePathDisclosure: View {
+    let path: String
+    var label = "Location"
+    @State private var isExpanded = false
+
+    var body: some View {
+        HushnoteDisclosure(label, isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(path)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(path, forType: .string)
+                    }
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                    }
+                }
+                .hushnoteButton(.quiet)
+            }
+        }
+    }
+}
+
+/// A disclosure whose triangle does not read as Finder. The label takes the
+/// eyebrow treatment so it sits in the same hierarchy as a section heading.
+struct HushnoteDisclosure<Content: View>: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: Content
+
+    init(
+        _ title: String,
+        isExpanded: Binding<Bool>,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        _isExpanded = isExpanded
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeOut(duration: 0.18)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    HushnoteEyebrow(title)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+
+            if isExpanded { content }
+        }
     }
 }
 

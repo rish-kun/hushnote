@@ -203,6 +203,33 @@ enum HushnoteDatabaseMigrations {
                     .updateAll(db, Column("activeSummaryVersionID").set(to: version.id))
             }
         }
+        migrator.registerMigration("v8_meeting_folders") { db in
+            try db.create(table: "meetingFolders") { table in
+                table.column("id", .text).primaryKey()
+                table.column("name", .text).notNull()
+                // Names are normalized in the store rather than relying on
+                // SQLite NOCASE, which is ASCII-only and does not fold accents.
+                table.column("normalizedName", .text).notNull().unique()
+                table.column("createdAt", .datetime).notNull()
+                table.column("updatedAt", .datetime).notNull()
+                table.column("deletedAt", .datetime)
+            }
+            try db.create(
+                index: "meetingFolders_active_alphabetical",
+                on: "meetingFolders",
+                columns: ["deletedAt", "normalizedName"]
+            )
+            try db.alter(table: "meetings") { table in
+                table.add(column: "folderID", .text)
+                    .references("meetingFolders", onDelete: .setNull)
+            }
+            try db.create(index: "meetings_on_folderID", on: "meetings", columns: ["folderID"])
+            try db.create(
+                index: "meetings_on_folderID_deletedAt_updatedAt",
+                on: "meetings",
+                columns: ["folderID", "deletedAt", "updatedAt"]
+            )
+        }
         return migrator
     }
 

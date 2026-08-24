@@ -27,6 +27,8 @@ public struct Meeting: Codable, Equatable, Identifiable, Sendable {
     public var retainsAudio: Bool
     public var activeSummaryVersionID: UUID?
     public var deletedAt: Date?
+    /// The optional flat collection this meeting belongs to. `nil` is Unfiled.
+    public var folderID: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -40,7 +42,8 @@ public struct Meeting: Codable, Equatable, Identifiable, Sendable {
         errorMessage: String? = nil,
         retainsAudio: Bool = false,
         activeSummaryVersionID: UUID? = nil,
-        deletedAt: Date? = nil
+        deletedAt: Date? = nil,
+        folderID: UUID? = nil
     ) {
         self.id = id
         self.title = title
@@ -54,6 +57,45 @@ public struct Meeting: Codable, Equatable, Identifiable, Sendable {
         self.retainsAudio = retainsAudio
         self.activeSummaryVersionID = activeSummaryVersionID
         self.deletedAt = deletedAt
+        self.folderID = folderID
+    }
+}
+
+/// A named, flat collection of meetings. Folder removal is recoverable: the
+/// row is soft-deleted while every assigned meeting becomes Unfiled.
+public struct MeetingFolder: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var name: String
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var deletedAt: Date?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        deletedAt: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.deletedAt = deletedAt
+    }
+}
+
+/// Counts are deliberately separate from a folder so a folder query does not
+/// have to materialize every meeting just to render a sidebar badge.
+public struct MeetingFolderCount: Equatable, Sendable, Identifiable {
+    public let folderID: UUID
+    public let meetingCount: Int
+
+    public var id: UUID { folderID }
+
+    public init(folderID: UUID, meetingCount: Int) {
+        self.folderID = folderID
+        self.meetingCount = meetingCount
     }
 }
 

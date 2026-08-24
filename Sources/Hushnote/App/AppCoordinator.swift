@@ -121,10 +121,16 @@ final class AppCoordinator {
             let meetings = try await store.meetings()
             state.meetings = meetings.map(Self.listItem)
             state.recentlyDeletedMeetings = try await store.recentlyDeleted().map(Self.listItem)
+            try await refreshFolderState()
             let ids = Set(meetings.map(\.id))
             state.meetingWorkspaceTabs = preferences.pruneMeetingTabs(keeping: ids)
             if let destination = preferences.sidebarDestination {
-                if case .meeting(let id) = destination, !ids.contains(id) {
+                let resolved = AppViewState.resolvedSidebarDestination(
+                    destination,
+                    meetingIDs: ids,
+                    folderIDs: Set(state.folders.map(\.id))
+                )
+                if resolved != destination {
                     state.selection = .meetings
                     preferences.sidebarDestination = .meetings
                 } else {
@@ -137,12 +143,14 @@ final class AppCoordinator {
         }
     }
 
-    func createMeetingNote() async {
+    func createMeetingNote(inFolder requestedFolderID: UUID? = nil) async {
+        let folderID = requestedFolderID ?? state.selectedFolderID
         let meeting = Meeting(
             title: "Meeting · \(Date().formatted(date: .abbreviated, time: .shortened))",
             updatedAt: Date(),
             status: .idle,
-            retainsAudio: state.retainAudio
+            retainsAudio: state.retainAudio,
+            folderID: folderID
         )
         do {
             try await store.saveMeeting(meeting)
@@ -152,6 +160,60 @@ final class AppCoordinator {
             setWorkspaceTab(.notes, for: meeting.id)
         } catch {
             state.markFailed(.init(kind: .database, message: "A new meeting note could not be created: \(error.localizedDescription)"))
+        }
+    }
+
+    // MARK: - Meeting folders
+
+    @discardableResult
+    func createMeetingFolder(named name: String) async -> MeetingFolder? {
+        do {
+            let folder = try await store.createMeetingFolder(name: name)
+            state.folders.append(folder)
+            state.folders.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            state.folderMeetingCounts[folder.id] = 0
+            return folder
+        } catch {
+            state.report(.folderManagement, error.localizedDescription)
+            return nil
+        }
+    }
+
+    func renameMeetingFolder(_ id: UUID, to name: String) async {
+        do {
+            try await store.renameMeetingFolder(id: id, name: name)
+            try await refreshFolderState()
+        } catch {
+            state.report(.folderManagement, error.localizedDescription)
+        }
+    }
+
+    func deleteMeetingFolder(_ id: UUID) async {
+        do {
+            try await store.deleteMeetingFolder(id: id)
+            // Folder deletion may unfile meetings that are selected, recording,
+            // or in Recently Deleted. Reloading the durable lists keeps every
+            // projection coherent without changing meeting timestamps.
+            let meetings = try await store.meetings()
+            state.meetings = meetings.map(Self.listItem)
+            state.recentlyDeletedMeetings = try await store.recentlyDeleted().map(Self.listItem)
+            try await refreshFolderState()
+            if state.selection == .folder(id) { setSelection(.meetings) }
+        } catch {
+            state.report(.folderManagement, error.localizedDescription)
+        }
+    }
+
+    /// Organization is safe during capture: the store changes only `folderID`.
+    func moveMeeting(_ id: UUID, toFolder folderID: UUID?) async {
+        do {
+            try await store.moveMeeting(id: id, toFolder: folderID)
+            if let meeting = try await store.meeting(id: id) {
+                replaceMeetingListItem(meeting)
+            }
+            try await refreshFolderState()
+        } catch {
+            state.report(.folderManagement, error.localizedDescription)
         }
     }
 
@@ -175,7 +237,8 @@ final class AppCoordinator {
                 startedAt: Date(),
                 updatedAt: Date(),
                 status: .idle,
-                retainsAudio: state.retainAudio
+                retainsAudio: state.retainAudio,
+                folderID: state.selectedFolderID
             )
         }
 
@@ -1950,6 +2013,31 @@ final class AppCoordinator {
         return result
     }
 
+    private func refreshFolderState() async throws {
+        let folders = try await store.meetingFolders()
+        let counts = try await store.meetingFolderCounts(folderIDs: Set(folders.map(\.id)))
+        state.folders = folders
+        state.folderMeetingCounts = Dictionary(
+            uniqueKeysWithValues: counts.map { ($0.folderID, $0.meetingCount) }
+        )
+        state.unfiledMeetingCount = try await store.unfiledMeetingCount()
+    }
+
+    private func replaceMeetingListItem(_ meeting: Meeting) {
+        let item = Self.listItem(meeting)
+        if let index = state.meetings.firstIndex(where: { $0.id == meeting.id }) {
+            // Moving a meeting must not discard the loaded transcript excerpt.
+            var replacement = item
+            replacement.excerpt = state.meetings[index].excerpt
+            state.meetings[index] = replacement
+        }
+        if let index = state.recentlyDeletedMeetings.firstIndex(where: { $0.id == meeting.id }) {
+            var replacement = item
+            replacement.excerpt = state.recentlyDeletedMeetings[index].excerpt
+            state.recentlyDeletedMeetings[index] = replacement
+        }
+    }
+
     private var selectedMeetingID: UUID? {
         if case .meeting(let id) = state.selection { return id }
         return state.activeMeetingID
@@ -1982,7 +2070,8 @@ final class AppCoordinator {
             excerpt: excerpt,
             isRecoverable: meeting.status == .interrupted,
             status: meeting.status,
-            retainsAudio: meeting.retainsAudio
+            retainsAudio: meeting.retainsAudio,
+            folderID: meeting.folderID
         )
         if let index = state.meetings.firstIndex(where: { $0.id == meeting.id }) {
             state.meetings[index] = replacement
@@ -2001,7 +2090,8 @@ final class AppCoordinator {
             excerpt: meeting.status == .interrupted ? "Recording can be recovered and finalized." : "Local meeting transcript",
             isRecoverable: meeting.status == .interrupted,
             status: meeting.status,
-            retainsAudio: meeting.retainsAudio
+            retainsAudio: meeting.retainsAudio,
+            folderID: meeting.folderID
         )
     }
 

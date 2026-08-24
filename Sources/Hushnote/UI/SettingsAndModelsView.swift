@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Where a speech model stands right now.
@@ -304,13 +305,14 @@ struct APIKeyField: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SecureField("API key", text: $entry)
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
+                .hushnoteField()
                 .frame(maxWidth: 480)
                 .onSubmit(submit)
 
             HStack(spacing: 12) {
                 Button(status == .verifying ? "Verifying…" : "Save and verify", action: submit)
-                    .buttonStyle(.bordered)
+                    .hushnoteButton(.secondary)
                     .disabled(!CredentialField.canSubmit(entry: entry, state: status))
                 if status == .verifying {
                     ProgressView().controlSize(.small)
@@ -321,7 +323,7 @@ struct APIKeyField: View {
             if !text.isEmpty {
                 Text(text)
                     .font(.caption)
-                    .foregroundStyle(isFailure ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(.secondary))
+                    .foregroundStyle(isFailure ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(HushnoteTheme.secondaryInk))
                     .accessibilityLabel(text)
             }
         }
@@ -370,7 +372,7 @@ struct AgentCLIModelField: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 9) {
                 TextField("Model", text: $entry)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(HushnoteFieldStyle())
                     .frame(maxWidth: 320)
                     .accessibilityLabel("Model for \(tool.executableName)")
                     .onChange(of: entry) { coordinator.setAgentCLIModel(entry, for: tool) }
@@ -399,7 +401,7 @@ struct AgentCLIModelField: View {
             if let note = listingNote {
                 Text(note)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
                     .frame(maxWidth: 620, alignment: .leading)
             }
         }
@@ -426,7 +428,7 @@ struct AgentCLIModelField: View {
 
     private var captionStyle: AnyShapeStyle {
         if case .rejected = resolution { return AnyShapeStyle(HushnoteTheme.vermilionInk) }
-        return AnyShapeStyle(.secondary)
+        return AnyShapeStyle(HushnoteTheme.secondaryInk)
     }
 
     /// Why there is no menu, when there is no menu. A tool that lists nothing
@@ -455,7 +457,7 @@ struct ModelMeter: View {
         HStack(spacing: 7) {
             Text(title)
                 .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
             HStack(spacing: 2.5) {
                 ForEach(0..<segments, id: \.self) { index in
                     RoundedRectangle(cornerRadius: 1, style: .continuous)
@@ -463,6 +465,9 @@ struct ModelMeter: View {
                         .frame(width: 11, height: 4)
                 }
             }
+            Text("\(filled)/\(segments)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(HushnoteTheme.secondaryInk)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(title) \(filled) out of \(segments)")
@@ -473,9 +478,10 @@ struct ModelBadgePill: View {
     let badge: ModelBadge
 
     var body: some View {
-        Text(badge.title.uppercased())
-            .font(.caption2.weight(.bold))
-            .tracking(0.7)
+        Text(badge.title)
+            .font(HushnoteTheme.Font.eyebrow)
+            .tracking(HushnoteTheme.eyebrowTracking)
+            .textCase(.uppercase)
             .padding(.horizontal, 7)
             .padding(.vertical, 2.5)
             .foregroundStyle(foreground)
@@ -518,11 +524,11 @@ struct ModelDownloadBar: View {
             HStack {
                 Text(ModelDownloadText.percentage(progress.fraction))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
                 Spacer()
                 Text(ModelDownloadText.rate(progress.bytesPerSecond))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.72))
             }
         }
         .frame(maxWidth: 420)
@@ -545,16 +551,15 @@ struct ModelManagerView: View {
         let isBusy = state.recordingPhase.isBusy
 
         return ScrollView {
-            VStack(alignment: .leading, spacing: 30) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Speech models")
-                        .font(HushnoteTheme.Font.pageTitle)
-                    Text("Models are verified before they are loaded and never substituted silently. Setting a default downloads it if it is not here yet, and uses it once it lands.")
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: 620, alignment: .leading)
-                }
+            AdaptivePageScaffold { policy in
+                VStack(alignment: .leading, spacing: policy == .compact ? 24 : 30) {
+                HushnotePageHeader(
+                    title: "Speech models",
+                    subtitle: "Compare the local speech inventory, then download or make one model the default. Hushnote never substitutes a model silently.",
+                    policy: policy
+                )
 
-                ModelStorageLocationCard()
+                modelStorageSummary
 
                 if isBusy {
                     Label(
@@ -562,57 +567,81 @@ struct ModelManagerView: View {
                         systemImage: "pause.circle"
                     )
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
                 }
 
                 if !split.downloaded.isEmpty {
-                    section("DOWNLOADED", rows: split.downloaded, isBusy: isBusy)
+                    section("DOWNLOADED", rows: split.downloaded, isBusy: isBusy, policy: policy)
                 }
                 if !split.available.isEmpty {
-                    section("AVAILABLE TO DOWNLOAD", rows: split.available, isBusy: isBusy)
+                    section("AVAILABLE TO DOWNLOAD", rows: split.available, isBusy: isBusy, policy: policy)
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Performance guidance", systemImage: "gauge.with.dots.needle.33percent")
                         .font(.headline)
                     Text("Large v3 Turbo is tuned for live work on the supported M4 baseline. The accuracy and speed meters rank the catalog against itself; they are not measured word error rates. Hushnote never changes your selection silently.")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
                         .frame(maxWidth: 620, alignment: .leading)
                 }
                 .padding(.top, 10)
             }
-            .pageChrome()
+            }
+            .padding(.vertical, 36)
         }
     }
 
+    private var modelStorageSummary: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                HushnoteEyebrow("Model location")
+                Text(coordinator.modelStorageDisplayPath)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 12)
+            Button("Manage Storage") { coordinator.setSelection(.storage) }
+                .buttonStyle(.borderless)
+        }
+        .padding(.vertical, 12)
+        .hushnoteBottomRule(opacity: 0.6)
+    }
+
     @ViewBuilder
-    private func section(_ title: String, rows: [ModelRow], isBusy: Bool) -> some View {
+    private func section(
+        _ title: String,
+        rows: [ModelRow],
+        isBusy: Bool,
+        policy: AdaptiveLayoutPolicy
+    ) -> some View {
         VStack(alignment: .leading, spacing: 13) {
-            Text(title)
-                .font(.caption2.weight(.bold))
-                .tracking(1.3)
-                .foregroundStyle(.secondary)
+            HushnoteEyebrow(title)
             ForEach(rows) { row in
-                modelRow(row, isBusy: isBusy)
-                Divider().opacity(0.5)
+                modelRow(row, isBusy: isBusy, policy: policy)
+                HushnoteRule(opacity: 0.5)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
-    private func modelRow(_ row: ModelRow, isBusy: Bool) -> some View {
+    private func modelRow(_ row: ModelRow, isBusy: Bool, policy: AdaptiveLayoutPolicy) -> some View {
         let isActive = row.role != nil
 
-        ViewThatFits(in: .horizontal) {
+        Group {
+            if policy == .compact {
+                VStack(alignment: .leading, spacing: 13) {
+                    modelInformation(row, isActive: isActive, compact: true)
+                    modelActions(row, isBusy: isBusy)
+                }
+            } else {
             HStack(alignment: .top, spacing: 22) {
-                modelInformation(row, isActive: isActive)
+                modelInformation(row, isActive: isActive, compact: false)
                 Spacer(minLength: 18)
                 modelActions(row, isBusy: isBusy)
             }
-            VStack(alignment: .leading, spacing: 13) {
-                modelInformation(row, isActive: isActive)
-                modelActions(row, isBusy: isBusy)
             }
         }
         .padding(.vertical, 6)
@@ -623,12 +652,12 @@ struct ModelManagerView: View {
         .accessibilityLabel(accessibilityLabel(row))
     }
 
-    private func modelInformation(_ row: ModelRow, isActive: Bool) -> some View {
-        HStack(alignment: .top, spacing: 22) {
+    private func modelInformation(_ row: ModelRow, isActive: Bool, compact: Bool) -> some View {
+        HStack(alignment: .top, spacing: compact ? 12 : 18) {
             Image(systemName: isActive ? "waveform.circle.fill" : "waveform.circle")
                 .font(.system(size: 25))
-                .foregroundStyle(isActive ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(.secondary))
-                .frame(width: 34)
+                .foregroundStyle(isActive ? AnyShapeStyle(HushnoteTheme.vermilionInk) : AnyShapeStyle(HushnoteTheme.secondaryInk))
+                .frame(width: compact ? 28 : 34)
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 7) {
@@ -642,20 +671,12 @@ struct ModelManagerView: View {
                         .foregroundStyle(HushnoteTheme.moss)
                 }
 
-                HStack(spacing: 10) {
-                    Text(coordinator.installedModelSizeText(row.model) ?? ModelListPolicy.sizeText(row.model))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                    ModelMeter(
-                        title: "Accuracy",
-                        filled: ModelListPolicy.accuracyMeter(row.model),
-                        tint: HushnoteTheme.moss
-                    )
-                    ModelMeter(
-                        title: "Speed",
-                        filled: ModelListPolicy.speedMeter(row.model),
-                        tint: HushnoteTheme.vermilionInk
-                    )
+                if compact {
+                    VStack(alignment: .leading, spacing: 5) {
+                        modelFacts(row)
+                    }
+                } else {
+                    modelFacts(row)
                 }
 
                 if let progress = row.availability.progress {
@@ -673,8 +694,27 @@ struct ModelManagerView: View {
         }
     }
 
+    private func modelFacts(_ row: ModelRow) -> some View {
+        HStack(spacing: 10) {
+            Text(coordinator.installedModelSizeText(row.model) ?? ModelListPolicy.sizeText(row.model))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.72))
+            ModelMeter(
+                title: "Accuracy",
+                filled: ModelListPolicy.accuracyMeter(row.model),
+                tint: HushnoteTheme.moss
+            )
+            ModelMeter(
+                title: "Speed",
+                filled: ModelListPolicy.speedMeter(row.model),
+                tint: HushnoteTheme.vermilionInk
+            )
+        }
+    }
+
     private func modelActions(_ row: ModelRow, isBusy: Bool) -> some View {
         HStack(spacing: 10) {
+            if row.availability != .ready {
             Button(ModelListPolicy.downloadLabel(row.availability)) {
                 if ModelListPolicy.canCancel(row.availability) {
                     coordinator.cancelDownload(row.model)
@@ -682,7 +722,7 @@ struct ModelManagerView: View {
                     Task { await coordinator.downloadModel(row.model) }
                 }
             }
-            .buttonStyle(.bordered)
+            .hushnoteButton(.secondary)
             .disabled(
                 !ModelListPolicy.canCancel(row.availability)
                     && !ModelListPolicy.canDownload(
@@ -690,9 +730,14 @@ struct ModelManagerView: View {
                         phase: state.recordingPhase
                     )
             )
+            } else {
+                Text("Downloaded")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(HushnoteTheme.moss)
+            }
 
             if row.role != .both {
-                Button("Set as default") {
+                Button("Make default") {
                     Task { await coordinator.setDefaultModel(row.model) }
                 }
                 .buttonStyle(.borderless)
@@ -731,110 +776,319 @@ struct SettingsView: View {
         @Bindable var state = state
 
         ScrollView {
-            VStack(alignment: .leading, spacing: 36) {
-                Text("Settings")
-                    .font(HushnoteTheme.Font.pageTitle)
-
-                settingsSection("TRANSCRIPTION") {
-                    Toggle(
-                        "Transcribe while the meeting is happening",
-                        isOn: Binding(
-                            get: { state.liveTranscriptionEnabled },
-                            set: { coordinator.setLiveTranscriptionEnabled($0) }
-                        )
+            AdaptivePageScaffold { policy in
+                VStack(alignment: .leading, spacing: policy == .compact ? 26 : 36) {
+                    HushnotePageHeader(
+                        title: "Settings",
+                        subtitle: "Capture behaviour, retention, and which model writes your summaries.",
+                        policy: policy
                     )
-                    Text("When off, no speech model is loaded during capture: the audio is written to disk and \(SpeechModelResolver.model(named: state.draft.finalModel).displayName) produces the transcript in one pass after you press Stop. That leaves the Neural Engine to the recording and keeps a smaller model's guesses off the screen, at the cost of having nothing to read until the meeting ends.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: 620, alignment: .leading)
-                    ModelStorageLocationCard()
-                        .padding(.top, 8)
-                }
 
-                settingsSection("PRIVACY") {
-                    Toggle(
-                        "Keep audio after finalization",
-                        isOn: Binding(
-                            get: { state.retainAudio },
-                            set: { coordinator.setRetainAudio($0) }
-                        )
-                    )
-                    Text("When off, temporary CAF tracks are removed after the final transcript and speaker pass succeed.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                settingsSection("INSIGHT PROVIDER") {
-                    Picker("Provider", selection: Binding(
-                        get: { state.selectedProvider },
-                        set: { coordinator.setSelectedProvider($0) }
-                    )) {
-                        ForEach(InsightProviderChoice.allCases) { provider in
-                            Text(provider.rawValue).tag(provider)
+                    if policy == .wide {
+                        HStack(alignment: .top, spacing: 44) {
+                            behaviorSettings(state: state)
+                            providerSettings(state: state, policy: policy)
                         }
-                    }
-                    .pickerStyle(.radioGroup)
-
-                    ProviderDisclosure(isLocal: state.selectedProvider.isLocal)
-
-                    if state.selectedProvider == .openAI || state.selectedProvider == .anthropic {
-                        APIKeyField(provider: state.selectedProvider)
-                    } else if state.selectedProvider == .chatGPT {
-                        Button("Connect ChatGPT") { Task { await coordinator.connectChatGPT() } }
-                            .buttonStyle(.borderedProminent)
-                            .tint(HushnoteTheme.inkFill)
-                        Text("Uses Codex App Server’s managed login and Codex rate limits. It does not expose ChatGPT history.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if let tool = state.selectedProvider.agentCLITool {
-                        AgentCLIStatusView(tool: tool)
-                        AgentCLIModelField(tool: tool)
                     } else {
-                        TextField("Path to llama-server executable", text: Binding(
-                            get: { coordinator.localLlamaExecutablePath },
-                            set: { coordinator.setLocalLlamaExecutablePath($0) }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 540)
-                        TextField("Path to GGUF model", text: Binding(
-                            get: { coordinator.localModelPath },
-                            set: { coordinator.setLocalModelPath($0) }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 540)
-                        Text("Hushnote launches the server on 127.0.0.1 only and stops it after the request.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        behaviorSettings(state: state)
+                        providerSettings(state: state, policy: policy)
                     }
-                }
-
-                settingsSection("RECORDING") {
-                    Label("System Audio Recording Only", systemImage: "speaker.wave.2.fill")
-                    Button("Open Privacy & Security") { coordinator.openPrivacySettings() }
-                        .buttonStyle(.bordered)
-                }
-
-                settingsSection("LOCAL DATA") {
-                    Text("Database and recoverable sessions")
-                    Text(coordinator.applicationDataPath)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                    Button("Reveal in Finder") { coordinator.revealApplicationData() }
-                        .buttonStyle(.bordered)
                 }
             }
-            .pageChrome()
+            .padding(.vertical, 36)
+        }
+    }
+
+    private func behaviorSettings(state: AppViewState) -> some View {
+        VStack(alignment: .leading, spacing: 30) {
+            settingsSection("APPEARANCE") {
+                UtilitySettingRow(
+                    title: "Appearance",
+                    consequence: "Choose whether Hushnote follows macOS or uses a fixed light or dark appearance."
+                ) {
+                    AppearanceModeControl()
+                }
+            }
+
+            settingsSection("CAPTURE") {
+                UtilitySettingRow(
+                    title: "Live transcription",
+                    consequence: "Loads a speech model during capture. Turn it off to write audio first and produce the final transcript after Stop."
+                ) {
+                    Toggle("Live transcription", isOn: Binding(
+                        get: { state.liveTranscriptionEnabled },
+                        set: { coordinator.setLiveTranscriptionEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(UtilitySwitchStyle())
+                    .accessibilityLabel("Live transcription")
+                }
+            }
+
+            settingsSection("RETENTION") {
+                UtilitySettingRow(
+                    title: "Keep audio after finalization",
+                    consequence: "When off, temporary CAF tracks are removed after the transcript and speaker pass succeed."
+                ) {
+                    Toggle("Keep audio after finalization", isOn: Binding(
+                        get: { state.retainAudio },
+                        set: { coordinator.setRetainAudio($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(UtilitySwitchStyle())
+                    .accessibilityLabel("Keep audio after finalization")
+                }
+            }
+
+            settingsSection("RECORDING") {
+                UtilitySettingRow(
+                    title: "System audio recording",
+                    consequence: "Hushnote records system audio only. macOS permission is managed in Privacy & Security."
+                ) {
+                    Button("Open Privacy & Security") { coordinator.openPrivacySettings() }
+                        .hushnoteButton(.secondary)
+                }
+            }
+
+            settingsSection("LOCAL MANAGEMENT") {
+                UtilitySettingRow(
+                    title: "Models and local data",
+                    consequence: "Review model downloads, database space, retained recordings, and their locations in one place."
+                ) {
+                    Button("Manage Storage") { coordinator.setSelection(.storage) }
+                        .hushnoteButton(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private struct AppearanceModeControl: View {
+        @AppStorage(AppPreferences.appearanceUserDefaultsKey)
+        private var appearanceRawValue = AppearanceMode.system.rawValue
+
+        private var selection: Binding<AppearanceMode> {
+            Binding(
+                get: {
+                    AppearanceMode(rawValue: appearanceRawValue) ?? .system
+                },
+                set: { mode in
+                    AppPreferences().appearance = mode
+                    // Keep the observation source in sync so the root scene,
+                    // Settings, and every open window update immediately.
+                    appearanceRawValue = mode.rawValue
+                }
+            )
+        }
+
+        var body: some View {
+            HushnoteSegmentedControl(
+                options: AppearanceMode.allCases,
+                selection: selection
+            ) { mode in
+                Text(mode.title)
+                    .accessibilityLabel(mode.title)
+            }
+            .frame(width: 255)
+            .accessibilityLabel("Appearance")
+            .accessibilityValue(selection.wrappedValue.title)
+        }
+    }
+
+    private func providerSettings(state: AppViewState, policy: AdaptiveLayoutPolicy) -> some View {
+        settingsSection("INSIGHT PROVIDER") {
+            ProviderInventory(
+                selection: Binding(
+                    get: { state.selectedProvider },
+                    set: { coordinator.setSelectedProvider($0) }
+                ),
+                policy: policy
+            ) {
+                providerConfiguration(for: state.selectedProvider)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func providerConfiguration(for provider: InsightProviderChoice) -> some View {
+        ProviderDisclosure(isLocal: provider.isLocal)
+
+        if provider == .openAI || provider == .anthropic {
+            APIKeyField(provider: provider)
+        } else if provider == .chatGPT {
+            Button("Connect ChatGPT") { Task { await coordinator.connectChatGPT() } }
+                .hushnoteButton(.primary)
+            Text("Uses Codex App Server’s managed login and Codex rate limits. It does not expose ChatGPT history.")
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+        } else if let tool = provider.agentCLITool {
+            AgentCLIStatusView(tool: tool)
+            AgentCLIModelField(tool: tool)
+        } else {
+            DisclosureGroup("Advanced local configuration") {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField("Path to llama-server executable", text: Binding(
+                        get: { coordinator.localLlamaExecutablePath },
+                        set: { coordinator.setLocalLlamaExecutablePath($0) }
+                    ))
+                    .textFieldStyle(HushnoteFieldStyle())
+                    TextField("Path to GGUF model", text: Binding(
+                        get: { coordinator.localModelPath },
+                        set: { coordinator.setLocalModelPath($0) }
+                    ))
+                    .textFieldStyle(HushnoteFieldStyle())
+                    Text("Hushnote launches the server on 127.0.0.1 only and stops it after the request.")
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+                .padding(.top, 8)
+            }
         }
     }
 
     private func settingsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 13) {
-            Text(title)
-                .font(.caption2.weight(.bold))
-                .tracking(1.3)
-                .foregroundStyle(.secondary)
+            HushnoteEyebrow(title)
             content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A setting is a consequence and a control, not a row borrowed from the
+/// system preference pane. The control remains a real Toggle or Button, so
+/// keyboard and VoiceOver behavior are preserved.
+private struct UtilitySettingRow<Accessory: View>: View {
+    let title: String
+    let consequence: String
+    @ViewBuilder let accessory: Accessory
+
+    init(
+        title: String,
+        consequence: String,
+        @ViewBuilder accessory: () -> Accessory
+    ) {
+        self.title = title
+        self.consequence = consequence
+        self.accessory = accessory()
+    }
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 22) {
+                copy
+                Spacer(minLength: 16)
+                accessory
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                copy
+                accessory
+            }
+        }
+        .padding(.vertical, 11)
+        .hushnoteBottomRule(opacity: 0.55)
+    }
+
+    private var copy: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.callout.weight(.semibold))
+            Text(consequence)
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+                .frame(maxWidth: 560, alignment: .leading)
+        }
+    }
+}
+
+private struct UtilitySwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Button {
+            configuration.isOn.toggle()
+        } label: {
+            ZStack(alignment: configuration.isOn ? .trailing : .leading) {
+                Capsule(style: .continuous)
+                    .fill(configuration.isOn ? HushnoteTheme.moss : HushnoteTheme.rule.opacity(0.8))
+                    .frame(width: 42, height: 24)
+                Circle()
+                    .fill(HushnoteTheme.paperRaised)
+                    .frame(width: 18, height: 18)
+                    .padding(3)
+            }
+            .animation(.easeOut(duration: 0.16), value: configuration.isOn)
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(configuration.isOn ? "On" : "Off")
+    }
+}
+
+/// On larger canvases the provider is a product-owned inventory with an
+/// adjacent detail panel. The compact control is deliberately a native Picker:
+/// it gives a narrow window the same choices without a cramped button stack.
+private struct ProviderInventory<Detail: View>: View {
+    @Binding var selection: InsightProviderChoice
+    let policy: AdaptiveLayoutPolicy
+    @ViewBuilder let detail: Detail
+
+    init(
+        selection: Binding<InsightProviderChoice>,
+        policy: AdaptiveLayoutPolicy,
+        @ViewBuilder detail: () -> Detail
+    ) {
+        _selection = selection
+        self.policy = policy
+        self.detail = detail()
+    }
+
+    var body: some View {
+        if policy == .compact {
+            VStack(alignment: .leading, spacing: 14) {
+                Picker("Provider", selection: $selection) {
+                    ForEach(InsightProviderChoice.allCases) { provider in
+                        Text(provider.rawValue).tag(provider)
+                    }
+                }
+                .pickerStyle(.menu)
+                detailPanel
+            }
+        } else {
+            HStack(alignment: .top, spacing: 24) {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(InsightProviderChoice.allCases) { provider in
+                        Button {
+                            selection = provider
+                        } label: {
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(selection == provider ? HushnoteTheme.vermilion : HushnoteTheme.rule)
+                                    .frame(width: 6, height: 6)
+                                Text(provider.rawValue)
+                                    .font(.callout.weight(selection == provider ? .semibold : .regular))
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(selection == provider ? HushnoteTheme.selectionSurface : .clear, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Use \(provider.rawValue)")
+                        .accessibilityAddTraits(selection == provider ? .isSelected : [])
+                    }
+                }
+                .frame(width: 194, alignment: .leading)
+
+                detailPanel
+                    .padding(.leading, 24)
+                    .overlay(alignment: .leading) { Rectangle().fill(HushnoteTheme.rule.opacity(0.7)).frame(width: 1) }
+            }
+        }
+    }
+
+    private var detailPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(selection.rawValue)
+                .font(HushnoteTheme.Font.subsectionTitle)
+            detail
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -847,21 +1101,34 @@ struct ModelStorageLocationCard: View {
         VStack(alignment: .leading, spacing: 10) {
             Label("Model storage", systemImage: "internaldrive")
                 .font(.headline)
-            Text(coordinator.modelStorageDisplayPath)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .lineLimit(2)
+            DisclosureGroup("Location") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(coordinator.modelStorageDisplayPath)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                        .textSelection(.enabled)
+                    HStack(spacing: 12) {
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(coordinator.modelStorageDisplayPath, forType: .string)
+                        }
+                        .buttonStyle(.borderless)
+                        Button("Reveal") { coordinator.revealModelStorage() }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                .padding(.top, 4)
+            }
+            .font(.caption)
+            .foregroundStyle(HushnoteTheme.secondaryInk)
 
             HStack(spacing: 10) {
                 Button("Choose Folder…") { coordinator.chooseModelStorageDirectory() }
-                    .buttonStyle(.bordered)
+                    .hushnoteButton(.secondary)
                 if coordinator.modelStoragePaths.parentDirectory != nil {
                     Button("Use Default") { coordinator.resetModelStorageDirectory() }
-                        .buttonStyle(.bordered)
+                        .hushnoteButton(.secondary)
                 }
-                Button("Reveal in Finder") { coordinator.revealModelStorage() }
-                    .buttonStyle(.borderless)
             }
 
             if let progress = coordinator.modelStorageMigrationProgress {
@@ -872,22 +1139,22 @@ struct ModelStorageLocationCard: View {
                     )
                     Text(progress.currentItem.map { "Copying \($0)…" } ?? "Finishing model copy…")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
                 }
                 .frame(maxWidth: 480)
             } else if let queued = coordinator.queuedModelStoragePath {
                 Label("Queued for \(queued)", systemImage: "clock")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
             } else if let status = coordinator.modelStorageStatus {
                 Text(status)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
             }
 
             Text("A custom parent contains one Hushnote Models folder. Complete models can be copied when you switch; old files stay in place until you remove them yourself.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
                 .frame(maxWidth: 620, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -908,14 +1175,14 @@ struct AgentCLIStatusView: View {
         VStack(alignment: .leading, spacing: 9) {
             Text("Runs the \(tool.executableName) you are already signed into, with its tools switched off and nothing but an empty folder to read. No API key needed. The transcript is sent to that provider.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
 
             if isChecking {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text("Checking \(tool.executableName)…")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
                 }
             } else if let problem {
                 Text(problem)
@@ -925,11 +1192,11 @@ struct AgentCLIStatusView: View {
             } else {
                 Text("\(tool.displayName) is ready.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
             }
 
             Button("Check again") { Task { await check() } }
-                .buttonStyle(.bordered)
+                .hushnoteButton(.secondary)
                 .disabled(isChecking)
         }
         .task(id: tool) { await check() }
