@@ -566,6 +566,10 @@ final class AppViewState {
     var folderMeetingCounts: [UUID: Int] = [:]
     var unfiledMeetingCount = 0
     var transcript: [TranscriptLineItem] = []
+    /// A request to bring one paragraph into view, raised by the transcript
+    /// index. Carried as identity rather than as a position, for the same
+    /// reason every other transcript address in this app is.
+    var transcriptJumpRequest: TranscriptJumpRequest?
     private var meetingInsights: [UUID: InsightWorkspaceState] = [:]
     private var unscopedInsights = InsightWorkspaceState()
     var recordingPhase = RecordingPhase.idle
@@ -808,5 +812,20 @@ final class AppViewState {
                 }
             }
         }
+    }
+}
+
+
+/// One request to scroll the transcript to a paragraph.
+///
+/// `issued` is what makes asking twice for the same paragraph a second event:
+/// without it the value would compare equal and `onChange` would not fire.
+struct TranscriptJumpRequest: Equatable, Sendable {
+    let paragraphID: UUID
+    let issued: Date
+
+    init(paragraphID: UUID, issued: Date = Date()) {
+        self.paragraphID = paragraphID
+        self.issued = issued
     }
 }

@@ -34,6 +34,13 @@ struct TranscriptParagraph: Identifiable, Equatable {
     let end: TimeInterval
     let runs: [TranscriptProseRun]
     let lines: [TranscriptLineItem]
+    /// Whether this paragraph opens a new five-minute stretch.
+    ///
+    /// Deliberately not `timestamp != nil`: a time is also re-anchored on every
+    /// change of voice, and keying chapters on that gives a two-person
+    /// conversation one chapter per turn -- an index with an entry for every
+    /// reply indexes nothing.
+    let opensChapter: Bool
 
     /// The paragraph as one string: the reading text, the accessibility label,
     /// and what the grouping rules measure themselves against.
@@ -113,8 +120,10 @@ enum TranscriptGrouping {
             // Naming answers "who is speaking now", so it compares against the
             // paragraph above rather than against everyone seen so far.
             let label = draft.speaker == previous?.speaker ? nil : draft.speaker
+            let opensChapter =
+                marker(draft.start, rules) != previous.map { marker($0.start, rules) }
             let stamped = label != nil
-                || marker(draft.start, rules) != previous.map { marker($0.start, rules) }
+                || opensChapter
                 || draft.openingGap >= rules.timeShiftGap
 
             return TranscriptParagraph(
@@ -125,7 +134,8 @@ enum TranscriptGrouping {
                 start: draft.start,
                 end: draft.end,
                 runs: draft.runs,
-                lines: draft.lines
+                lines: draft.lines,
+                opensChapter: opensChapter
             )
         }
     }
@@ -205,13 +215,182 @@ enum TranscriptGrouping {
 }
 
 extension TranscriptParagraph {
-    /// Whether anything but prose belongs above this paragraph.
+    /// A name above the paragraph, because the voice changed.
     ///
-    /// The header is apparatus, and apparatus that repeats stops being read.
-    /// A paragraph that merely continues the same voice in the same stretch of
-    /// the recording draws nothing at all: the break itself is the signal.
-    var showsHeader: Bool {
-        speakerLabel != nil || timestamp != nil || possibleLeakage
+    /// Apparatus that repeats stops being read, so a paragraph continuing the
+    /// same voice draws no name at all.
+    var showsSpeakerName: Bool { speakerLabel != nil }
+
+    /// A rule and a chapter time above the paragraph, because a new stretch of
+    /// the recording has begun. This is the beat the index points at, and it is
+    /// rare -- roughly six times in a thirty-minute meeting.
+    var opensSection: Bool { opensChapter }
+}
+
+/// A stretch of the meeting between two time markers: what the index points at.
+///
+/// Derived from paragraphs rather than from raw segments, so the sanitised text
+/// is the only text it ever sees. There is no new path here from Whisper's
+/// output to a rendered string.
+struct TranscriptChapter: Identifiable, Equatable {
+    /// The identity of the paragraph that opens the chapter -- never a
+    /// position, for the same reason `TranscriptParagraph.id` is not one.
+    let id: UUID
+    let start: TimeInterval
+    let end: TimeInterval
+    /// Distinct speakers heard in this stretch, in first-heard order.
+    let speakers: [String]
+    /// The opening words, already cleaned and already truncated.
+    let opening: String
+    let paragraphIDs: [UUID]
+}
+
+extension TranscriptGrouping {
+    /// How much of a chapter's first paragraph the index shows.
+    static let chapterOpeningLimit = 64
+
+    /// The chapters of a transcript, in order.
+    ///
+    /// - Parameter includesOpenChapter: pass `false` while recording. The
+    ///   chapter still accruing text would otherwise rewrite its own opening
+    ///   words and speaker list on every buffer, reflowing an index the reader
+    ///   is trying to steer by. Closed chapters never change, because grouping
+    ///   only ever extends the last paragraph.
+    nonisolated static func chapters(
+        _ paragraphs: [TranscriptParagraph],
+        includesOpenChapter: Bool = true
+    ) -> [TranscriptChapter] {
+        var chapters: [TranscriptChapter] = []
+        var currentParagraphs: [TranscriptParagraph] = []
+
+        func close() {
+            guard let first = currentParagraphs.first else { return }
+            var speakers: [String] = []
+            for paragraph in currentParagraphs where !speakers.contains(paragraph.speaker) {
+                speakers.append(paragraph.speaker)
+            }
+            chapters.append(
+                TranscriptChapter(
+                    id: first.id,
+                    start: first.start,
+                    end: currentParagraphs.map(\.end).max() ?? first.end,
+                    speakers: speakers,
+                    opening: opening(of: first.text),
+                    paragraphIDs: currentParagraphs.map(\.id)
+                )
+            )
+            currentParagraphs = []
+        }
+
+        for paragraph in paragraphs {
+            // A chapter opens exactly where the reading flow already draws a
+            // rule, so the index and the page agree about where the beats are.
+            if paragraph.opensSection { close() }
+            currentParagraphs.append(paragraph)
+        }
+        close()
+
+        if !includesOpenChapter, !chapters.isEmpty {
+            chapters.removeLast()
+        }
+        return chapters
+    }
+
+    /// Truncates on a word boundary, so the index never cuts mid-word.
+    nonisolated static func opening(
+        of text: String,
+        limit: Int = TranscriptGrouping.chapterOpeningLimit
+    ) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+
+        let clipped = trimmed.prefix(limit)
+        guard let lastSpace = clipped.lastIndex(of: " ") else {
+            return String(clipped) + "\u{2026}"
+        }
+        return clipped[clipped.startIndex..<lastSpace]
+            .trimmingCharacters(in: .whitespaces) + "\u{2026}"
+    }
+}
+
+/// Which chapter the reader is in, from the headers currently on screen.
+///
+/// `LazyVStack` only renders what is visible, so the map is small and sparse --
+/// the answer has to come from the headers that reported, not from a scan of
+/// every chapter.
+enum TranscriptChapterVisibility {
+    /// - Parameters:
+    ///   - headerOffsets: each reporting header's offset from the top of the
+    ///     scroll viewport. Negative means it has scrolled past the top.
+    ///   - order: every chapter id, in document order.
+    /// - Returns: the last header to have passed the top edge, or the first one
+    ///   still below it when none has.
+    nonisolated static func current(
+        headerOffsets: [UUID: CGFloat],
+        order: [UUID],
+        tolerance: CGFloat = 8
+    ) -> UUID? {
+        guard !order.isEmpty else { return nil }
+
+        var passed: UUID?
+        var firstReporting: UUID?
+
+        for id in order {
+            guard let offset = headerOffsets[id] else { continue }
+            if firstReporting == nil { firstReporting = id }
+            if offset <= tolerance { passed = id }
+        }
+        return passed ?? firstReporting
+    }
+}
+
+/// Where the reading column, its apparatus margin, and the index sit.
+///
+/// Container-aware rather than tier-aware: the margin appears as soon as there
+/// is room for it, which happens partway through the regular tier rather than
+/// at one of `AdaptiveLayoutPolicy`'s boundaries.
+struct TranscriptLayout: Equatable, Sendable {
+    var gutter: CGFloat
+    /// Zero when the container cannot host an apparatus column.
+    var marginWidth: CGFloat
+    var marginGap: CGFloat
+    var measure: CGFloat
+    var showsIndexRail: Bool
+    var railWidth: CGFloat
+
+    static let margin: CGFloat = 64
+    static let marginGap: CGFloat = 24
+    static let rail: CGFloat = 232
+    static let railMinimumGap: CGFloat = 40
+
+    var hasMargin: Bool { marginWidth > 0 }
+
+    /// The reading column plus whatever apparatus hangs beside it.
+    var columnWidth: CGFloat {
+        hasMargin ? marginWidth + marginGap + measure : measure
+    }
+
+    nonisolated static func resolve(availableWidth: CGFloat) -> Self {
+        let policy = AdaptiveLayoutPolicy.tier(for: availableWidth)
+        let gutter = policy.gutter
+        let measure = AdaptiveLayoutPolicy.readingMeasure
+
+        let marginCost = margin + marginGap
+        let content = availableWidth - 2 * gutter
+        let fitsMargin = content >= marginCost + measure
+        let fitsRail = policy.showsRightRail
+            && content >= marginCost + measure + railMinimumGap + rail
+
+        return TranscriptLayout(
+            gutter: gutter,
+            marginWidth: fitsMargin ? margin : 0,
+            marginGap: marginGap,
+            // At compact the measure is a ceiling, not a width: the column
+            // fills a narrow window rather than leaving a ragged right edge.
+            measure: policy == .compact ? .infinity : measure,
+            showsIndexRail: fitsRail,
+            railWidth: rail
+        )
     }
 }
 

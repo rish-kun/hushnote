@@ -112,7 +112,7 @@ struct ActiveMeetingView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    TranscriptView(isEditable: false, horizontalInset: policy.gutter)
+                    TranscriptView(isEditable: false, horizontalInset: policy.gutter, isRecording: true)
                 }
             }
         }
@@ -972,11 +972,13 @@ enum TranscriptRowText {
 struct TranscriptView: View {
     let isEditable: Bool
     let horizontalInset: CGFloat
+    var isRecording = false
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isFollowing = true
     @State private var openParagraph: UUID?
+    @State private var headerOffsets: [UUID: CGFloat] = [:]
 
     var body: some View {
         // One linear pass over the transcript. A paragraph that did not change
@@ -988,15 +990,92 @@ struct TranscriptView: View {
             isEditable: isEditable,
             in: paragraphs
         )
+        // While recording, the chapter still accruing text is withheld: it
+        // would rewrite its own opening words on every buffer and reflow an
+        // index the reader is trying to steer by.
+        let chapters = TranscriptGrouping.chapters(
+            paragraphs,
+            includesOpenChapter: !isRecording
+        )
+        let liveParagraph = isRecording ? paragraphs.last?.id : nil
 
+        GeometryReader { proxy in
+            let layout = TranscriptLayout.resolve(availableWidth: proxy.size.width)
+
+            HStack(alignment: .top, spacing: 0) {
+                reader(
+                    paragraphs: paragraphs,
+                    chapters: chapters,
+                    open: open,
+                    liveParagraph: liveParagraph,
+                    layout: layout
+                )
+
+                if layout.showsIndexRail, !chapters.isEmpty {
+                    TranscriptIndexRail(
+                        chapters: chapters,
+                        currentChapterID: TranscriptChapterVisibility.current(
+                            headerOffsets: headerOffsets,
+                            order: chapters.map(\.id)
+                        ),
+                        isRecording: isRecording,
+                        width: layout.railWidth
+                    )
+                    .padding(.trailing, layout.gutter)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .overlay {
+            // Asked of the paragraphs rather than the segments: a transcript of
+            // nothing but control tokens has no prose in it, and an empty pane
+            // would say nothing at all.
+            if paragraphs.isEmpty {
+                HushnoteEmptyState(
+                    title: "No transcript",
+                    message: "The final transcript has not been produced yet."
+                ) {
+                    HushnoteGlyph(systemName: "text.quote")
+                }
+                .padding(.horizontal, horizontalInset)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func reader(
+        paragraphs: [TranscriptParagraph],
+        chapters: [TranscriptChapter],
+        open: UUID?,
+        liveParagraph: UUID?,
+        layout: TranscriptLayout
+    ) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(paragraphs) { paragraph in
+                        if paragraph.opensSection, let start = paragraph.timestamp {
+                            TranscriptChapterHeader(start: start, layout: layout)
+                                .id(chapterHeaderID(paragraph.id))
+                                // Reports where this chapter sits relative to
+                                // the top edge, which is what tells the rail
+                                // where the reader is.
+                                .background {
+                                    GeometryReader { header in
+                                        Color.clear.preference(
+                                            key: ChapterOffsetKey.self,
+                                            value: [paragraph.id: header.frame(in: .named(scrollSpace)).minY]
+                                        )
+                                    }
+                                }
+                        }
+
                         TranscriptParagraphView(
                             paragraph: paragraph,
+                            layout: layout,
                             isEditable: isEditable,
                             isOpen: open == paragraph.id,
+                            isLive: liveParagraph == paragraph.id,
                             toggleOpen: {
                                 openParagraph = open == paragraph.id ? nil : paragraph.id
                             },
@@ -1004,14 +1083,16 @@ struct TranscriptView: View {
                         )
                     }
                 }
-                .frame(maxWidth: HushnoteTheme.transcriptMeasure, alignment: .leading)
+                .frame(maxWidth: layout.columnWidth, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, horizontalInset)
-                // Every paragraph brings its own space above it, so the pane
-                // only has to add the last one's worth at the bottom.
-                .padding(.top, 2)
-                .padding(.bottom, 34)
+                .padding(.horizontal, layout.gutter)
+                // Room to breathe under the tab rule, and enough at the foot
+                // that reading never stops flush against the window edge.
+                .padding(.top, 32)
+                .padding(.bottom, 96)
             }
+            .coordinateSpace(name: scrollSpace)
+            .onPreferenceChange(ChapterOffsetKey.self) { headerOffsets = $0 }
             // A live transcript is a live region: VoiceOver should not treat a
             // new line as a layout change to re-announce from the top.
             .accessibilityAddTraits(.updatesFrequently)
@@ -1030,50 +1111,61 @@ struct TranscriptView: View {
             // that too.
             .onChange(of: state.transcript.last?.id) { _, _ in
                 guard isFollowing, let anchor = paragraphs.last?.id else { return }
-                if reduceMotion {
-                    proxy.scrollTo(anchor, anchor: .bottom)
-                } else {
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo(anchor, anchor: .bottom)
-                    }
-                }
+                scroll(proxy, to: anchor, anchor: .bottom)
             }
-            .overlay(alignment: .bottomTrailing) {
+            .overlay(alignment: .bottom) {
                 // Only offered once the user has actually left the bottom, so
                 // it never competes with the transcript it would scroll.
                 if !isFollowing, let anchor = paragraphs.last?.id {
                     Button {
-                        if reduceMotion {
-                            proxy.scrollTo(anchor, anchor: .bottom)
-                        } else {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                proxy.scrollTo(anchor, anchor: .bottom)
-                            }
-                        }
+                        scroll(proxy, to: anchor, anchor: .bottom)
                         isFollowing = true
                     } label: {
                         Label("Jump to latest", systemImage: "arrow.down")
                             .font(.caption.weight(.medium))
-                            .padding(.horizontal, 12)
+                            .foregroundStyle(HushnoteTheme.ink)
+                            .padding(.horizontal, 13)
                             .padding(.vertical, 7)
-                            .background(.regularMaterial, in: Capsule())
+                            .background(HushnoteTheme.paperRaised, in: Capsule())
+                            .overlay { Capsule().stroke(HushnoteTheme.rule) }
                     }
                     .buttonStyle(.plain)
-                    .padding(20)
+                    // Centred on the column it scrolls rather than pinned to
+                    // the pane's corner, where it used to float over nothing.
+                    .padding(.leading, layout.gutter)
+                    .frame(maxWidth: layout.columnWidth, alignment: .center)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.bottom, 24)
                 }
             }
+            .onChange(of: state.transcriptJumpRequest) { _, request in
+                guard let request else { return }
+                scroll(proxy, to: chapterHeaderID(request.paragraphID), anchor: .top)
+                isFollowing = false
+                state.transcriptJumpRequest = nil
+            }
         }
-        .overlay {
-            // Asked of the paragraphs rather than the segments: a transcript of
-            // nothing but control tokens has no prose in it, and an empty pane
-            // would say nothing at all.
-            if paragraphs.isEmpty {
-                HushnoteEmptyState(
-                    title: "No transcript",
-                    message: "The final transcript has not been produced yet."
-                ) {
-                    HushnoteGlyph(systemName: "text.quote")
-                }
+    }
+
+    private var scrollSpace: String { "hushnote.transcript.scroll" }
+
+    /// Chapter headers scroll to their own anchor, which is deliberately not
+    /// the paragraph's: scrolling to the paragraph would put its rule and time
+    /// above the top edge, so the reader would arrive just after the beat.
+    private func chapterHeaderID(_ paragraphID: UUID) -> String {
+        "chapter-\(paragraphID.uuidString)"
+    }
+
+    private func scroll(
+        _ proxy: ScrollViewProxy,
+        to anchor: some Hashable,
+        anchor edge: UnitPoint
+    ) {
+        if reduceMotion {
+            proxy.scrollTo(anchor, anchor: edge)
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(anchor, anchor: edge)
             }
         }
     }
@@ -1090,6 +1182,183 @@ struct TranscriptView: View {
     }
 }
 
+/// Where each rendered chapter header sits inside the scroll view.
+///
+/// `LazyVStack` only renders what is visible, so this map is small and sparse
+/// by construction -- which is exactly what `TranscriptChapterVisibility`
+/// expects to reason over.
+private struct ChapterOffsetKey: PreferenceKey {
+    static let defaultValue: [UUID: CGFloat] = [:]
+
+    static func reduce(value: inout [UUID: CGFloat], nextValue: () -> [UUID: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// A beat in the recording, drawn where `TranscriptGrouping` decided the reader
+/// has lost the thread of the clock. These are the stops the index points at.
+private struct TranscriptChapterHeader: View {
+    let start: TimeInterval
+    let layout: TranscriptLayout
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: layout.marginGap) {
+            if layout.hasMargin {
+                Text(DurationText.clock(start))
+                    .font(.footnote.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(HushnoteTheme.ink)
+                    .frame(width: layout.marginWidth, alignment: .trailing)
+            }
+            HushnoteRule(opacity: 0.45)
+                .frame(maxWidth: layout.measure)
+            if !layout.hasMargin {
+                Text(DurationText.clock(start))
+                    .font(.footnote.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(HushnoteTheme.ink)
+            }
+        }
+        .padding(.top, 48)
+        .padding(.bottom, 24)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Chapter at \(DurationText.spoken(start))")
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// The apparatus beside a paragraph: when it was said, the way into correcting
+/// it, and whether it is still being written.
+///
+/// It hangs outside the measure, so a reader scanning prose never crosses it.
+/// The time is set as bare digits rather than in a `TimestampButton` capsule,
+/// because in this app a moss capsule means "you can go there" and a transcript
+/// timestamp has nowhere to go -- there is no player behind it.
+private struct TranscriptMargin: View {
+    let start: TimeInterval
+    let layout: TranscriptLayout
+    let isEditable: Bool
+    let isLive: Bool
+    let possibleLeakage: Bool
+    let isRevealed: Bool
+    let correct: () -> Void
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            Text(DurationText.clock(start))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.62))
+                .accessibilityLabel("At \(DurationText.spoken(start))")
+
+            if isEditable {
+                // A word, not a glyph. An affordance seen once every thirty
+                // minutes has to be learned; a word is simply read.
+                Button("Correct", action: correct)
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .opacity(isRevealed ? 1 : 0)
+                    .accessibilityHint("Opens the segments in this paragraph for editing")
+            }
+
+            if possibleLeakage {
+                Image(systemName: "waveform.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.vermilionInk)
+                    .help("This may duplicate audio leaking between tracks")
+                    .accessibilityLabel("May duplicate audio leaking between tracks")
+            }
+        }
+        .frame(width: layout.marginWidth, alignment: .trailing)
+        .overlay(alignment: .trailing) {
+            // The one accent, used for its one meaning, exactly where new text
+            // is landing. Static: the header pulse already owns motion here,
+            // and a second pulse beside prose you are reading is hostile.
+            if isLive {
+                Rectangle()
+                    .fill(HushnoteTheme.vermilion.opacity(0.5))
+                    .frame(width: 2)
+                    .offset(x: 12)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+}
+
+/// The transcript's index: the beats of the meeting, who spoke in each, and
+/// where the reader currently is. It is a sibling of the scroll view rather
+/// than a passenger inside it, because an index that scrolls away cannot index.
+private struct TranscriptIndexRail: View {
+    let chapters: [TranscriptChapter]
+    let currentChapterID: UUID?
+    let isRecording: Bool
+    let width: CGFloat
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HushnoteEyebrow("Contents")
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(chapters) { chapter in
+                        HushnoteSelectableRow(
+                            isSelected: chapter.id == currentChapterID,
+                            select: { state.transcriptJumpRequest = .init(paragraphID: chapter.id) }
+                        ) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 7) {
+                                    // A capsule here, unlike the margin: this
+                                    // one really does go somewhere.
+                                    TimestampButton(seconds: chapter.start) {
+                                        state.transcriptJumpRequest = .init(paragraphID: chapter.id)
+                                    }
+                                    if !chapter.speakers.isEmpty {
+                                        Text(chapter.speakers.joined(separator: ", "))
+                                            .font(.caption2)
+                                            .foregroundStyle(HushnoteTheme.secondaryInk)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                Text(chapter.opening)
+                                    .font(.caption)
+                                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                    }
+                }
+            }
+            .scrollIndicators(.never)
+
+            HushnoteRule(opacity: 0.45)
+            foot
+        }
+        .frame(width: width, alignment: .leading)
+        .padding(.top, 32)
+        .padding(.bottom, 24)
+        // Deliberately not `.updatesFrequently`: a rail that re-announced on
+        // every arriving segment would make VoiceOver unusable while recording.
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Transcript contents")
+    }
+
+    @ViewBuilder
+    private var foot: some View {
+        if isRecording {
+            HStack(spacing: 7) {
+                RecordingPulse(isActive: true)
+                ElapsedTimeLabel(font: .caption.monospacedDigit())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+            }
+        } else if let last = chapters.last {
+            let voices = Set(chapters.flatMap(\.speakers)).count
+            Text("\(DurationText.clock(last.end)) · \(voices) \(voices == 1 ? "voice" : "voices")")
+                .font(.caption)
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+        }
+    }
+}
+
 /// One paragraph: prose, and only the apparatus it earns.
 ///
 /// The name of a speaker and the time appear above the paragraph, small and
@@ -1098,32 +1367,80 @@ struct TranscriptView: View {
 /// carries nothing at all -- the break is the signal.
 private struct TranscriptParagraphView: View {
     let paragraph: TranscriptParagraph
+    let layout: TranscriptLayout
     let isEditable: Bool
     let isOpen: Bool
+    let isLive: Bool
     let toggleOpen: () -> Void
     let onEdit: (TranscriptLineItem, String) -> Void
 
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
+    @FocusState private var isCorrectFocused: Bool
     @State private var isRenamingSpeaker = false
     @State private var speakerDraft = ""
     @FocusState private var speakerFieldFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if paragraph.showsHeader || isOpen { header }
-            if isOpen { segments } else { prose }
+        HStack(alignment: .firstTextBaseline, spacing: layout.marginGap) {
+            if layout.hasMargin {
+                TranscriptMargin(
+                    start: paragraph.start,
+                    layout: layout,
+                    isEditable: isEditable && !isOpen,
+                    isLive: isLive,
+                    possibleLeakage: paragraph.possibleLeakage,
+                    isRevealed: isHovering || isCorrectFocused,
+                    correct: toggleOpen
+                )
+                .focused($isCorrectFocused)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                if paragraph.showsSpeakerName || isOpen { header }
+                if isOpen { segments } else { prose }
+            }
+            .frame(maxWidth: layout.measure, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        // A hover target the whole width of the measure, so the correction
-        // affordance in the margin can be reached from anywhere in the
-        // paragraph rather than only from the words themselves.
+        // A hover target the whole width of the column, so the affordance in
+        // the margin can be reached from anywhere in the paragraph rather than
+        // only from the words themselves.
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
-        .overlay(alignment: .topLeading) { correctionAffordance }
-        // A new voice or a new time opens a section and is given room; a
-        // paragraph that merely continues gets a paragraph's worth of space.
-        .padding(.top, paragraph.showsHeader ? 26 : 13)
+        .background {
+            // Says "this block is a unit you can act on" in the app's own
+            // vocabulary, using the same surface the opened paragraph uses --
+            // so opening is continuous with hovering rather than a jump.
+            if isEditable, isHovering, !isOpen {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(HushnoteTheme.paperRaised)
+                    .padding(.horizontal, -12)
+                    .padding(.vertical, -8)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isHovering)
+        // The instinctive gesture for "edit this text", offered beside the real
+        // button rather than instead of it.
+        .onTapGesture(count: 2) { if isEditable, !isOpen { toggleOpen() } }
+        // A new voice opens a section and is given room; a paragraph that
+        // merely continues gets a paragraph's worth of space. A chapter
+        // opening brings its own, so it is deliberately not counted here.
+        .padding(.top, paragraph.showsSpeakerName ? 32 : 16)
+    }
+
+    /// At compact widths there is no margin, so the affordance follows the
+    /// paragraph instead of hanging beside it.
+    @ViewBuilder
+    private var inlineCorrect: some View {
+        if isEditable, !isOpen, !layout.hasMargin {
+            Button("Correct", action: toggleOpen)
+                .buttonStyle(.plain)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+                .accessibilityHint("Opens the segments in this paragraph for editing")
+        }
     }
 
     private var header: some View {
@@ -1160,15 +1477,6 @@ private struct TranscriptParagraphView: View {
                     .accessibilityLabel("Rename \(speaker)")
                 }
             }
-            if let timestamp = paragraph.timestamp {
-                TimestampButton(seconds: timestamp)
-            }
-            if paragraph.possibleLeakage {
-                Image(systemName: "waveform.badge.exclamationmark")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .help("This may duplicate audio leaking between tracks")
-            }
             if isOpen {
                 Spacer(minLength: 12)
                 Button("Done", action: toggleOpen)
@@ -1194,12 +1502,18 @@ private struct TranscriptParagraphView: View {
     /// arriving mid-paragraph can still read as provisional without breaking
     /// the paragraph in two.
     private var prose: some View {
-        proseText
-            .font(HushnoteTheme.Font.reading)
-            .foregroundStyle(HushnoteTheme.ink)
-            .lineSpacing(7)
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
+        VStack(alignment: .leading, spacing: 6) {
+            proseText
+                .font(HushnoteTheme.Font.reading)
+                .foregroundStyle(HushnoteTheme.ink)
+                .lineSpacing(7)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+
+            inlineCorrect
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .opacity(isHovering || isCorrectFocused ? 1 : 0)
+        }
     }
 
     private var proseText: Text {
@@ -1222,34 +1536,14 @@ private struct TranscriptParagraphView: View {
                 TranscriptRow(line: line) { onEdit(line, $0) }
             }
         }
-        .padding(.vertical, 9)
-        .padding(.horizontal, 12)
+        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
         .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 8))
         .overlay {
             RoundedRectangle(cornerRadius: 8).stroke(HushnoteTheme.rule.opacity(0.7))
         }
     }
 
-    /// Kept out in the margin so it never sits over the prose, and kept out of
-    /// sight until the pointer is in the paragraph. It stays in the
-    /// accessibility tree either way.
-    @ViewBuilder
-    private var correctionAffordance: some View {
-        if isEditable, !isOpen {
-            Button(action: toggleOpen) {
-                Image(systemName: "pencil")
-                    .font(.caption)
-                    .foregroundStyle(HushnoteTheme.secondaryInk)
-                    .frame(width: 28, height: 28)
-            }
-            .buttonStyle(.plain)
-            .help("Correct this paragraph")
-            .accessibilityLabel("Correct this paragraph")
-            .accessibilityHint("Opens the segments in this paragraph for editing")
-            .opacity(isHovering ? 1 : 0)
-            .offset(x: -30, y: paragraph.showsHeader ? 25 : 1)
-        }
-    }
 }
 
 /// One segment, while its paragraph is open for correction.

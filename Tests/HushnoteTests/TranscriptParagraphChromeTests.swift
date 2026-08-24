@@ -14,14 +14,14 @@ import Testing
 struct TranscriptParagraphChromeTests {
     // MARK: - Apparatus
 
-    @Test("A paragraph that opens a voice or a time draws a header")
-    func openingParagraphDrawsAHeader() {
+    @Test("A paragraph that opens a new voice names it")
+    func openingParagraphNamesItsVoice() {
         let paragraphs = TranscriptGrouping.paragraphs([
             Self.line(ordinal: 0, speaker: "Ada", start: 0, end: 2, text: "Are we agreed?"),
             Self.line(ordinal: 1, speaker: "Grace", start: 2, end: 4, text: "Agreed."),
         ])
 
-        #expect(paragraphs.filter(\.showsHeader).count == 2)
+        #expect(paragraphs.filter(\.showsSpeakerName).count == 2)
     }
 
     /// The case the whole redesign is for: a paragraph that merely continues the
@@ -44,14 +44,16 @@ struct TranscriptParagraphChromeTests {
         let continuation = try #require(paragraphs.dropFirst().first)
         #expect(continuation.speakerLabel == nil)
         #expect(continuation.timestamp == nil)
-        #expect(continuation.showsHeader == false)
+        #expect(continuation.showsSpeakerName == false)
+        #expect(continuation.opensSection == false)
     }
 
-    /// A leaking segment used to warn on its own row. Folded into a paragraph it
-    /// still has to warn, so it earns a header for a paragraph that would
-    /// otherwise carry none.
-    @Test("A leak warning is enough to draw a header on its own")
-    func leakWarningEarnsAHeader() throws {
+    /// A leaking segment used to warn on its own row, and then to force a whole
+    /// header onto a paragraph that had nothing else to say. The warning now
+    /// lives in the apparatus margin, so it no longer drags a speaker name and
+    /// a rule along with it -- but it must still be reported.
+    @Test("A leak warning is carried without forcing a header")
+    func leakWarningIsCarriedInTheMargin() throws {
         let sentence = "This is a sentence of some length that carries the point along."
         var lines = (0..<12).map { ordinal in
             Self.line(
@@ -70,7 +72,8 @@ struct TranscriptParagraphChromeTests {
         #expect(continuation.speakerLabel == nil)
         #expect(continuation.timestamp == nil)
         #expect(continuation.possibleLeakage)
-        #expect(continuation.showsHeader)
+        #expect(continuation.showsSpeakerName == false)
+        #expect(continuation.opensSection == false)
     }
 
     // MARK: - Which paragraph is open for correction
