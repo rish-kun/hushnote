@@ -1051,7 +1051,20 @@ final class AppCoordinator {
         }
         do {
             let matches = try await store.searchSegments(cleaned, limit: 200)
-            state.applySearchMatches(Set(matches.map(\.meetingID)), for: cleaned)
+            // The segments carry the matched line, who said it, and when. All
+            // of that used to be reduced to a set of meeting identifiers and
+            // thrown away one line later, which is why search could say a
+            // meeting matched but never which moment in it did.
+            let results = MeetingSearchResultBuilder.results(
+                segmentMatches: matches,
+                meetings: state.meetings,
+                titleMatches: state.meetingsMatchingTitle(cleaned)
+            )
+            state.applySearchMatches(
+                Set(matches.map(\.meetingID)),
+                results: results,
+                for: cleaned
+            )
         } catch {
             state.applySearchMatches([], for: cleaned)
         }
@@ -1486,6 +1499,17 @@ final class AppCoordinator {
     func setLocalModelPath(_ path: String) {
         localModelPath = path
         preferences.localModelPath = path
+    }
+
+    /// Opens a meeting at one transcript moment.
+    ///
+    /// This does write through to the meeting's remembered tab, which is
+    /// deliberate: the user asked for something said out loud, so the
+    /// transcript is the tab they want next time too.
+    func openMeetingMoment(meetingID: UUID, segmentID: String) {
+        setSelection(.meeting(meetingID))
+        setWorkspaceTab(.transcript, for: meetingID)
+        state.transcriptJumpRequest = TranscriptJumpRequest(segmentID: segmentID)
     }
 
     func setSelection(_ destination: SidebarDestination?) {

@@ -73,6 +73,7 @@ struct AppShellView: View {
                 query: $searchQuery,
                 selectedMeetingID: $selectedSearchResultID,
                 onOpen: openSearchResult,
+                onOpenMoment: openSearchMoment,
                 onDismiss: { isShowingSearch = false }
             )
             .environment(state)
@@ -121,10 +122,19 @@ struct AppShellView: View {
         isShowingSearch = false
     }
 
+    /// Opens the meeting *at* the matched line rather than at its remembered
+    /// tab. The user asked for a moment, so the transcript is what they get.
+    private func openSearchMoment(_ meetingID: UUID, _ segmentID: String) {
+        coordinator.openMeetingMoment(meetingID: meetingID, segmentID: segmentID)
+        isShowingSearch = false
+    }
+
     private func clearSearch() {
         searchQuery = ""
         selectedSearchResultID = nil
         state.searchText = ""
+        state.searchPhase = .idle
+        state.searchResults = []
         Task { await coordinator.searchMeetings("") }
     }
 
@@ -252,160 +262,340 @@ struct AppShellView: View {
     }
 }
 
+/// One addressable line in the palette. The list the keyboard walks is flat,
+/// even though the rows are drawn grouped by meeting.
+private enum SearchEntry: Hashable {
+    case meeting(UUID)
+    case moment(meetingID: UUID, segmentID: String)
+
+    var meetingID: UUID {
+        switch self {
+        case .meeting(let id): id
+        case .moment(let id, _): id
+        }
+    }
+}
+
+/// The ⌘K palette.
+///
+/// Deliberately banded rather than stacked: the field, the listing and the
+/// legend each run edge to edge and own their inset, separated by a hairline
+/// rather than by air. The previous layout put four blocks at one uniform gap
+/// inside one uniform padding, so nothing was emphasised -- including the
+/// field, which is the entire point of the screen.
 private struct MeetingSearchPalette: View {
     @Binding var query: String
     @Binding var selectedMeetingID: UUID?
     let onOpen: (UUID) -> Void
+    let onOpenMoment: (UUID, String) -> Void
     let onDismiss: () -> Void
     @Environment(AppViewState.self) private var state
     @FocusState private var isSearchFieldFocused: Bool
+    @State private var selection: SearchEntry?
 
-    private var results: [MeetingListItem] {
-        Array(state.filteredMeetings.prefix(20))
+    private var hasQuery: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// On open the palette shows recents rather than a poster. Pressing
+    /// down-down-return is then a two-second path to yesterday's meeting, and
+    /// the row shape is learned before it has to be read under time pressure.
+    private var results: [MeetingSearchResult] {
+        hasQuery
+            ? state.searchResults
+            : state.meetings.prefix(8).map {
+                MeetingSearchResult(meeting: $0, moments: [], additionalMomentCount: 0)
+            }
+    }
+
+    /// Visual order, flattened. This is what ↑↓ walk.
+    private var entries: [SearchEntry] {
+        results.flatMap { result in
+            [.meeting(result.id)]
+                + result.moments.map { .moment(meetingID: result.id, segmentID: $0.id) }
+        }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Search meetings")
-                        .font(HushnoteTheme.Font.sectionTitle)
-                    Text("Search titles, transcripts, speakers, and decisions.")
-                        .font(.callout)
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                }
-                Spacer(minLength: 12)
-                Text("⌘K")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(HushnoteTheme.secondaryInk)
-            }
+        VStack(spacing: 0) {
+            field
+            HushnoteRule()
+            body(for: results)
+            HushnoteRule()
+            legend
+        }
+        .frame(width: 640)
+        .background(HushnoteTheme.paperRaised)
+        .task {
+            isSearchFieldFocused = true
+            selection = entries.first
+        }
+        .onMoveCommand(perform: moveSelection)
+        // The Cancel button used to carry `.cancelAction`, so deleting it would
+        // have silently taken Escape with it.
+        .onExitCommand(perform: onDismiss)
+    }
 
-            TextField("Search all meetings", text: $query)
-                .textFieldStyle(HushnoteFieldStyle())
+    private var field: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 16))
+                .foregroundStyle(isSearchFieldFocused ? HushnoteTheme.ink : HushnoteTheme.secondaryInk)
+            TextField("Search every meeting", text: $query)
+                .textFieldStyle(.plain)
+                .focusEffectDisabled()
+                .font(.system(size: 18))
+                .foregroundStyle(HushnoteTheme.ink)
                 .focused($isSearchFieldFocused)
-                .accessibilityLabel("Search all meetings")
-                .onSubmit(openSelectedResult)
+                .accessibilityLabel("Search every meeting")
+                .onSubmit(openSelection)
                 .onChange(of: query) { _, value in
                     state.searchText = value
-                    selectedMeetingID = state.filteredMeetings.first?.id
+                    state.searchPhase = value.isEmpty ? .idle : .pending
+                    selection = entries.first
                 }
+            if hasQuery {
+                Button {
+                    query = ""
+                    state.searchText = ""
+                    state.searchPhase = .idle
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 20)
+        .frame(height: 56)
+        // The focus indication is a moss underline rather than a box: a rounded
+        // rectangle inside a 640-point edge-to-edge band fights the panel.
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(HushnoteTheme.moss)
+                .frame(height: 2)
+                .opacity(isSearchFieldFocused ? 1 : 0)
+        }
+    }
 
-            Group {
-                if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    searchPrompt
-                } else if results.isEmpty {
-                    HushnoteEmptyState(
-                        title: "No matching meetings",
-                        message: "Try a title, speaker, decision, or phrase from the transcript."
-                    ) {
-                        HushnoteGlyph(systemName: "magnifyingglass")
-                    }
-                    .padding(.horizontal, 30)
-                    .frame(maxWidth: .infinity, minHeight: 230)
-                } else {
+    @ViewBuilder
+    private func body(for results: [MeetingSearchResult]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HushnoteEyebrow(eyebrow)
+                .padding(.horizontal, 20)
+                .frame(height: 28, alignment: .leading)
+
+            if results.isEmpty {
+                emptyBody
+            } else {
+                ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            ForEach(results) { meeting in
-                                searchResult(meeting)
-                                HushnoteRule(opacity: 0.62)
+                            ForEach(results) { result in
+                                MeetingSearchRow(
+                                    result: result,
+                                    selection: selection,
+                                    open: { onOpen(result.id) },
+                                    openMoment: { onOpenMoment(result.id, $0) }
+                                )
+                                .id(SearchEntry.meeting(result.id))
+                                HushnoteRule(opacity: 0.5)
                             }
                         }
                     }
-                    .frame(height: 300)
+                    .onChange(of: selection) { _, entry in
+                        guard let entry else { return }
+                        proxy.scrollTo(entry.meetingID.hashValue == 0 ? entry : entry, anchor: .center)
+                    }
                 }
             }
-
-            HStack {
-                Text("↑↓ to choose · Return to open · Esc to close")
-                    .font(.caption)
-                    .foregroundStyle(HushnoteTheme.secondaryInk)
-                Spacer()
-                Button("Cancel", action: onDismiss)
-                    .keyboardShortcut(.cancelAction)
-            }
         }
-        .padding(24)
-        .frame(width: 620)
-        .task { isSearchFieldFocused = true }
-        .onMoveCommand(perform: moveSelection)
+        .frame(height: 400, alignment: .top)
     }
 
-    private var searchPrompt: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: "text.magnifyingglass")
-                .font(.title2)
-                .foregroundStyle(HushnoteTheme.moss)
-            Text("Find the moment you need")
-                .font(.headline)
-            Text("Search across your private meeting notebook without changing the current view.")
-                .font(.callout)
-                .foregroundStyle(HushnoteTheme.secondaryInk)
+    @ViewBuilder
+    private var emptyBody: some View {
+        if state.meetings.isEmpty {
+            paletteEmptyState(
+                title: "No meetings yet",
+                message: "Record one, and everything said in it becomes searchable here."
+            )
+        } else {
+            paletteEmptyState(
+                title: "No matching meetings",
+                message: "Try a title, a speaker, or a phrase somebody actually said."
+            )
         }
-        .padding(.vertical, 38)
+    }
+
+    private func paletteEmptyState(title: String, message: String) -> some View {
+        HushnoteEmptyState(title: title, message: message) {
+            HushnoteGlyph(systemName: "magnifyingglass")
+        }
+        .padding(.horizontal, 20)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func searchResult(_ meeting: MeetingListItem) -> some View {
-        Button {
-            onOpen(meeting.id)
-        } label: {
-            HStack(alignment: .top, spacing: 14) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(meeting.startedAt, format: .dateTime.month(.abbreviated).day())
-                        .font(.caption.weight(.semibold))
-                    Text(meeting.startedAt, format: .dateTime.year())
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                }
-                .frame(width: 66, alignment: .leading)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(meeting.title)
-                        .font(.headline)
-                        .lineLimit(1)
-                    Text(meeting.excerpt.isEmpty ? "No transcript yet" : meeting.excerpt)
-                        .font(.callout)
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                        .lineLimit(2)
-                }
-                Spacer(minLength: 8)
-                if selectedMeetingID == meeting.id {
-                    Image(systemName: "return")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(HushnoteTheme.moss)
-                        .accessibilityHidden(true)
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                selectedMeetingID == meeting.id ? HushnoteTheme.selectionSurface : .clear,
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-            )
+    /// The only thing that changes during the debounce. A 12-point uppercase
+    /// label can swap ten times a second without reading as flicker; a spinner
+    /// cannot, which is why there isn't one.
+    private var eyebrow: String {
+        guard hasQuery else { return "Recent" }
+        if state.searchPhase == .pending { return "Searching transcripts…" }
+        let moments = results.reduce(0) { $0 + $1.moments.count }
+        guard moments > 0 else {
+            return results.isEmpty ? "No matches" : "\(results.count) by title"
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Open \(meeting.title)")
+        return "\(moments) moment\(moments == 1 ? "" : "s") in \(results.count) meeting\(results.count == 1 ? "" : "s")"
+    }
+
+    private var legend: some View {
+        Text("↑↓ choose · ↩ open · ⌘↩ open meeting · esc close")
+            .font(.caption)
+            .foregroundStyle(HushnoteTheme.secondaryInk)
+            .padding(.horizontal, 20)
+            .frame(height: 34, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Keyboard shortcuts. Up and down arrows choose. Return opens. Command Return opens the meeting. Escape closes."
+            )
     }
 
     private func moveSelection(_ direction: MoveCommandDirection) {
-        guard !results.isEmpty else { return }
-        let current = selectedMeetingID.flatMap { id in results.firstIndex(where: { $0.id == id }) } ?? 0
+        let entries = entries
+        guard !entries.isEmpty else { return }
+        let current = selection.flatMap { entries.firstIndex(of: $0) } ?? 0
         switch direction {
-        case .down:
-            selectedMeetingID = results[min(current + 1, results.count - 1)].id
-        case .up:
-            selectedMeetingID = results[max(current - 1, 0)].id
-        default:
-            break
+        // Clamped rather than wrapped: springing from the last row to the first
+        // loses the reader's place in a list they are scanning.
+        case .down: selection = entries[min(current + 1, entries.count - 1)]
+        case .up: selection = entries[max(current - 1, 0)]
+        default: break
         }
+        selectedMeetingID = selection?.meetingID
     }
 
-    private func openSelectedResult() {
-        if let selectedMeetingID {
-            onOpen(selectedMeetingID)
-        } else if let first = results.first {
-            onOpen(first.id)
+    private func openSelection() {
+        switch selection ?? entries.first {
+        case .meeting(let id): onOpen(id)
+        case .moment(let meetingID, let segmentID): onOpenMoment(meetingID, segmentID)
+        case nil: break
         }
+    }
+}
+
+/// One meeting in the palette, with the moments inside it that matched.
+private struct MeetingSearchRow: View {
+    let result: MeetingSearchResult
+    let selection: SearchEntry?
+    let open: () -> Void
+    let openMoment: (String) -> Void
+
+    private var isMeetingSelected: Bool { selection == .meeting(result.id) }
+
+    private var isAnythingHereSelected: Bool {
+        selection?.meetingID == result.id
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            HushnoteRowDate(date: result.meeting.startedAt)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Button(action: open) {
+                    HStack(spacing: 8) {
+                        Text(result.meeting.title)
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(HushnoteTheme.ink)
+                            .lineLimit(1)
+                        Spacer(minLength: 8)
+                        Text(DurationText.clock(result.meeting.duration))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(HushnoteTheme.secondaryInk)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open \(result.meeting.title)")
+                .accessibilityAddTraits(isMeetingSelected ? [.isSelected] : [])
+
+                if result.moments.isEmpty {
+                    Text(result.meeting.excerpt.isEmpty ? "No transcript yet" : result.meeting.excerpt)
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                        .lineLimit(1)
+                } else {
+                    ForEach(result.moments) { moment in
+                        MeetingSearchMomentLine(
+                            moment: moment,
+                            isSelected: selection == .moment(
+                                meetingID: result.id,
+                                segmentID: moment.id
+                            ),
+                            open: { openMoment(moment.id) }
+                        )
+                    }
+                    if result.additionalMomentCount > 0 {
+                        Text("+\(result.additionalMomentCount) more in this meeting")
+                            .font(.caption2)
+                            .foregroundStyle(HushnoteTheme.secondaryInk)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(alignment: .leading) {
+            if isAnythingHereSelected {
+                HushnoteTheme.selectionSurface
+                    .overlay(alignment: .leading) {
+                        // The tint alone gives the eye no anchor at this width,
+                        // and is the only cue a colour-blind reader would lose.
+                        Rectangle()
+                            .fill(HushnoteTheme.moss)
+                            .frame(width: 2)
+                    }
+            }
+        }
+    }
+}
+
+/// A matched line of transcript: when it was said, by whom, and what was said.
+private struct MeetingSearchMomentLine: View {
+    let moment: MeetingSearchMoment
+    let isSelected: Bool
+    let open: () -> Void
+
+    var body: some View {
+        Button(action: open) {
+            HStack(spacing: 8) {
+                // A moss capsule, because this one really does go somewhere.
+                TimestampButton(seconds: moment.start, action: open)
+                if let speaker = moment.speaker, !speaker.isEmpty {
+                    Text(speaker)
+                        .font(.caption2)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+                Text(moment.text)
+                    .font(.caption)
+                    .foregroundStyle(isSelected ? HushnoteTheme.ink : HushnoteTheme.secondaryInk)
+                    // One line each: two moments at one line beat one moment at
+                    // two, because breadth is what tells you which meeting.
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(
+            moment.speaker.map { "\($0): \(moment.text)" } ?? moment.text
+        )
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 

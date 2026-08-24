@@ -1138,13 +1138,42 @@ struct TranscriptView: View {
                     .padding(.bottom, 24)
                 }
             }
-            .onChange(of: state.transcriptJumpRequest) { _, request in
-                guard let request else { return }
-                scroll(proxy, to: chapterHeaderID(request.paragraphID), anchor: .top)
-                isFollowing = false
-                state.transcriptJumpRequest = nil
+            .onChange(of: state.transcriptJumpRequest) { _, _ in
+                resolveJump(proxy, paragraphs: paragraphs)
+            }
+            // A request raised from search arrives before the meeting's
+            // transcript has loaded. Retry as paragraphs appear, rather than
+            // consuming the request against an empty list.
+            .onChange(of: paragraphs.count) { _, _ in
+                resolveJump(proxy, paragraphs: paragraphs)
             }
         }
+    }
+
+    private func resolveJump(_ proxy: ScrollViewProxy, paragraphs: [TranscriptParagraph]) {
+        guard let request = state.transcriptJumpRequest else { return }
+
+        if let paragraphID = request.paragraphID {
+            // From the index: land on the chapter's own anchor, not the
+            // paragraph's, or the rule and time it opens with end up above the
+            // top edge and the reader arrives just past the beat.
+            scroll(proxy, to: chapterHeaderID(paragraphID), anchor: .top)
+        } else if let segmentID = request.segmentID,
+                  let paragraphID = TranscriptGrouping.paragraphID(
+                      containingSegmentID: segmentID,
+                      in: paragraphs
+                  ) {
+            scroll(proxy, to: paragraphID, anchor: .center)
+        } else {
+            // Leave the request standing rather than consuming it against
+            // nothing; the retry above will pick it up.
+            return
+        }
+
+        // Without this the follow-scroll takes the view straight back to the
+        // bottom as soon as the next segment arrives.
+        isFollowing = false
+        state.transcriptJumpRequest = nil
     }
 
     private var scrollSpace: String { "hushnote.transcript.scroll" }

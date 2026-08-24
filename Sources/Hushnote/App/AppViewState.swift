@@ -565,6 +565,14 @@ final class AppViewState {
     /// Active-meeting counts, keyed by folder, for sidebar badges.
     var folderMeetingCounts: [UUID: Int] = [:]
     var unfiledMeetingCount = 0
+    var searchResults: [MeetingSearchResult] = []
+    /// Whether the transcript search behind the current query has settled.
+    ///
+    /// Without this, an empty result set during the 250ms debounce is
+    /// indistinguishable from a query that genuinely matched nothing, and a
+    /// fast typist gets "No matching meetings" flashing between keystrokes.
+    var searchPhase: SearchPhase = .idle
+
     var transcript: [TranscriptLineItem] = []
     /// A request to bring one paragraph into view, raised by the transcript
     /// index. Carried as identity rather than as a position, for the same
@@ -685,10 +693,18 @@ final class AppViewState {
     /// Debouncing cancels the previous query, but cancellation is not
     /// instantaneous: a query already in flight can still return, and without
     /// this the last one to finish wins regardless of what it was asking.
-    func applySearchMatches(_ ids: Set<UUID>?, for query: String) {
+    func applySearchMatches(
+        _ ids: Set<UUID>?,
+        results: [MeetingSearchResult] = [],
+        for query: String
+    ) {
+        // Load-bearing: a slow response for an abandoned query must not
+        // overwrite the results of the one the user is actually looking at.
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard query.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed else { return }
         searchMatchedMeetingIDs = ids
+        searchResults = results
+        searchPhase = trimmed.isEmpty ? .idle : .done
     }
 
     var finalizationLabel: String {
@@ -704,6 +720,16 @@ final class AppViewState {
                 || $0.excerpt.localizedStandardContains(searchText)
                 || searchMatchedMeetingIDs?.contains($0.id) == true
         }
+    }
+
+    /// Meetings whose title answers the query, matched in memory.
+    ///
+    /// The list is fully resident, so title hits are instant while the FTS5
+    /// pass over transcripts is still running behind the debounce.
+    func meetingsMatchingTitle(_ query: String) -> [MeetingListItem] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return meetings.filter { $0.title.localizedStandardContains(trimmed) }
     }
 
     var selectedFolderID: UUID? {
@@ -820,12 +846,25 @@ final class AppViewState {
 ///
 /// `issued` is what makes asking twice for the same paragraph a second event:
 /// without it the value would compare equal and `onChange` would not fire.
+enum SearchPhase: Equatable, Sendable {
+    /// No query.
+    case idle
+    /// A query is typed; the transcript search behind it has not answered yet.
+    case pending
+    case done
+}
+
 struct TranscriptJumpRequest: Equatable, Sendable {
-    let paragraphID: UUID
+    /// Either a paragraph to scroll to, raised by the transcript's own index...
+    let paragraphID: UUID?
+    /// ...or a segment, raised by search, which the pane resolves to whichever
+    /// paragraph that segment was folded into.
+    let segmentID: String?
     let issued: Date
 
-    init(paragraphID: UUID, issued: Date = Date()) {
+    init(paragraphID: UUID? = nil, segmentID: String? = nil, issued: Date = Date()) {
         self.paragraphID = paragraphID
+        self.segmentID = segmentID
         self.issued = issued
     }
 }

@@ -313,6 +313,22 @@ extension TranscriptGrouping {
     }
 }
 
+extension TranscriptGrouping {
+    /// The paragraph a given transcript segment was folded into.
+    ///
+    /// A paragraph's identity is its *opening* line's, so a segment in the
+    /// middle of one has to be searched for across `lines`. Addressed by
+    /// identity, never by index. Returns nil when the transcript does not hold
+    /// that segment -- it may not have loaded yet, or the segment may have
+    /// cleaned away to nothing and been dropped.
+    nonisolated static func paragraphID(
+        containingSegmentID segmentID: String,
+        in paragraphs: [TranscriptParagraph]
+    ) -> UUID? {
+        paragraphs.first { $0.lines.contains { $0.segmentID == segmentID } }?.id
+    }
+}
+
 /// Which chapter the reader is in, from the headers currently on screen.
 ///
 /// `LazyVStack` only renders what is visible, so the map is small and sparse --

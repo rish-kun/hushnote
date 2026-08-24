@@ -501,6 +501,8 @@ extension View {
 /// cross an actor boundary. The chrome is therefore applied in two places, and
 /// these constants are what keep them identical.
 enum HushnoteFieldMetrics {
+    static let focusRingWidth: CGFloat = 2
+    static let focusRingOpacity: Double = 0.55
     static let cornerRadius: CGFloat = 8
     static let horizontalPadding: CGFloat = 11
     static let verticalPadding: CGFloat = 9
@@ -517,6 +519,7 @@ enum HushnoteFieldMetrics {
 struct HushnoteFieldChrome: ViewModifier {
     func body(content: Content) -> some View {
         content
+            .focusEffectDisabled()
             .font(.callout)
             .padding(.horizontal, HushnoteFieldMetrics.horizontalPadding)
             .padding(.vertical, HushnoteFieldMetrics.verticalPadding)
@@ -530,11 +533,41 @@ struct HushnoteFieldChrome: ViewModifier {
 
 extension View {
     func hushnoteField() -> some View { modifier(HushnoteFieldChrome()) }
+
+    /// The focus ring the app owns, in moss rather than platform blue.
+    ///
+    /// Suppressing the system ring without replacing it would leave a keyboard
+    /// user with no idea where they are, so this is not optional decoration.
+    func hushnoteFocusRing(_ isFocused: Bool) -> some View {
+        modifier(HushnoteFocusRing(isFocused: isFocused))
+    }
+}
+
+struct HushnoteFocusRing: ViewModifier {
+    let isFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content.overlay {
+            HushnoteFieldMetrics.shape
+                .strokeBorder(
+                    HushnoteTheme.moss.opacity(isFocused ? HushnoteFieldMetrics.focusRingOpacity : 0),
+                    lineWidth: HushnoteFieldMetrics.focusRingWidth
+                )
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: isFocused)
+        }
+    }
 }
 
 struct HushnoteFieldStyle: TextFieldStyle {
     func _body(configuration: TextField<Self._Label>) -> some View {
+        // Without `.plain` the field keeps its platform presentation: an
+        // `NSTextField` bezel and the system blue focus ring, drawn *inside*
+        // the border below. Focus indication is the call site's job -- a
+        // `TextFieldStyle` is stateless and cannot know about focus.
         configuration
+            .textFieldStyle(.plain)
+            .focusEffectDisabled()
             .font(.callout)
             .padding(.horizontal, HushnoteFieldMetrics.horizontalPadding)
             .padding(.vertical, HushnoteFieldMetrics.verticalPadding)
