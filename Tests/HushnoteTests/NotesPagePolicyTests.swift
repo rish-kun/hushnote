@@ -34,6 +34,18 @@ struct NotesPagePolicyTests {
         #expect(NotesPagePolicy.wordCount("ship the\nrelease\ton Friday") == 5)
     }
 
+    /// The old copy said "Write notes while the meeting runs" on a screen the
+    /// navigation could not reach during a meeting. It can now -- but only
+    /// while one is actually running.
+    @Test("The invitation only promises what the phase can deliver")
+    func placeholder() {
+        #expect(NotesPagePolicy.placeholder(isCapturing: true).hasPrefix("Write while it happens"))
+        #expect(
+            NotesPagePolicy.placeholder(isCapturing: false)
+                .hasPrefix("Anything worth keeping")
+        )
+    }
+
     @Test("One word is not one words")
     func label() {
         #expect(NotesPagePolicy.wordCountLabel(0) == "0 words")

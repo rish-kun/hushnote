@@ -59,6 +59,11 @@ struct ActiveMeetingView: View {
     var body: some View {
         GeometryReader { proxy in
             let policy = AdaptiveLayoutPolicy.tier(for: proxy.size.width)
+            let tabs = WorkspaceTabAvailability.available(during: state.recordingPhase)
+            let selected = WorkspaceTabAvailability.resolved(
+                state.workspaceTab(for: meetingID),
+                during: state.recordingPhase
+            )
 
             VStack(spacing: 0) {
                 recordingHeader(policy)
@@ -91,28 +96,26 @@ struct ActiveMeetingView: View {
                         .background(HushnoteTheme.vermilion.opacity(0.08))
                 }
 
-                if state.transcript.isEmpty {
-                    // With live transcription off nothing is listening for text, so
-                    // the pane says what will actually happen instead. See
-                    // `LiveTranscriptionPolicy.emptyTranscript`.
-                    let empty = LiveTranscriptionPolicy.emptyTranscript(isEnabled: state.liveTranscriptionEnabled)
-                    VStack(spacing: 13) {
-                        Image(systemName: empty.symbol)
-                            .font(.system(size: 28, weight: .light))
-                            .foregroundStyle(
-                                state.liveTranscriptionEnabled
-                                    ? AnyShapeStyle(HushnoteTheme.vermilionInk)
-                                    : AnyShapeStyle(HushnoteTheme.secondaryInk)
-                            )
-                        Text(empty.title)
-                            .font(HushnoteTheme.Font.emptyStateTitle)
-                        Text(empty.detail)
-                            .font(.callout)
-                            .foregroundStyle(HushnoteTheme.secondaryInk)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    TranscriptView(isEditable: false, horizontalInset: policy.gutter, isRecording: true)
+                // Everything above is session-wide: it belongs to the capture,
+                // not to whichever tab is open over it.
+                MeetingWorkspaceTabBar(
+                    tabs: tabs,
+                    selected: selected,
+                    select: { coordinator.setWorkspaceTab($0, for: meetingID) },
+                    horizontalInset: policy.gutter
+                )
+
+                // Deliberately a switch over two leaves rather than the two
+                // bodies inline. `state.transcript` is written on every live
+                // ASR delta, so a body that reads it is rebuilt at speaking
+                // cadence -- and this one would then hold the notes editor.
+                // `ActiveTranscriptTab` owns that read the way `SystemLevelMeter`
+                // owns `systemLevel`.
+                switch selected {
+                case .notes:
+                    MeetingNotesView(meetingID: meetingID)
+                default:
+                    ActiveTranscriptTab(horizontalInset: policy.gutter)
                 }
             }
         }
@@ -179,12 +182,75 @@ struct ActiveMeetingView: View {
     }
 }
 
+/// The live transcript, and what stands in for it before there is one.
+///
+/// A leaf for the same reason `SystemLevelMeter` and `ElapsedTimeLabel` are:
+/// `state.transcript` is replaced wholesale on every arriving delta, and
+/// SwiftUI attributes that dependency to whichever `body` actually reads it.
+/// Read from `ActiveMeetingView.body` -- as it was until the recording screen
+/// gained tabs -- it rebuilt the header, the level strip and now the notes
+/// editor every time somebody spoke.
+private struct ActiveTranscriptTab: View {
+    let horizontalInset: CGFloat
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        if state.transcript.isEmpty {
+            // With live transcription off nothing is listening for text, so
+            // the pane says what will actually happen instead. See
+            // `LiveTranscriptionPolicy.emptyTranscript`. It is scoped to this
+            // tab rather than the whole screen now: someone recording with
+            // live transcription off still has notes to write.
+            let empty = LiveTranscriptionPolicy.emptyTranscript(isEnabled: state.liveTranscriptionEnabled)
+            VStack(spacing: 13) {
+                Image(systemName: empty.symbol)
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(
+                        state.liveTranscriptionEnabled
+                            ? AnyShapeStyle(HushnoteTheme.vermilionInk)
+                            : AnyShapeStyle(HushnoteTheme.secondaryInk)
+                    )
+                Text(empty.title)
+                    .font(HushnoteTheme.Font.emptyStateTitle)
+                Text(empty.detail)
+                    .font(.callout)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            TranscriptView(
+                // One source of truth rather than a hardcoded `false` that
+                // happens to agree with it.
+                isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
+                horizontalInset: horizontalInset,
+                isRecording: true
+            )
+        }
+    }
+}
+
 struct CompletedMeetingView: View {
     let meetingID: UUID
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
-    private let tabs = WorkspaceTab.allCases
+    /// Not `state.recordingPhase`: this workspace also renders for meetings
+    /// that are merely *not* the one recording. See `governingPhase`.
+    private var phase: RecordingPhase {
+        WorkspaceTabAvailability.governingPhase(
+            state.recordingPhase,
+            activeMeetingID: state.activeMeetingID,
+            meetingID: meetingID
+        )
+    }
+
+    private var tabs: [WorkspaceTab] {
+        WorkspaceTabAvailability.available(during: phase)
+    }
+
+    private var selectedTab: WorkspaceTab {
+        WorkspaceTabAvailability.resolved(state.workspaceTab(for: meetingID), during: phase)
+    }
 
     var body: some View {
         @Bindable var state = state
@@ -203,7 +269,7 @@ struct CompletedMeetingView: View {
 
                 MeetingWorkspaceTabBar(
                     tabs: tabs,
-                    selected: state.workspaceTab(for: meetingID),
+                    selected: selectedTab,
                     select: { coordinator.setWorkspaceTab($0, for: meetingID) },
                     horizontalInset: policy.gutter
                 )
@@ -401,7 +467,7 @@ struct CompletedMeetingView: View {
 
     @ViewBuilder
     private func workspaceTab(_ policy: AdaptiveLayoutPolicy) -> some View {
-        switch state.workspaceTab(for: meetingID) {
+        switch selectedTab {
         case .notes: MeetingNotesView(meetingID: meetingID)
         case .summary: summaryWorkspace(policy)
         case .transcript:
@@ -856,7 +922,25 @@ struct MeetingNotesView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
 
+    /// The editor's own caret. `TextEditor(text:selection:)` is macOS 15, and
+    /// this package targets macOS 15, so stamping needs no AppKit bridge and
+    /// no availability fence -- `TextSelection.Indices` hands back real
+    /// `Range<String.Index>` values into the bound string.
+    @State private var selection: TextSelection?
+
     private var notes: String { state.meetingNotes[meetingID, default: ""] }
+
+    /// The transcript's own clock, which is the audio sample clock. Nil when
+    /// nothing has been transcribed yet -- with live transcription off there is
+    /// no honest time to stamp, and a wrong one is worse than none.
+    ///
+    /// Read only from `stampMoment`'s action closure, never from `body`.
+    /// `state.transcript` is replaced on every live ASR delta, and a `body`
+    /// that reads it is rebuilt at speaking cadence -- with the editor inside
+    /// it. That is why the rail is `NotesRail`, a separate view.
+    private var stampableSeconds: TimeInterval? {
+        state.transcript.last?.end
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -867,7 +951,7 @@ struct MeetingNotesView: View {
                     .frame(maxWidth: layout.readerWidth ?? .infinity, alignment: .leading)
 
                 if layout.showsIndexRail {
-                    rail
+                    NotesRail(meetingID: meetingID)
                         .frame(width: layout.railWidth, alignment: .leading)
                         .padding(.top, 34)
                         .padding(.trailing, layout.gutter)
@@ -896,10 +980,16 @@ struct MeetingNotesView: View {
     }
 
     private var editor: some View {
-        TextEditor(text: Binding(
-            get: { notes },
-            set: { coordinator.queueMeetingNotes(meetingID: meetingID, text: $0) }
-        ))
+        TextEditor(
+            text: Binding(
+                get: { notes },
+                set: { coordinator.queueMeetingNotes(meetingID: meetingID, text: $0) }
+            ),
+            selection: $selection
+        )
+        .onReceive(NotificationCenter.default.publisher(for: .hushnoteStampMoment)) { _ in
+            stampMoment()
+        }
         .font(HushnoteTheme.Font.reading)
         .lineSpacing(6)
         .textEditorStyle(.plain)
@@ -907,12 +997,9 @@ struct MeetingNotesView: View {
         .frame(maxHeight: .infinity)
         .overlay(alignment: .topLeading) {
             if notes.isEmpty {
-                // Deliberately no longer "Write notes while the meeting
-                // runs…": while a meeting runs `MeetingWorkspaceView` routes
-                // to `ActiveMeetingView`, which has no tab bar and therefore
-                // no Notes tab. The old copy advertised something the
-                // navigation cannot reach.
-                Text("Anything worth keeping about this meeting…")
+                Text(NotesPagePolicy.placeholder(
+                    isCapturing: state.recordingPhase.isCapturing
+                ))
                     .font(HushnoteTheme.Font.reading)
                     .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.55))
                     // Clears `NSTextView`'s own line-fragment padding, so the
@@ -924,17 +1011,60 @@ struct MeetingNotesView: View {
         .accessibilityLabel("Meeting notes")
     }
 
-    // MARK: - Rail
+    /// Writes the moment being spoken into the note, at the caret.
+    ///
+    /// Delivered by notification rather than by a `keyboardShortcut` on a
+    /// button, because the menu command cannot reach this view's `@State` --
+    /// the same route `.hushnoteToggleSidebar` takes for the same reason.
+    private func stampMoment() {
+        guard let seconds = stampableSeconds else { return }
 
-    /// The same two sections Ask's rail carries, so the two tabs agree about
-    /// what a meeting's facts are and where they live.
-    private var rail: some View {
+        var range: Range<String.Index>?
+        if case .selection(let selected)? = selection?.indices {
+            range = selected
+        }
+
+        let stamped = NoteStampPolicy.stamping(notes, selection: range, seconds: seconds)
+        coordinator.queueMeetingNotes(meetingID: meetingID, text: stamped.text)
+        // Re-derived against the *new* string: the index the caret came from
+        // was invalidated by the insertion that just happened.
+        selection = TextSelection(
+            insertionPoint: stamped.text.index(
+                stamped.text.startIndex,
+                offsetBy: stamped.caretOffset
+            )
+        )
+    }
+
+}
+
+/// What is true about these notes, and about the meeting behind them.
+///
+/// Its own view rather than a computed property on `MeetingNotesView`, because
+/// it reads `state.transcript` -- which is replaced on every live ASR delta.
+/// Read from the page's own body, it would rebuild the notes editor every time
+/// somebody spoke. Same reason `SystemLevelMeter` is a leaf.
+private struct NotesRail: View {
+    let meetingID: UUID
+    @Environment(AppViewState.self) private var state
+
+    private var notes: String { state.meetingNotes[meetingID, default: ""] }
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 26) {
             VStack(alignment: .leading, spacing: 8) {
                 HushnoteEyebrow("Notes")
                 saveLine
                 if !notes.isEmpty {
                     Text(NotesPagePolicy.wordCountLabel(NotesPagePolicy.wordCount(notes)))
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+                if state.recordingPhase.isCapturing, state.transcript.last != nil {
+                    // Said where the writing is, not only in a menu. An
+                    // affordance reachable solely by shortcut is one nobody
+                    // finds.
+                    Text("⌘⇧T stamps the moment")
                         .font(.caption)
                         .foregroundStyle(HushnoteTheme.secondaryInk)
                 }

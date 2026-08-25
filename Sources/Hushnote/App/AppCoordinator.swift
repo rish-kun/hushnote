@@ -622,6 +622,33 @@ final class AppCoordinator {
         }
     }
 
+    /// Writes every debounced note immediately, without its 350 ms wait.
+    ///
+    /// `queueMeetingNotes` waits before touching the database so a sentence
+    /// being typed is one write rather than forty. The process dying inside
+    /// that window took the last thing the user wrote with it, and quitting is
+    /// exactly when the window is open -- a reflexive ⌘Q lands mid-sentence far
+    /// more often than it lands in a lull. Quitting therefore cancels the wait
+    /// rather than honouring it.
+    func flushPendingNotes() async {
+        let pending = pendingNoteTasks
+        pendingNoteTasks.removeAll()
+
+        for (meetingID, task) in pending {
+            task.cancel()
+            guard let notes = state.meetingNotes[meetingID] else { continue }
+            do {
+                // A cancelled task may already be past its sleep and inside
+                // the same write. Writing the same text twice is a no-op; not
+                // writing it at all is the bug being closed.
+                try await store.updateMeetingNotes(id: meetingID, notes: notes)
+            } catch {
+                state.report(.noteSave, error.localizedDescription)
+            }
+            state.notesSaving.remove(meetingID)
+        }
+    }
+
     // MARK: - Authored meeting content
 
     func renameMeeting(meetingID: UUID, title: String) async -> Bool {

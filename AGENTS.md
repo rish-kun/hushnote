@@ -159,10 +159,66 @@ out to the view, so the page reports "Saving…" / "Saved" instead of printing
 the standing promise "Saved automatically to this meeting". `NotesPagePolicy`
 holds that decision and the word count.
 
-Known gap, deliberately not closed here: **Notes is unreachable while a meeting
-is recording.** `MeetingWorkspaceView` routes to `ActiveMeetingView`, which has
-no tab bar. Until that changes the placeholder must not advertise writing
-during a meeting.
+### Notes during a recording
+
+`ActiveMeetingView` carries `MeetingWorkspaceTabBar` too, so Notes and
+Transcript are both reachable while capturing. Three things about it are
+load-bearing:
+
+- **`ActiveMeetingView.body` must never read `state.transcript`.** It is
+  replaced on every live ASR delta, and SwiftUI attributes that dependency to
+  whichever `body` reads it — so a read there rebuilds the header, the level
+  strip and *the notes editor* every time somebody speaks. The live transcript
+  and its empty state live in `ActiveTranscriptTab`, and the notes rail lives
+  in `NotesRail`, for exactly this reason. Same discipline as `SystemLevelMeter`
+  and `ElapsedTimeLabel`.
+- **`WorkspaceTabAvailability` decides which tabs a phase offers**, and a busy
+  phase offers only `[.notes, .transcript]`. Summary and Ask are gated only on
+  the transcript being non-empty, which it is during live capture — offering
+  them mid-recording would generate against provisional text whose segment
+  identifiers the final pass is about to re-mint, leaving every citation
+  dangling. Resolution of a stored tab is **read-only** (`resolved(_:during:)`):
+  starting a recording on a meeting whose stored tab is Summary must not
+  overwrite that preference.
+- **`governingPhase` is not `state.recordingPhase`.** The phase is global but
+  only one meeting owns the capture session; reading it directly hid Summary
+  and Ask on every *other* meeting for the length of an unrelated recording.
+
+### Stamping a moment into a note
+
+`NoteStampPolicy` splices `[MM:SS] ` at the caret. `TextEditor(text:selection:)`
+is macOS 15 and the package targets macOS 15, so this needs **no AppKit bridge
+and no availability fence** — `TextSelection.Indices` yields real
+`Range<String.Index>` values into the bound string. Do not reach for an
+`NSTextView` wrapper here; it would have to re-earn the placeholder, undo,
+spell-check, dark-mode text colour, and the "a focused field belongs to the
+user" rule that `TranscriptRowText.reseededDraft` had to be written for.
+
+Two constraints:
+
+- **The clock is `state.transcript.last?.end`, never `AppViewState.elapsed`.**
+  `elapsed` is a one-second `Task.sleep` accumulator that lags audio time by
+  seconds over a long meeting; a stamp taken from it points several sentences
+  behind the words it means. When nothing has been transcribed there is no
+  honest time and the stamp is refused.
+- **A `String.Index` does not survive the insertion.** The policy returns a
+  character offset for the caller to re-derive against the new string.
+
+Tappable timestamps are deliberately **not** built: they would need a note-text
+parser, a seconds→segment resolver, and a rich-text editor that macOS 15 does
+not have (`AttributedString` editing is macOS 26). The stamp is a durable
+plain-text convention.
+
+### Notes and termination
+
+`queueMeetingNotes` waits 350 ms before writing so a sentence is one write
+rather than forty, and quitting is exactly when that window is open.
+`TerminationDecision.flushPendingNotes` defers the reply long enough for
+`AppCoordinator.flushPendingNotes()` to land it. It raises no alert — an
+unwritten note is not a question anyone needs to answer — so it ranks *below*
+`confirmUnsavedSummary` and `confirmFinalizing`, both of which flush notes on
+their own way out. Every branch of `applicationShouldTerminate` that ends in
+the process dying goes through `flushNotesThenReply()`.
 
 ### Meeting management: folders, unfiled, and Recently Deleted
 

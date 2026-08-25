@@ -42,4 +42,43 @@ struct TerminationGuardTests {
             ) == .confirmUnsavedSummary
         )
     }
+
+    /// `queueMeetingNotes` waits 350 ms before writing, so a sentence being
+    /// typed is one write rather than forty. Quitting is exactly when that
+    /// window is open: a reflexive ⌘Q lands mid-sentence far more often than
+    /// it lands in a lull, and the note went with the process.
+    @Test("A note still inside its debounce defers the quit long enough to land")
+    func unflushedNotesDeferTermination() {
+        #expect(
+            TerminationGuard.decision(for: .idle, hasUnflushedNotes: true) == .flushPendingNotes
+        )
+        #expect(
+            TerminationGuard.decision(for: .failed("stopped"), hasUnflushedNotes: true)
+                == .flushPendingNotes
+        )
+    }
+
+    /// Flushing raises no question, so it must never displace one. The summary
+    /// path flushes notes on its way out, which is why ordering it first loses
+    /// nothing.
+    @Test("A question the user must answer outranks a write nobody need be asked about")
+    func questionsOutrankTheFlush() {
+        #expect(
+            TerminationGuard.decision(
+                for: .idle,
+                hasUnsavedSummaryChanges: true,
+                hasUnflushedNotes: true
+            ) == .confirmUnsavedSummary
+        )
+        #expect(
+            TerminationGuard.decision(
+                for: .idle,
+                hasInsightWork: true,
+                hasUnflushedNotes: true
+            ) == .confirmFinalizing
+        )
+        #expect(
+            TerminationGuard.decision(for: .recording, hasUnflushedNotes: true) == .confirmCapture
+        )
+    }
 }

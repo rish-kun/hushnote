@@ -69,6 +69,15 @@ struct HushnoteApp: App {
                     NotificationCenter.default.post(name: .hushnoteSearchMeetings, object: nil)
                 }
                 .keyboardShortcut("k", modifiers: .command)
+                // Only while there is a clock to stamp from. Off a recording
+                // the transcript's end is the end of the meeting, which is not
+                // a moment anyone means.
+                if state.recordingPhase.isCapturing {
+                    Button("Stamp This Moment") {
+                        NotificationCenter.default.post(name: .hushnoteStampMoment, object: nil)
+                    }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                }
             }
         }
 

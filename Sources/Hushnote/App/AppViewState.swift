@@ -21,6 +21,49 @@ enum WorkspaceTab: String, Codable, CaseIterable, Identifiable, Sendable {
     var id: Self { self }
 }
 
+/// Which workspace tabs a meeting offers in a given recording phase.
+///
+/// Summary and Ask are gated only on the transcript being non-empty, which it
+/// is during live capture -- so exposing them mid-recording would let a summary
+/// or a grounded answer be generated against provisional text. The final pass
+/// mints entirely new segment identifiers, so every citation such an answer
+/// captured would address a row that no longer exists. The screen already says
+/// "Live text is provisional"; this is the same statement made structurally.
+enum WorkspaceTabAvailability {
+    /// The phase that governs *this* meeting's tabs.
+    ///
+    /// `state.recordingPhase` is global, but only one meeting owns the capture
+    /// session. While meeting A records, meeting B is idle and its Summary and
+    /// Ask tabs are perfectly meaningful -- reading the global phase would hide
+    /// them for the duration of an unrelated recording. Same guard
+    /// `MeetingWorkspaceRoute` uses to decide which workspace to show at all.
+    nonisolated static func governingPhase(
+        _ phase: RecordingPhase,
+        activeMeetingID: UUID?,
+        meetingID: UUID
+    ) -> RecordingPhase {
+        activeMeetingID == meetingID ? phase : .idle
+    }
+
+    nonisolated static func available(during phase: RecordingPhase) -> [WorkspaceTab] {
+        phase.isBusy ? [.notes, .transcript] : WorkspaceTab.allCases
+    }
+
+    /// Resolves a persisted choice against what the phase actually offers.
+    ///
+    /// Deliberately read-only, like `AppViewState.resolvedSidebarDestination`:
+    /// starting a recording on a meeting whose stored tab is Summary must not
+    /// overwrite that preference, or the tab silently changes under the user
+    /// for good the moment they press Stop.
+    nonisolated static func resolved(
+        _ stored: WorkspaceTab,
+        during phase: RecordingPhase
+    ) -> WorkspaceTab {
+        let offered = available(during: phase)
+        return offered.contains(stored) ? stored : .notes
+    }
+}
+
 enum RecordingStartupStage: Equatable, Sendable {
     case idle
     case arming

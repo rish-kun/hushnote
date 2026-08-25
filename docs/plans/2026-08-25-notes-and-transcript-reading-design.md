@@ -106,11 +106,69 @@ is readable, and widening the window must never widen it.
   foot's voice count. The nested `TimestampButton` is gone; the row is the
   target.
 
-## Not done here, and why
+## Second pass: the deferred items, done
 
-- **Notes during a recording.** `ActiveMeetingView` would need the tab bar,
-  which changes what the recording screen *is*. Worth doing; not a UI polish.
-- **Timestamp stamping in notes.** Only meaningful while recording, which the
-  above blocks.
-- **A notes edit timestamp.** Nothing persists one, and inventing one to fill
-  a rail line would be decoration.
+The three items below were deferred in the first pass. Two are now built; the
+third stays deferred, and one bug the investigation turned up is fixed.
+
+### Notes during a recording — built
+
+`ActiveMeetingView` now carries `MeetingWorkspaceTabBar`. The recording header,
+the level-meter strip and the notice banner stay *above* it: they belong to the
+capture, not to whichever tab is open over it. `recordingHeader` and
+`meetingHeader` deliberately stay separate — rename, folder-move and export are
+invalid mid-capture, and `canExportAudio` gates on a `MeetingAudioTrack` row
+that `stopMeeting` does not write until the end.
+
+Two things this forced:
+
+- **A re-render hazard that already existed.** `ActiveMeetingView.body` read
+  `state.transcript.isEmpty` directly, so it was already rebuilding its header
+  and level strip on every live ASR delta — harmless until a text editor joined
+  them. The transcript read moved into `ActiveTranscriptTab` and the rail's
+  reads into `NotesRail`, so the body that owns the editor depends on nothing
+  written at speaking cadence.
+- **Summary and Ask must not be offered mid-recording.** Both are gated only on
+  the transcript being non-empty, which it is during capture. A summary
+  generated then cites segments the final pass is about to re-mint.
+  `WorkspaceTabAvailability` restricts a busy phase to `[.notes, .transcript]`
+  and resolves a stored tab read-only, so the preference survives.
+  `governingPhase` keeps this per-meeting: the phase is global, and reading it
+  directly hid Summary and Ask on unrelated finished meetings.
+
+### Timestamp stamping — built, natively
+
+`TextEditor(text:selection:)` is macOS 15 and the package targets macOS 15, so
+`NoteStampPolicy` splices at the caret with no AppKit bridge. `⌘⇧T`, offered
+only while capturing. The time comes from `state.transcript.last?.end` — the
+audio sample clock — and never from `AppViewState.elapsed`, a one-second sleep
+accumulator that lags real time by seconds over a long meeting.
+
+A selection is collapsed to its start rather than replaced: typing over a
+selection is what typing does, but a stamp is a command, and one that silently
+ate a selected paragraph is a loss the undo stack gets blamed for.
+
+### An unflushed note could be lost to ⌘Q — fixed
+
+Found while wiring the above, and pre-existing. `queueMeetingNotes` waits
+350 ms; `TerminationGuard` had no case for it, so a note typed and then quit
+within that window never reached the database.
+`TerminationDecision.flushPendingNotes` now defers the reply long enough for
+`AppCoordinator.flushPendingNotes()` to write it, and every other terminating
+branch flushes on its way out.
+
+### Tappable timestamps — still deferred, and should stay that way
+
+It needs three things that do not exist: a parser over note text, a
+seconds→segment resolver, and a rich-text editor. `AttributedString` editing is
+macOS 26, so the only way to render a tappable run today is the `NSTextView`
+wrapper — which would have to re-earn the placeholder, undo, spell-check,
+dark-mode text colour, and the "a focused field belongs to the user" rule that
+`TranscriptRowText.reseededDraft` exists to enforce. The stamp is a durable
+plain-text convention instead. There is also no audio playback in this app, so
+a stamp can only ever mean "scroll the transcript there".
+
+### A notes edit timestamp — still not built
+
+Nothing persists one, and inventing one to fill a rail line would be
+decoration.

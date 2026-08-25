@@ -12,6 +12,11 @@ enum TerminationDecision: Equatable {
     case confirmFinalizing
     /// Authored summary text exists only in the editor buffer.
     case confirmUnsavedSummary
+    /// A note is inside `queueMeetingNotes`' 350 ms debounce and has not
+    /// reached the database. Nothing to ask the user -- the write takes
+    /// milliseconds and there is no decision to make -- so the reply is
+    /// deferred just long enough to land it.
+    case flushPendingNotes
 }
 
 /// `NSApp.terminate` tears the process down immediately: `IncrementalCAFWriter.finish()`
@@ -23,12 +28,19 @@ enum TerminationGuard {
     static func decision(
         for phase: RecordingPhase,
         hasInsightWork: Bool = false,
-        hasUnsavedSummaryChanges: Bool = false
+        hasUnsavedSummaryChanges: Bool = false,
+        hasUnflushedNotes: Bool = false
     ) -> TerminationDecision {
         switch phase {
         case .idle, .failed:
             if hasInsightWork { return .confirmFinalizing }
-            return hasUnsavedSummaryChanges ? .confirmUnsavedSummary : .terminateNow
+            // Ranked by what the user would have to answer for. A summary in
+            // the editor is a decision they have not made; a note mid-debounce
+            // is a write nobody needs to be asked about. The summary path
+            // flushes notes on its way out, so nothing is lost by ordering the
+            // question first.
+            if hasUnsavedSummaryChanges { return .confirmUnsavedSummary }
+            return hasUnflushedNotes ? .flushPendingNotes : .terminateNow
         case .preparing, .recording, .paused:
             // `.preparing` counts as live capture: the pipeline may already hold
             // an open take by the time the user reaches for ⌘Q.
@@ -54,10 +66,14 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
         switch TerminationGuard.decision(
             for: state.recordingPhase,
             hasInsightWork: state.hasInsightWork,
-            hasUnsavedSummaryChanges: state.hasUnsavedSummaryChanges
+            hasUnsavedSummaryChanges: state.hasUnsavedSummaryChanges,
+            hasUnflushedNotes: !state.notesSaving.isEmpty
         ) {
         case .terminateNow:
             return .terminateNow
+
+        case .flushPendingNotes:
+            return flushNotesThenReply()
 
         case .confirmCapture:
             let alert = NSAlert()
@@ -72,6 +88,7 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
 
             Task { @MainActor in
                 await Self.coordinator?.stopMeeting()
+                await Self.coordinator?.flushPendingNotes()
                 NSApp.reply(toApplicationShouldTerminate: true)
             }
             return .terminateLater
@@ -85,7 +102,8 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
                 """
             alert.addButton(withTitle: "Keep Finalizing")
             alert.addButton(withTitle: "Quit Anyway")
-            return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+            guard alert.runModal() != .alertFirstButtonReturn else { return .terminateCancel }
+            return flushNotesThenReply()
 
         case .confirmUnsavedSummary:
             let alert = NSAlert()
@@ -100,14 +118,35 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
                 guard let meetingID = state.unsavedSummaryMeetingID else { return .terminateCancel }
                 Task { @MainActor in
                     let saved = await Self.coordinator?.saveSummary(meetingID: meetingID) == true
+                    if saved { await Self.coordinator?.flushPendingNotes() }
                     NSApp.reply(toApplicationShouldTerminate: saved)
                 }
                 return .terminateLater
             case .alertThirdButtonReturn:
-                return .terminateNow
+                // Declining to save the *summary* says nothing about a note
+                // typed a moment ago, which the user never chose to discard.
+                return flushNotesThenReply()
             default:
                 return .terminateCancel
             }
         }
+    }
+
+    /// Defers the reply only long enough for a debounced note to land.
+    ///
+    /// Every branch that ends in the process dying passes through here, because
+    /// `queueMeetingNotes`' 350 ms window is open precisely when someone
+    /// reaches for ⌘Q mid-sentence -- and unlike an unsaved summary, an
+    /// unwritten note raises no question worth putting in front of anyone.
+    private func flushNotesThenReply() -> NSApplication.TerminateReply {
+        guard let coordinator = Self.coordinator,
+              Self.state?.notesSaving.isEmpty == false
+        else { return .terminateNow }
+
+        Task { @MainActor in
+            await coordinator.flushPendingNotes()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }

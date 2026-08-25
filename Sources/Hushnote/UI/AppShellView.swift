@@ -5,6 +5,7 @@ extension Notification.Name {
     static let hushnoteNewFolder = Notification.Name("hushnote.new-folder")
     static let hushnoteSearchMeetings = Notification.Name("hushnote.search-meetings")
     static let hushnoteToggleSidebar = Notification.Name("hushnote.toggle-sidebar")
+    static let hushnoteStampMoment = Notification.Name("hushnote.stamp-moment")
 }
 
 struct AppShellView: View {
