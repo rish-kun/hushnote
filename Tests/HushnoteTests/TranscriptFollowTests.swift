@@ -70,4 +70,50 @@ struct TranscriptFollowTests {
             )
         )
     }
+
+    /// The bug this parameter exists for. The auto-scroll aligns the last
+    /// paragraph's *bottom* with the viewport, so the reader's bottom inset --
+    /// 96 points of blank paper, and the page's only "you have reached the end"
+    /// signal now that there is no scroll indicator -- is still below it. An
+    /// inset larger than the tolerance therefore made every auto-scroll read as
+    /// the user scrolling away: following switched itself off on the first
+    /// arriving segment, and "Jump to latest" stayed lit for the rest of the
+    /// recording, which is the same as meaning nothing.
+    @Test("Blank paper below the last paragraph is not the user scrolling away")
+    func bottomInsetIsNotAScrollAway() {
+        // Exactly where `scrollTo(anchor: .bottom)` leaves the viewport.
+        let restingOffset = 3_000.0 - containerHeight - 96
+
+        #expect(
+            TranscriptFollow.isFollowing(
+                contentOffsetY: restingOffset,
+                containerHeight: containerHeight,
+                contentHeight: 3_000,
+                bottomInset: 96
+            )
+        )
+        // And without being told about the inset, it gets it wrong -- which is
+        // what shipped.
+        #expect(
+            TranscriptFollow.isFollowing(
+                contentOffsetY: restingOffset,
+                containerHeight: containerHeight,
+                contentHeight: 3_000
+            ) == false
+        )
+    }
+
+    /// The inset is slack, not a licence. Scrolling a screen up is still the
+    /// user taking over.
+    @Test("A reader who has actually scrolled away is not dragged back")
+    func realScrollAwayStillStops() {
+        #expect(
+            TranscriptFollow.isFollowing(
+                contentOffsetY: 3_000 - containerHeight - 96 - 400,
+                containerHeight: containerHeight,
+                contentHeight: 3_000,
+                bottomInset: 96
+            ) == false
+        )
+    }
 }

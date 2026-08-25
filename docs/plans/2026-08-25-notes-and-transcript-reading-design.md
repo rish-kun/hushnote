@@ -172,3 +172,61 @@ a stamp can only ever mean "scroll the transcript there".
 
 Nothing persists one, and inventing one to fill a rail line would be
 decoration.
+
+## Third pass: taking the scroll indicators away
+
+The scroll bar silently answers two questions — "how long is this?" and "where
+am I?" — so removing it is only free if something else answers them. The
+decision taken was to remove it with **no replacement**, and that holds up here
+for a specific reason: the transcript is not actually unreplaced. The apparatus
+margin carries a clock on every paragraph, the header carries the meeting's
+total duration, and the index rail highlights the current chapter. "I am at
+14:20 of 30:15" is better orientation than a thumb, in the unit a reader of a
+meeting actually thinks in.
+
+The honest residual cost, accepted: when the fold lands in inter-paragraph
+whitespace, a page can look finished when it is not. Roughly one open in five
+to ten. Every fix for that is a replacement indicator.
+
+### What the modifier actually is
+
+Measured on this machine, not inferred. `.hidden` and `.never` are not
+interchangeable — see AGENTS.md "Scroll indicators" for the rule. The short
+version: `.hidden` only works under the overlay scroller style, and any attached
+mouse puts the machine in legacy style, where it does nothing at all.
+
+### What the removal promoted, and therefore what had to be fixed with it
+
+- **`TranscriptFollow` was measuring against the wrong bottom.** The auto-scroll
+  aligns the last paragraph's bottom with the viewport, leaving the reader's
+  96pt inset below it; the tolerance was 24. Following switched itself off on
+  the first arriving segment and "Jump to latest" stayed lit for the whole
+  recording. Pre-existing — it shipped at 34 against 24 — and made three times
+  worse by this design's own first pass. `isFollowing` now takes `bottomInset`.
+- **The margin timestamp failed AA.** `secondaryInk.opacity(0.62)` composites to
+  2.87:1. `ThemeContrastTests` checks tokens, never call sites, so an opacity
+  knockdown at a call site is invisible to it. Between 856pt and 1180pt there is
+  no rail, and that timestamp is the reader's only orientation.
+- **The index rail did not scroll its own selection into view.** An index
+  highlighting a row outside its own viewport is not indexing anything.
+- **"Jump to latest" was not built like a control.** A `paperRaised` fill is
+  1.06:1 on paper and a `rule` stroke is 1.72:1, under WCAG's 3:1 for a
+  component boundary — so the page's only remaining scroll affordance read as
+  another piece of text floating over the prose. It is now
+  `.hushnoteButton(.primary)`, it says "Jump to end" on a finished meeting, and
+  it is centred on the measure rather than on the column — centring on
+  `columnWidth` counted the apparatus margin and put it 44pt left of the text.
+- **The notes editor's bottom inset was outside its own clip**, so a note long
+  enough to scroll had its last line sliced mid-glyph above a band of blank
+  paper. Moved to `.contentMargins(.bottom, 32, for: .scrollContent)`.
+- **The notes page reported nothing below 1180pt.** `NotesRail` is gated on the
+  rail threshold, so the save state that `AppViewState.notesSaving` exists to
+  surface vanished on any narrower window. `NotesStatusLine` now appears inline
+  under the measure where there is no rail.
+
+### Scope
+
+All four workspace tabs are suppressed, not only the two asked about: switching
+from Transcript to Summary would otherwise flicker a scroll bar in and out.
+Settings, Models, Storage, the meeting library and the search palette still show
+theirs, and are deliberately out of scope — they are inventory, not reading.

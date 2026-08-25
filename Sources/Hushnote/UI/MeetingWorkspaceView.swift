@@ -502,6 +502,7 @@ struct CompletedMeetingView: View {
             .padding(.horizontal, policy.gutter)
             .padding(.vertical, 30)
         }
+        .scrollIndicators(.never)
     }
 
     private func summaryBody(showsActions: Bool) -> some View {
@@ -624,6 +625,7 @@ struct CompletedMeetingView: View {
             .lineSpacing(6)
             .frame(minHeight: 180)
             .scrollContentBackground(.hidden)
+            .scrollIndicators(.never)
             .padding(12)
             .background(HushnoteTheme.paperRaised, in: RoundedRectangle(cornerRadius: 9))
             .overlay { RoundedRectangle(cornerRadius: 9).stroke(HushnoteTheme.rule) }
@@ -707,7 +709,7 @@ private struct MeetingWorkspaceTabBar: View {
     let horizontalInset: CGFloat
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        ScrollView(.horizontal) {
             HStack(spacing: 5) {
                 ForEach(tabs, id: \.self) { tab in
                     let isSelected = selected == tab
@@ -730,6 +732,9 @@ private struct MeetingWorkspaceTabBar: View {
             .padding(.horizontal, horizontalInset)
             .padding(.vertical, 10)
         }
+        // `.scrollIndicators` rather than the `showsIndicators:` initializer,
+        // so every scroll container in the workspace is suppressed the same way.
+        .scrollIndicators(.never)
         .overlay(alignment: .bottom) {
             HushnoteRule(opacity: 0.72)
         }
@@ -953,7 +958,10 @@ struct MeetingNotesView: View {
                 if layout.showsIndexRail {
                     NotesRail(meetingID: meetingID)
                         .frame(width: layout.railWidth, alignment: .leading)
-                        .padding(.top, 34)
+                        // 32, like the transcript's. The shared spread exists
+                        // so switching tabs never moves the text; at 34 it
+                        // moved by two points vertically instead.
+                        .padding(.top, 32)
                         .padding(.trailing, layout.gutter)
                 }
             }
@@ -970,13 +978,24 @@ struct MeetingNotesView: View {
                     .frame(width: layout.marginWidth, height: 0)
                     .accessibilityHidden(true)
             }
-            editor
-                .frame(maxWidth: layout.measure, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                editor
+                // Below 1180pt there is no rail, and the page reported
+                // nothing at all: no word count, no "Saving…", no "Saved".
+                // The whole point of `AppViewState.notesSaving` is that the
+                // page states what is true instead of promising it, and that
+                // disappeared on any window narrower than the rail's
+                // threshold. This is the rail's first block, relocated.
+                if !layout.showsIndexRail {
+                    NotesStatusLine(meetingID: meetingID)
+                        .padding(.top, 14)
+                }
+            }
+            .frame(maxWidth: layout.measure, alignment: .leading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.horizontal, layout.gutter)
-        .padding(.top, 30)
-        .padding(.bottom, 32)
+        .padding(.top, 32)
     }
 
     private var editor: some View {
@@ -994,6 +1013,14 @@ struct MeetingNotesView: View {
         .lineSpacing(6)
         .textEditorStyle(.plain)
         .scrollContentBackground(.hidden)
+        .scrollIndicators(.never)
+        // Inside the editor's own scroll content, not on the page around it.
+        // On the page it did nothing for a note long enough to scroll: the
+        // last line was sliced mid-glyph and then floated above a band of
+        // blank paper, which reads as a rendering fault rather than as more
+        // text below. The transcript already puts its inset inside the scroll
+        // view for the same reason.
+        .contentMargins(.bottom, 32, for: .scrollContent)
         .frame(maxHeight: .infinity)
         .overlay(alignment: .topLeading) {
             if notes.isEmpty {
@@ -1001,7 +1028,8 @@ struct MeetingNotesView: View {
                     isCapturing: state.recordingPhase.isCapturing
                 ))
                     .font(HushnoteTheme.Font.reading)
-                    .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.55))
+                    // 2.50:1 at 0.55. Quiet is not the same as unreadable.
+                    .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.75))
                     // Clears `NSTextView`'s own line-fragment padding, so the
                     // placeholder sits under the caret rather than beside it.
                     .padding(.leading, 5)
@@ -1035,7 +1063,6 @@ struct MeetingNotesView: View {
             )
         )
     }
-
 }
 
 /// What is true about these notes, and about the meeting behind them.
@@ -1054,20 +1081,7 @@ private struct NotesRail: View {
         VStack(alignment: .leading, spacing: 26) {
             VStack(alignment: .leading, spacing: 8) {
                 HushnoteEyebrow("Notes")
-                saveLine
-                if !notes.isEmpty {
-                    Text(NotesPagePolicy.wordCountLabel(NotesPagePolicy.wordCount(notes)))
-                        .font(.caption)
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                }
-                if state.recordingPhase.isCapturing, state.transcript.last != nil {
-                    // Said where the writing is, not only in a menu. An
-                    // affordance reachable solely by shortcut is one nobody
-                    // finds.
-                    Text("⌘⇧T stamps the moment")
-                        .font(.caption)
-                        .foregroundStyle(HushnoteTheme.secondaryInk)
-                }
+                NotesStatusLine(meetingID: meetingID, axis: .vertical)
             }
 
             if !state.transcript.isEmpty {
@@ -1087,6 +1101,47 @@ private struct NotesRail: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("About these notes")
+    }
+}
+
+/// What is true about these notes right now: whether the last keystroke has
+/// reached the database, how much is written, and -- while recording -- that a
+/// moment can be stamped.
+///
+/// Its own view because it appears in two places: stacked in `NotesRail` where
+/// there is room for one, and inline under the measure where there is not.
+private struct NotesStatusLine: View {
+    let meetingID: UUID
+    var axis: Axis = .horizontal
+    @Environment(AppViewState.self) private var state
+
+    private var notes: String { state.meetingNotes[meetingID, default: ""] }
+
+    var body: some View {
+        let content = Group {
+            saveLine
+            if !notes.isEmpty {
+                Text(NotesPagePolicy.wordCountLabel(NotesPagePolicy.wordCount(notes)))
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+            }
+            if state.recordingPhase.isCapturing, state.transcript.last != nil {
+                // Said where the writing is, not only in a menu. An affordance
+                // reachable solely by shortcut is one nobody finds.
+                Text("⌘⇧T stamps the moment")
+                    .font(.caption)
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+            }
+        }
+
+        if axis == .vertical {
+            VStack(alignment: .leading, spacing: 8) { content }
+        } else {
+            HStack(spacing: 14) {
+                content
+                Spacer(minLength: 0)
+            }
+        }
     }
 
     @ViewBuilder
@@ -1315,8 +1370,15 @@ struct TranscriptView: View {
                 // Room to breathe under the tab rule, and enough at the foot
                 // that reading never stops flush against the window edge.
                 .padding(.top, 32)
-                .padding(.bottom, 96)
+                // Load-bearing, not decorative. With no scroll indicator this
+                // band of blank paper is the only "you have reached the end"
+                // signal the page has, and it works because the largest gap
+                // inside the document is smaller: 32 between paragraphs, ~48
+                // above a chapter rule -- and the chapter case brings a visible
+                // hairline with it. Do not reduce it.
+                .padding(.bottom, Self.readerBottomInset)
             }
+            .scrollIndicators(.never)
             .coordinateSpace(name: scrollSpace)
             .onPreferenceChange(ChapterOffsetKey.self) { headerOffsets = $0 }
             // A live transcript is a live region: VoiceOver should not treat a
@@ -1326,7 +1388,15 @@ struct TranscriptView: View {
                 TranscriptFollow.isFollowing(
                     contentOffsetY: geometry.contentOffset.y,
                     containerHeight: geometry.containerSize.height,
-                    contentHeight: geometry.contentSize.height
+                    contentHeight: geometry.contentSize.height,
+                    // The auto-scroll aligns the last paragraph's *bottom* with
+                    // the viewport, which leaves the whole bottom inset below
+                    // it. Without telling the policy about that inset, every
+                    // auto-scroll lands outside its own tolerance and follow
+                    // switches itself off -- so "Jump to latest" lit up on the
+                    // first arriving segment and stayed lit for the rest of the
+                    // recording, which is the same as meaning nothing.
+                    bottomInset: Self.readerBottomInset
                 )
             } action: { _, following in
                 isFollowing = following
@@ -1343,23 +1413,26 @@ struct TranscriptView: View {
                 // Only offered once the user has actually left the bottom, so
                 // it never competes with the transcript it would scroll.
                 if !isFollowing, let anchor = paragraphs.last?.id {
-                    Button {
+                    // "Latest" implies something is still arriving. On a
+                    // meeting that ended three weeks ago there is only an end.
+                    Button(isRecording ? "Jump to latest" : "Jump to end", systemImage: "arrow.down") {
                         scroll(proxy, to: anchor, anchor: .bottom)
                         isFollowing = true
-                    } label: {
-                        Label("Jump to latest", systemImage: "arrow.down")
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(HushnoteTheme.ink)
-                            .padding(.horizontal, 13)
-                            .padding(.vertical, 7)
-                            .background(HushnoteTheme.paperRaised, in: Capsule())
-                            .overlay { Capsule().stroke(HushnoteTheme.rule) }
                     }
-                    .buttonStyle(.plain)
-                    // Centred on the column it scrolls rather than pinned to
-                    // the pane's corner, where it used to float over nothing.
-                    .padding(.leading, layout.gutter)
-                    .frame(maxWidth: layout.columnWidth, alignment: .center)
+                    // Was a hand-rolled capsule: `paperRaised` on `paper` is a
+                    // 1.06:1 fill and a `rule` stroke is 1.72:1, under WCAG's
+                    // 3:1 for a component boundary -- so it read as one more
+                    // piece of text floating over the prose rather than as a
+                    // control. It is also the page's only scroll affordance
+                    // now, which is a filled control's job.
+                    .hushnoteButton(.primary)
+                    .font(.caption.weight(.medium))
+                    // Centred on the *measure*, not on the column. Centring on
+                    // `columnWidth` counted the apparatus margin, which put the
+                    // pill 44pt to the left of the text it scrolls.
+                    .padding(.leading, layout.gutter + layout.marginWidth
+                        + (layout.hasMargin ? layout.marginGap : 0))
+                    .frame(maxWidth: layout.measure, alignment: .center)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.bottom, 24)
                 }
@@ -1401,6 +1474,10 @@ struct TranscriptView: View {
         isFollowing = false
         state.transcriptJumpRequest = nil
     }
+
+    /// The blank paper under the last paragraph. Shared by the padding that
+    /// draws it and the follow policy that has to know it is there.
+    private static let readerBottomInset: CGFloat = 96
 
     private var scrollSpace: String { "hushnote.transcript.scroll" }
 
@@ -1513,9 +1590,14 @@ private struct TranscriptMargin: View {
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 6) {
+            // No opacity knockdown. `secondaryInk` passes at 6.88:1 and
+            // `ThemeContrastTests` proves it, but that suite tests tokens and
+            // never call sites -- at 0.62 this composited to 2.87:1 in light,
+            // failing AA. Below 1180pt there is no index rail and no scroll
+            // indicator, so this timestamp is the reader's only orientation.
             Text(DurationText.clock(start))
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(HushnoteTheme.secondaryInk.opacity(0.62))
+                .foregroundStyle(HushnoteTheme.secondaryInk)
                 .accessibilityLabel("At \(DurationText.spoken(start))")
 
             if isEditable {
@@ -1562,54 +1644,70 @@ private struct TranscriptIndexRail: View {
     let isRecording: Bool
     let width: CGFloat
     @Environment(AppViewState.self) private var state
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HushnoteEyebrow("Contents")
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(chapters) { chapter in
-                        let isCurrent = chapter.id == currentChapterID
+            ScrollViewReader { rail in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(chapters) { chapter in
+                            let isCurrent = chapter.id == currentChapterID
 
-                        HushnoteSelectableRow(
-                            isSelected: isCurrent,
-                            select: { state.transcriptJumpRequest = .init(paragraphID: chapter.id) }
-                        ) {
-                            // One line, the way an index line is: a number and
-                            // a heading. It used to carry a timestamp capsule,
-                            // the speaker list and two lines of preview prose,
-                            // which made seven of them a second column of body
-                            // copy competing with the one being read. The
-                            // speaker lists in particular said
-                            // "Speaker 1, Speaker 2 / Speaker 2 / Speaker 2,
-                            // Speaker 1" -- repetition, not information. The
-                            // voices survive in the foot, counted.
-                            HStack(alignment: .firstTextBaseline, spacing: 9) {
-                                Text(DurationText.clock(chapter.start))
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(
-                                        isCurrent ? HushnoteTheme.ink : HushnoteTheme.secondaryInk
-                                    )
-                                Text(chapter.opening)
-                                    .font(.caption)
-                                    .foregroundStyle(
-                                        isCurrent ? HushnoteTheme.ink : HushnoteTheme.secondaryInk
-                                    )
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
+                            HushnoteSelectableRow(
+                                isSelected: isCurrent,
+                                select: {
+                                    state.transcriptJumpRequest = .init(paragraphID: chapter.id)
+                                }
+                            ) {
+                                // One line, the way an index line is: a number
+                                // and a heading. It used to carry a timestamp
+                                // capsule, the speaker list and two lines of
+                                // preview prose, which made seven of them a
+                                // second column of body copy competing with the
+                                // one being read. The speaker lists in
+                                // particular said "Speaker 1, Speaker 2 /
+                                // Speaker 2 / Speaker 2, Speaker 1" --
+                                // repetition, not information. The voices
+                                // survive in the foot, counted.
+                                HStack(alignment: .firstTextBaseline, spacing: 9) {
+                                    Text(DurationText.clock(chapter.start))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(rowInk(isCurrent))
+                                    Text(chapter.opening)
+                                        .font(.caption)
+                                        .foregroundStyle(rowInk(isCurrent))
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                }
                             }
+                            // The row is the target. A `TimestampButton` nested
+                            // inside `HushnoteSelectableRow`'s own button gave
+                            // one entry two hit areas doing the same thing.
+                            .accessibilityLabel(
+                                "\(DurationText.spoken(chapter.start)). \(chapter.opening)"
+                            )
+                            .id(chapter.id)
                         }
-                        // The row is the target. A `TimestampButton` nested
-                        // inside `HushnoteSelectableRow`'s own button gave one
-                        // entry two overlapping hit areas doing the same thing.
-                        .accessibilityLabel(
-                            "\(DurationText.spoken(chapter.start)). \(chapter.opening)"
-                        )
+                    }
+                }
+                .scrollIndicators(.never)
+                // An index that highlights a row scrolled out of its own list
+                // is not indexing anything. Especially so now that it is what
+                // the scroll indicator used to do.
+                .onChange(of: currentChapterID) { _, current in
+                    guard let current else { return }
+                    if reduceMotion {
+                        rail.scrollTo(current, anchor: .center)
+                    } else {
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            rail.scrollTo(current, anchor: .center)
+                        }
                     }
                 }
             }
-            .scrollIndicators(.never)
 
             HushnoteRule(opacity: 0.45)
             foot
@@ -1621,6 +1719,10 @@ private struct TranscriptIndexRail: View {
         // every arriving segment would make VoiceOver unusable while recording.
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Transcript contents")
+    }
+
+    private func rowInk(_ isCurrent: Bool) -> Color {
+        isCurrent ? HushnoteTheme.ink : HushnoteTheme.secondaryInk
     }
 
     @ViewBuilder
@@ -1886,15 +1988,22 @@ private struct TranscriptRow: View {
 /// following is a state the user can leave by scrolling and return to
 /// deliberately.
 enum TranscriptFollow {
-    /// - Parameter tolerance: slack so a partly-scrolled line, or a bounce past
-    ///   the end, does not read as the user taking over.
+    /// - Parameters:
+    ///   - bottomInset: blank scroll content below the last paragraph. The
+    ///     auto-scroll aligns that paragraph's bottom with the viewport, so the
+    ///     inset is *always* still below it -- an inset larger than `tolerance`
+    ///     therefore makes every auto-scroll read as the user scrolling away,
+    ///     and following switches itself off on the first arriving segment.
+    ///   - tolerance: slack so a partly-scrolled line, or a bounce past the
+    ///     end, does not read as the user taking over.
     nonisolated static func isFollowing(
         contentOffsetY: Double,
         containerHeight: Double,
         contentHeight: Double,
+        bottomInset: Double = 0,
         tolerance: Double = 24
     ) -> Bool {
-        contentOffsetY + containerHeight >= contentHeight - tolerance
+        contentOffsetY + containerHeight >= contentHeight - bottomInset - tolerance
     }
 }
 
@@ -1941,6 +2050,7 @@ struct AskMeetingView: View {
             .padding(.horizontal, horizontalInset)
             .padding(.vertical, 30)
         }
+        .scrollIndicators(.never)
     }
 
     private var heading: some View {

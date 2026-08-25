@@ -146,6 +146,38 @@ Two more rules the transcript encodes:
   preview prose, which made it a second column of body copy competing with the
   transcript. Voices survive as a count in the rail's foot.
 
+### Scroll indicators
+
+Every scroll container in the meeting workspace is suppressed with
+`.scrollIndicators(.never)`, and the modifier is not interchangeable with
+`.hidden`:
+
+- **`.hidden` does nothing here.** It suppresses the indicator only under the
+  *overlay* scroller style. `NSScroller.preferredScrollerStyle` resolves to
+  `.legacy` whenever a mouse is attached — not only when the user sets "Show
+  scroll bars: Always" — and under `.legacy` `.hidden` leaves
+  `hasVerticalScroller == true` and the scroller reserves ~17pt of width.
+  `.never` was measured to win under all three `AppleShowScrollBars` states.
+- **`TextEditor` does honour it.** Its internal `AppKitScrollView` reads the
+  SwiftUI environment, so the notes and summary editors need no AppKit bridge.
+  Do not reach for one: a representable attached with `.background` is a
+  *sibling* of that scroll view, so `NSView.enclosingScrollView` returns nil,
+  and a version that climbs and descends to find it loses a race with SwiftUI,
+  which re-asserts `hasVerticalScroller` afterwards. The measured result was an
+  invisible scroller still consuming 17pt — nondeterministically.
+- **Suppress the transcript and the notes editor together.** Removing a
+  scroller returns ~17pt of width, and the Notes/Transcript x-alignment that
+  `TranscriptLayout` exists to protect depends on both reclaiming it.
+
+`TranscriptView`'s `readerBottomInset` (96) is load-bearing twice over: with no
+indicator it is the only "you have reached the end" signal, and
+`TranscriptFollow.isFollowing` must be told about it. The auto-scroll aligns the
+last paragraph's *bottom* with the viewport, leaving the inset below it — so an
+inset larger than the tolerance makes every auto-scroll read as the user
+scrolling away, and "Jump to latest" lights on the first segment and never goes
+out. That shipped for one release at 34 against a tolerance of 24, then got
+worse at 96.
+
 ### The notes page
 
 `MeetingNotesView` writes directly on the page: no fill, no stroke, no corner
@@ -428,9 +460,9 @@ coordinator wiring itself is verified only by reading.
 Pure policy/decision types sit beside their views or coordinator and carry
 their own tests, independent of any view hierarchy — e.g. `AdaptiveLayoutPolicy`
 (`AdaptiveLayoutPolicyTests`), `SidebarScrollerConfiguration`
-(`SidebarScrollerConfigurationTests`, which drives an `NSViewRepresentable`
-probe rather than the whole sidebar), `TerminationGuard`
-(`TerminationGuardTests`), `RecordingStorageCleanupPolicy`,
+(`SidebarScrollerConfigurationTests`, which asserts on the `.navigation`
+preset only — nothing covers the `NSViewRepresentable` probe's behaviour),
+`TerminationGuard` (`TerminationGuardTests`), `RecordingStorageCleanupPolicy`,
 `MeetingAudioRetentionPolicy`, and `FloatingPanelPositioning`
 (`FloatingPanelPositioningTests`). `WindowToolbarOwnershipTests` is the one
 exception that cannot be a behavioral test — SwiftUI toolbar placement has no
