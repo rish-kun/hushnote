@@ -202,6 +202,8 @@ struct AppShellView: View {
             MeetingsHomeView(scope: .unfiled)
         case .folder(let id):
             MeetingsHomeView(scope: .folder(id))
+        case .shared:
+            SharedLinksView()
         case .recentlyDeleted:
             MeetingsHomeView(scope: .recentlyDeleted)
         case .models:
@@ -831,6 +833,19 @@ private struct SidebarNavigationView: View {
                         count: state.unfiledMeetingCount,
                         isSelected: state.selection == .unfiled
                     ) { coordinator.setSelection(.unfiled) }
+
+                    // Only once there is something to manage. There is no web
+                    // dashboard, so this route is the only place a published
+                    // link can be seen or withdrawn -- but an empty row for a
+                    // feature nobody has used is just a permanent advert.
+                    if !state.meetingShares.isEmpty {
+                        SidebarNavigationRow(
+                            title: "Shared",
+                            systemImage: "link",
+                            count: state.meetingShares.count,
+                            isSelected: state.selection == .shared
+                        ) { coordinator.setSelection(.shared) }
+                    }
 
                     SidebarNavigationRow(
                         title: "Recently Deleted",

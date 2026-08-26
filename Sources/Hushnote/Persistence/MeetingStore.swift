@@ -342,6 +342,48 @@ public actor MeetingStore {
         }
     }
 
+    func meetingShare(meetingID: UUID) throws -> MeetingShare? {
+        try database.read { db in
+            try MeetingShareRecord.fetchOne(db, key: meetingID.uuidString)?.model()
+        }
+    }
+
+    /// Everything this Mac has ever published and not revoked, newest first.
+    /// There is no web dashboard, so this list is the only place shares can be
+    /// managed.
+    func allMeetingShares() throws -> [MeetingShare] {
+        try database.read { db in
+            try MeetingShareRecord
+                .order(Column("createdAt").desc, Column("shareID"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    /// Writes the share row and nothing else. It deliberately does not touch
+    /// `meetings.updatedAt`: the library is ordered by it, and publishing or
+    /// syncing a meeting is not a reason to move it to the top — the same rule
+    /// `moveMeeting` and `deleteMeetingFolder` follow. Nothing here writes
+    /// `transcriptSegments` either, so a sync cannot fire the v5 FTS trigger.
+    func upsertMeetingShare(_ share: MeetingShare) throws {
+        try database.write { db in
+            guard try MeetingRecord.exists(db, key: share.meetingID.uuidString) else {
+                throw PersistenceError.meetingNotFound(share.meetingID)
+            }
+            try MeetingShareRecord(share).save(db)
+        }
+    }
+
+    /// Forgets the local record of a share. Revocation is a network act and
+    /// happens first; this is what runs after it succeeds. Deleting a row that
+    /// is not there is not an error — a revoke retried after a partial failure
+    /// must be able to finish.
+    func deleteMeetingShare(meetingID: UUID) throws {
+        _ = try database.write { db in
+            try MeetingShareRecord.deleteOne(db, key: meetingID.uuidString)
+        }
+    }
+
     public func saveAudioTrack(_ track: MeetingAudioTrack) throws {
         try database.write { db in
             guard try MeetingRecord.fetchOne(db, key: track.meetingID.uuidString) != nil else {

@@ -5,6 +5,7 @@ enum SidebarDestination: Hashable {
     case meetings
     case unfiled
     case folder(UUID)
+    case shared
     case recentlyDeleted
     case models
     case storage
@@ -557,6 +558,7 @@ enum FailureKind: Equatable {
     case meetingDelete
     case folderManagement
     case noteSave
+    case shareSync
     case summarySave
     case speakerRename
     case transcriptEditSave
@@ -583,6 +585,10 @@ enum FailureRoute: Equatable {
         case .meetingDelete: .appAlert(title: "The meeting could not be deleted")
         case .folderManagement: .appAlert(title: "The folder could not be updated")
         case .noteSave: .appAlert(title: "Your notes are not being saved")
+        // An alert, not a quiet status line: a share that stopped publishing is
+        // a link other people are still reading, showing content that no longer
+        // matches what this Mac holds.
+        case .shareSync: .appAlert(title: "A shared link could not be updated")
         case .summarySave: .appAlert(title: "Your summary was not saved")
         case .speakerRename: .appAlert(title: "The speaker name was not saved")
         case .transcriptEditSave: .appAlert(title: "Your transcript correction was not saved")
@@ -655,6 +661,15 @@ final class AppViewState {
     var question = ""
     var recordingNotice: String?
     var meetingNotes: [UUID: String] = [:]
+    /// Every meeting this Mac has published, by meeting. There is no web
+    /// dashboard, so this dictionary and the `Shared` route are the only place
+    /// a link can be seen or withdrawn.
+    var meetingShares: [UUID: MeetingShare] = [:]
+    /// Meetings with a share request in flight -- creating, republishing,
+    /// changing a password or revoking.
+    var sharesInFlight: Set<UUID> = []
+    /// The meeting whose share sheet is open, if any.
+    var shareSheetMeetingID: UUID?
     /// Meetings whose notes have a keystroke that has not reached the database
     /// yet. The debounce and the write already existed in `AppCoordinator`;
     /// only the page had no way to see them, so it printed the standing
@@ -806,11 +821,18 @@ final class AppViewState {
     nonisolated static func resolvedSidebarDestination(
         _ destination: SidebarDestination?,
         meetingIDs: Set<UUID>,
-        folderIDs: Set<UUID>
+        folderIDs: Set<UUID>,
+        hasShares: Bool = false
     ) -> SidebarDestination {
         switch destination {
         case .meeting(let id) where !meetingIDs.contains(id),
              .folder(let id) where !folderIDs.contains(id):
+            .meetings
+        // The sidebar only offers Shared once something is shared, so a
+        // persisted `.shared` with nothing in it is a destination with no row
+        // pointing at it: an empty page reachable only by having been there
+        // last launch. Same reason a stale meeting or folder id resolves here.
+        case .shared where !hasShares:
             .meetings
         case let destination?:
             destination

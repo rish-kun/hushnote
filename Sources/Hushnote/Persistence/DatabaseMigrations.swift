@@ -230,6 +230,53 @@ enum HushnoteDatabaseMigrations {
                 columns: ["folderID", "deletedAt", "updatedAt"]
             )
         }
+        migrator.registerMigration("v9_meeting_shares") { db in
+            // A share is a publication of a meeting, not part of it: it lives in
+            // its own table so that creating, syncing or revoking one never
+            // writes `meetings` at all. Two consequences are load-bearing.
+            //
+            // `meetings.updatedAt` orders the library, and sharing is not a
+            // reason to move a meeting to the top of it — the same rule
+            // `deleteMeetingFolder` and `moveMeeting` already follow.
+            //
+            // And nothing here can fire the v5 FTS trigger, which is scoped to
+            // `AFTER UPDATE OF id, meetingID, text, speakerName ON
+            // transcriptSegments` and whose delete is a full scan of the shadow
+            // tables. A share column hung off `meetings` would have been safe;
+            // one hung off `transcriptSegments` would not, and sync writes are
+            // frequent by design.
+            //
+            // `meetingID` is the primary key rather than a surrogate: a meeting
+            // has at most one share, and the cascade deletes it with the
+            // meeting. The local row is only a record of a *remote* share, so
+            // the cascade is not itself a revocation — the coordinator revokes
+            // over the network before it deletes the meeting.
+            try db.create(table: "meetingShares") { table in
+                table.column("meetingID", .text)
+                    .primaryKey()
+                    .references("meetings", onDelete: .cascade)
+                table.column("shareID", .text).notNull().unique()
+                table.column("includesTranscript", .boolean).notNull()
+                table.column("includesNotes", .boolean).notNull()
+                table.column("includesSummary", .boolean).notNull()
+                table.column("hasPassword", .boolean).notNull()
+                table.column("createdAt", .datetime).notNull()
+                table.column("lastSyncedAt", .datetime)
+                // The checksum of the payload the server currently holds. A push
+                // is owed exactly when it differs from the checksum of the
+                // payload built right now, which is far more robust than
+                // observing every source of shared content and hoping none was
+                // missed. A failed push must leave this untouched, so the next
+                // attempt still sees a difference and retries.
+                table.column("syncedChecksum", .text)
+                table.column("lastError", .text)
+            }
+            try db.create(
+                index: "meetingShares_on_createdAt",
+                on: "meetingShares",
+                columns: ["createdAt"]
+            )
+        }
         return migrator
     }
 

@@ -68,6 +68,10 @@ final class AppCoordinator {
     @ObservationIgnored private var insightTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var insightGenerations: [UUID: UUID] = [:]
     @ObservationIgnored private let meetingAudioExporter = MeetingAudioExportService()
+    @ObservationIgnored private let shareTokens: any ShareTokenStoring
+    /// Built per call rather than held, because it needs the device token and
+    /// the token does not exist until the first share is created.
+    @ObservationIgnored private let makeSharePublisher: @Sendable (String, URL) -> any SharePublishing
     @ObservationIgnored private var audioExportTasks: [UUID: Task<Void, Never>] = [:]
     /// Cancellation is cooperative. A replaced export can finish after its
     /// successor starts, so every UI update is stamped with its own generation.
@@ -77,11 +81,16 @@ final class AppCoordinator {
         state: AppViewState,
         downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
         storageAccounting: any StorageAccounting = StorageAccountingService(),
+        shareTokens: any ShareTokenStoring = KeychainShareTokenStore(),
+        makeSharePublisher: @escaping @Sendable (String, URL) -> any SharePublishing
+            = { token, origin in HushnoteSharePublisher(origin: origin, deviceToken: token) },
         defaults: UserDefaults = .standard
     ) {
         self.state = state
         self.downloader = downloader
         self.storageAccounting = storageAccounting
+        self.shareTokens = shareTokens
+        self.makeSharePublisher = makeSharePublisher
         self.defaults = defaults
         let preferences = AppPreferences(defaults: defaults)
         self.preferences = preferences
@@ -122,13 +131,15 @@ final class AppCoordinator {
             state.meetings = meetings.map(Self.listItem)
             state.recentlyDeletedMeetings = try await store.recentlyDeleted().map(Self.listItem)
             try await refreshFolderState()
+            await loadShares()
             let ids = Set(meetings.map(\.id))
             state.meetingWorkspaceTabs = preferences.pruneMeetingTabs(keeping: ids)
             if let destination = preferences.sidebarDestination {
                 let resolved = AppViewState.resolvedSidebarDestination(
                     destination,
                     meetingIDs: ids,
-                    folderIDs: Set(state.folders.map(\.id))
+                    folderIDs: Set(state.folders.map(\.id)),
+                    hasShares: !state.meetingShares.isEmpty
                 )
                 if resolved != destination {
                     state.selection = .meetings
@@ -595,6 +606,12 @@ final class AppCoordinator {
             cachedSegments[id] = segments
             guard state.activeMeetingID != id else { return }
             state.transcript = segments.map(Self.lineItem)
+            // The natural moment to reconcile a published link with what this
+            // Mac now holds. Costs one checksum and no request when nothing
+            // shared has changed, which is almost always.
+            if state.meetingShares[id] != nil {
+                Task { await self.syncShareIfNeeded(meetingID: id) }
+            }
         } catch {
             state.report(.meetingLoad, error.localizedDescription)
         }
@@ -647,6 +664,187 @@ final class AppCoordinator {
             }
             state.notesSaving.remove(meetingID)
         }
+    }
+
+    // MARK: - Sharing
+
+    /// The device token, minted on first use.
+    ///
+    /// Generating it lazily is deliberate: a Mac that has never shared anything
+    /// has no share identity at all, and nothing in the Keychain to leak.
+    private func shareToken() async throws -> String {
+        if let existing = try await shareTokens.token() { return existing }
+        let minted = ShareDeviceToken.generate()
+        try await shareTokens.setToken(minted)
+        return minted
+    }
+
+    private func sharePublisher() async throws -> any SharePublishing {
+        makeSharePublisher(try await shareToken(), ShareService.origin())
+    }
+
+    func loadShares() async {
+        do {
+            let shares = try await store.allMeetingShares()
+            state.meetingShares = Dictionary(uniqueKeysWithValues: shares.map { ($0.meetingID, $0) })
+        } catch {
+            state.report(.shareSync, error.localizedDescription)
+        }
+    }
+
+    /// Creates the link if there is none, and republishes if there is.
+    ///
+    /// One entry point for both because the sheet offers one button: the
+    /// difference between "create" and "update" is a detail of what already
+    /// exists on the server, not a decision the user is making.
+    func publishShare(meetingID: UUID, includes: ShareIncludes, password: String?) async {
+        guard !includes.isEmpty else {
+            state.report(.shareSync, ShareError.nothingSelected.localizedDescription)
+            return
+        }
+        guard !state.sharesInFlight.contains(meetingID) else { return }
+        state.sharesInFlight.insert(meetingID)
+        defer { state.sharesInFlight.remove(meetingID) }
+
+        do {
+            let payload = try await sharePayload(meetingID: meetingID, includes: includes)
+            let publisher = try await sharePublisher()
+            var record: MeetingShare
+
+            if var existing = state.meetingShares[meetingID] {
+                try await publisher.update(shareID: existing.shareID, payload: payload)
+                if let password {
+                    try await publisher.setPassword(shareID: existing.shareID, password: password)
+                    existing.hasPassword = true
+                }
+                existing.includes = includes
+                record = existing
+            } else {
+                let shareID = try await publisher.create(payload: payload, password: password)
+                record = MeetingShare(
+                    meetingID: meetingID,
+                    shareID: shareID,
+                    includes: includes,
+                    hasPassword: password != nil,
+                    createdAt: Date(),
+                    lastSyncedAt: nil,
+                    syncedChecksum: nil,
+                    lastError: nil
+                )
+            }
+
+            record.lastSyncedAt = Date()
+            record.syncedChecksum = SharePayloadBuilder.checksum(payload)
+            record.lastError = nil
+            try await store.upsertMeetingShare(record)
+            state.meetingShares[meetingID] = record
+        } catch {
+            // The previously published version stays exactly as it was. A
+            // failed publish must never blank a page other people are reading.
+            var failed = state.meetingShares[meetingID]
+            failed?.lastError = error.localizedDescription
+            if let failed {
+                try? await store.upsertMeetingShare(failed)
+                state.meetingShares[meetingID] = failed
+            }
+            state.report(.shareSync, error.localizedDescription)
+        }
+    }
+
+    /// Republishes only when the content has actually changed.
+    ///
+    /// Checksum rather than an observer on every source of shared content:
+    /// comparing what the payload *is* to what the server was last given cannot
+    /// miss a mutation path, and adding a new shared field later cannot forget
+    /// to register one. It also means an edit that changes nothing shared --
+    /// correcting a segment on a notes-only share -- costs no request at all.
+    func syncShareIfNeeded(meetingID: UUID) async {
+        guard let share = state.meetingShares[meetingID],
+              !state.sharesInFlight.contains(meetingID)
+        else { return }
+
+        do {
+            let payload = try await sharePayload(meetingID: meetingID, includes: share.includes)
+            let checksum = SharePayloadBuilder.checksum(payload)
+            guard case .push = ShareSyncPolicy.decide(share: share, payloadChecksum: checksum) else {
+                return
+            }
+            state.sharesInFlight.insert(meetingID)
+            defer { state.sharesInFlight.remove(meetingID) }
+
+            try await sharePublisher().update(shareID: share.shareID, payload: payload)
+            let updated = ShareSyncPolicy.succeeded(share, checksum: checksum)
+            try await store.upsertMeetingShare(updated)
+            state.meetingShares[meetingID] = updated
+        } catch {
+            // Silent on purpose: this runs when a meeting is merely opened, and
+            // an alert for a background republish would interrupt reading. The
+            // failure is recorded and shown in the share sheet and the Shared
+            // list, where it can be acted on.
+            let failed = ShareSyncPolicy.failed(share, error: error)
+            try? await store.upsertMeetingShare(failed)
+            state.meetingShares[meetingID] = failed
+        }
+    }
+
+    func revokeShare(meetingID: UUID) async {
+        guard let share = state.meetingShares[meetingID] else { return }
+        state.sharesInFlight.insert(meetingID)
+        defer { state.sharesInFlight.remove(meetingID) }
+
+        do {
+            try await sharePublisher().revoke(shareID: share.shareID)
+            try await store.deleteMeetingShare(meetingID: meetingID)
+            state.meetingShares[meetingID] = nil
+            if state.selection == .shared, state.meetingShares.isEmpty {
+                setSelection(.meetings)
+            }
+        } catch ShareError.notFound, ShareError.revoked {
+            // Already gone on the server. Keeping a local row for a link that
+            // does not exist would leave a revoke button that can never succeed.
+            try? await store.deleteMeetingShare(meetingID: meetingID)
+            state.meetingShares[meetingID] = nil
+        } catch {
+            var failed = share
+            failed.lastError = error.localizedDescription
+            try? await store.upsertMeetingShare(failed)
+            state.meetingShares[meetingID] = failed
+            state.report(.shareSync, error.localizedDescription)
+        }
+    }
+
+    private func sharePayload(meetingID: UUID, includes: ShareIncludes) async throws -> SharePayload {
+        let meeting = try await store.meeting(id: meetingID)
+        let segments = includes.transcript ? try await store.segments(meetingID: meetingID) : []
+        let insights = state.insights(for: meetingID)
+
+        // `Meeting` stores the two ends, not the span. Falling back to the last
+        // segment's end matters for a meeting still being finalized, where
+        // `endedAt` is not written yet.
+        let duration: TimeInterval = {
+            if let started = meeting?.startedAt, let ended = meeting?.endedAt {
+                return max(0, ended.timeIntervalSince(started))
+            }
+            return segments.last.map { Double($0.endMilliseconds) / 1000 } ?? 0
+        }()
+
+        return SharePayloadBuilder.build(
+            title: meeting?.title ?? "Meeting",
+            startedAt: meeting?.startedAt ?? meeting?.createdAt ?? Date(),
+            duration: duration,
+            includes: includes,
+            transcript: segments,
+            notes: includes.notes ? (state.meetingNotes[meetingID] ?? meeting?.notes ?? "") : "",
+            preparedSummary: includes.summary
+                ? SharePayloadBuilder.summary(
+                    text: insights.summary,
+                    topics: insights.topics,
+                    decisions: insights.decisions,
+                    actions: insights.actions,
+                    openQuestions: insights.openQuestions
+                )
+                : nil
+        )
     }
 
     // MARK: - Authored meeting content
@@ -969,6 +1167,27 @@ final class AppCoordinator {
     private func permanentlyDeleteMeeting(_ id: UUID) async {
         insightTasks[id]?.cancel()
         audioExportTasks[id]?.cancel()
+
+        // The link comes down first, and a failure here stops the delete.
+        //
+        // Same ordering the audio files already use: everything outside the
+        // relational row is removed before the row that lets you find it again.
+        // Deleting the meeting first would leave a published transcript on the
+        // internet with nothing left on this Mac that knows its id -- and the
+        // device token is the only thing that could ever have revoked it.
+        if state.meetingShares[id] != nil {
+            await revokeShare(meetingID: id)
+            guard state.meetingShares[id] == nil else {
+                state.report(
+                    .meetingDelete,
+                    """
+                    This meeting is still shared and its link could not be                     withdrawn, so it has not been deleted. Try again when you                     are online.
+                    """
+                )
+                return
+            }
+        }
+
         do {
             try await store.deleteMeeting(id: id, deleteAudioFiles: true)
             state.recentlyDeletedMeetings.removeAll { $0.id == id }

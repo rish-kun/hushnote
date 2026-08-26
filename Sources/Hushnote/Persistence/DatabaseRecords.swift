@@ -91,6 +91,57 @@ struct MeetingFolderRecord: Codable, FetchableRecord, PersistableRecord, TableRe
     }
 }
 
+/// The local half of a share. The server holds the payload and a hash of the
+/// device token; this row holds only what this Mac needs to keep the two in
+/// step and to revoke.
+struct MeetingShareRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "meetingShares"
+
+    var meetingID: String
+    var shareID: String
+    var includesTranscript: Bool
+    var includesNotes: Bool
+    var includesSummary: Bool
+    var hasPassword: Bool
+    var createdAt: Date
+    var lastSyncedAt: Date?
+    var syncedChecksum: String?
+    var lastError: String?
+
+    init(_ share: MeetingShare) {
+        meetingID = share.meetingID.uuidString
+        shareID = share.shareID
+        includesTranscript = share.includes.transcript
+        includesNotes = share.includes.notes
+        includesSummary = share.includes.summary
+        hasPassword = share.hasPassword
+        createdAt = share.createdAt
+        lastSyncedAt = share.lastSyncedAt
+        syncedChecksum = share.syncedChecksum
+        lastError = share.lastError
+    }
+
+    func model() throws -> MeetingShare {
+        guard let meetingID = UUID(uuidString: meetingID) else {
+            throw PersistenceError.corruptRecord("meeting share \(shareID)")
+        }
+        return MeetingShare(
+            meetingID: meetingID,
+            shareID: shareID,
+            includes: ShareIncludes(
+                transcript: includesTranscript,
+                notes: includesNotes,
+                summary: includesSummary
+            ),
+            hasPassword: hasPassword,
+            createdAt: createdAt,
+            lastSyncedAt: lastSyncedAt,
+            syncedChecksum: syncedChecksum,
+            lastError: lastError
+        )
+    }
+}
+
 struct SummaryVersionRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
     static let databaseTableName = "summaryVersions"
 

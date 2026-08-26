@@ -107,6 +107,7 @@ struct AppPreferences {
             switch raw {
             case "meetings": return .meetings
             case "unfiled": return .unfiled
+            case "shared": return .shared
             case "recentlyDeleted": return .recentlyDeleted
             case "models": return .models
             case "settings": return .settings
@@ -125,6 +126,7 @@ struct AppPreferences {
             let raw: String? = switch newValue {
             case .meetings: "meetings"
             case .unfiled: "unfiled"
+            case .shared: "shared"
             case .recentlyDeleted: "recentlyDeleted"
             case .models: "models"
             case .settings: "settings"

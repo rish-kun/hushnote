@@ -1,0 +1,42 @@
+{
+  "name": "hushnote-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only web renderer for Hushnote meeting share links.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "schema:types": "node --experimental-strip-types scripts/generate-payload-types.ts"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "2.1.0",
+    "@upstash/ratelimit": "2.0.8",
+    "@upstash/redis": "1.38.2",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "drizzle-orm": "0.45.2",
+    "next": "15.5.24",
+    "postgres": "3.4.9",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.9.2",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "drizzle-kit": "0.31.10",
+    "json-schema-to-typescript": "15.0.4",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  },
+  "overrides": {
+    "postcss": "8.5.26",
+    "sharp": "0.35.3"
+  }
+}

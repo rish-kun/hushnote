@@ -279,6 +279,14 @@ struct CompletedMeetingView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: meetingID) { await coordinator.loadMeeting(meetingID) }
+        .sheet(
+            isPresented: Binding(
+                get: { state.shareSheetMeetingID == meetingID },
+                set: { if !$0 { state.shareSheetMeetingID = nil } }
+            )
+        ) {
+            MeetingShareSheet(meetingID: meetingID)
+        }
     }
 
     private func meetingHeader(_ policy: AdaptiveLayoutPolicy) -> some View {
@@ -305,6 +313,42 @@ struct CompletedMeetingView: View {
         }
     }
 
+    /// A meeting that is published says so, permanently, wherever it is read.
+    ///
+    /// A share is republished from the current meeting whenever what it
+    /// includes changes, so this is not decoration: nobody should be correcting
+    /// a transcript or typing a note into a document that is on the internet
+    /// without being able to see that it is. It names what is actually
+    /// published, because a share of the transcript alone and a share that also
+    /// carries your notes are very different things to be typing into.
+    @ViewBuilder
+    private var shareBadge: some View {
+        if let share = state.meetingShares[meetingID] {
+            Button { state.shareSheetMeetingID = meetingID } label: {
+                HStack(spacing: 6) {
+                    HushnoteBadge(
+                        title: share.hasPassword ? "Shared · Password" : "Shared",
+                        tone: .alert
+                    )
+                    Text(sharedContentSummary(share.includes))
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("This meeting is published. Open the share settings.")
+        }
+    }
+
+    private func sharedContentSummary(_ includes: ShareIncludes) -> String {
+        var parts: [String] = []
+        if includes.transcript { parts.append("transcript") }
+        if includes.notes { parts.append("notes") }
+        if includes.summary { parts.append("summary") }
+        return parts.isEmpty ? "nothing" : parts.joined(separator: " · ")
+    }
+
     private var meetingHeading: some View {
         VStack(alignment: .leading, spacing: 8) {
             EditableMeetingTitle(
@@ -313,6 +357,7 @@ struct CompletedMeetingView: View {
             )
             .layoutPriority(1)
             meetingMetadata
+            shareBadge
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -387,6 +432,7 @@ struct CompletedMeetingView: View {
 
     @ViewBuilder
     private var meetingActionControls: some View {
+        shareControl
         if canStartTranscribing {
             Button("Start Transcribing") {
                 Task { await coordinator.startMeeting(meetingID: meetingID) }
@@ -416,6 +462,17 @@ struct CompletedMeetingView: View {
             Label("Export", systemImage: "square.and.arrow.up")
         }
         .menuStyle(.borderlessButton)
+    }
+
+    /// Deliberately its own control rather than an item in the Export menu.
+    /// Export writes a file the user already controls; this publishes to the
+    /// internet. Filing them together would make the difference a submenu.
+    private var shareControl: some View {
+        Button(state.meetingShares[meetingID] == nil ? "Share…" : "Sharing…") {
+            state.shareSheetMeetingID = meetingID
+        }
+        .hushnoteButton(.secondary)
+        .disabled(state.transcript.isEmpty && state.meetingShares[meetingID] == nil)
     }
 
     /// Answered from the loaded meeting rather than from disk: this is read

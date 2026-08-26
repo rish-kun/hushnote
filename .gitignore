@@ -8,3 +8,9 @@ DerivedData/
 *.m4a
 *.gguf
 
+
+# Node (web/)
+node_modules/
+.next/
+.vercel/
+.env*.local
