@@ -292,11 +292,24 @@ struct CompletedMeetingView: View {
     private func meetingHeader(_ policy: AdaptiveLayoutPolicy) -> some View {
         ViewThatFits(in: .horizontal) {
             if policy != .compact {
+                // The three priorities are load-bearing and none of them is
+                // decoration. `meetingActions` is fixed-size chrome and must be
+                // resolved at its natural width *first*: with the heading at
+                // the highest priority, a greedy `maxWidth: .infinity` heading
+                // took the entire row, `meetingActions` fell back to its
+                // minimum, and -- because a button label carries no line limit
+                // -- "Start Transcribing" wrapped to one character per line
+                // into a 180pt vertical capsule that pushed the tab bar half a
+                // page down. The heading still outranks the `Spacer` for the
+                // same reason it always did: at equal priority the two split
+                // the leftover space between them and the title truncates
+                // beside a gap of nothing.
                 HStack(alignment: .top, spacing: 18) {
                     meetingHeading
                         .layoutPriority(1)
                     Spacer(minLength: 24)
                     meetingActions
+                        .layoutPriority(2)
                 }
             }
 
@@ -422,10 +435,17 @@ struct CompletedMeetingView: View {
 
     @ViewBuilder
     private var meetingActions: some View {
+        // Both candidates hold their natural width, the stacked one included.
+        // `ViewThatFits` accepts its *last* candidate whatever the proposal, so
+        // a compressible fallback is not a fallback -- it is a promise to
+        // accept any width at all, including zero. That is what let a starved
+        // row render buttons as vertical capsules rather than forcing the
+        // header to stack. A control label wraps in no layout this app has.
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 10) { meetingActionControls }
                 .fixedSize(horizontal: true, vertical: false)
             VStack(alignment: .leading, spacing: 10) { meetingActionControls }
+                .fixedSize(horizontal: true, vertical: false)
         }
         .accessibilityElement(children: .contain)
     }

@@ -117,7 +117,17 @@ final class AppCoordinator {
 
     func bootstrap() async {
         refreshInstalledModels()
-        await refreshInstalledModelSizes()
+        // Deliberately not awaited. `refreshInstalledModelSizes` walks every
+        // installed model directory counting `st_blocks` per file -- thousands
+        // of artifacts across several gigabytes -- and awaiting it here put a
+        // whole-filesystem scan in front of the query that fills the library.
+        // On a warm cache it costs 40-80 ms and hides the bug; cold, or while
+        // CoreML is loading a final model and starving a `.utility` task, it
+        // runs long enough that the sidebar reads "All Meetings 1" and a user
+        // starts a second recording believing the first is gone. Nothing in
+        // the library depends on a byte count: only the Models and Storage
+        // screens read it, and they render fine while it resolves.
+        Task { await self.refreshInstalledModelSizes() }
         do {
             _ = try await store.failInterruptedProviderRuns()
             _ = try await store.purgeDeletedMeetings(
