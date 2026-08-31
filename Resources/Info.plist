@@ -26,8 +26,10 @@
     <string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSAudioCaptureUsageDescription</key>
-    <string>Hushnote records system audio from your meeting apps to create a private local transcript.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Hushnote records system audio from your meeting apps to create a private local transcript.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Hushnote records your microphone on a separate local track so your side of the meeting is included.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Personal prototype</string>
 </dict>

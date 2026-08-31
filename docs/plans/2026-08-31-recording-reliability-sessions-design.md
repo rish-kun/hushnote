@@ -31,9 +31,11 @@ capture ownership.
   continues.
 
 Existing meetings are migrated into a synthetic legacy session. Existing
-audio paths and transcript identifiers remain valid. The old one-track-per-
-meeting/source uniqueness constraint is removed without touching columns that
-fire the expensive transcript FTS update trigger.
+audio paths and transcript identifiers remain valid. The old `audioTracks`
+table remains as a compatibility projection while capture is moved to the new
+take graph; the new `audioTakes` table has no one-file-per-meeting/source
+constraint. The backfill does not touch columns that fire the expensive
+transcript FTS update trigger.
 
 ## Timeline and source behavior
 

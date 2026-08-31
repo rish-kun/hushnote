@@ -3,6 +3,25 @@ import XCTest
 
 @MainActor
 final class AppViewStateTests: XCTestCase {
+    func testMicrophonePreferencesApplyWithoutCouplingLevelsToDiagnostics() {
+        let suite = "dev.rishit.hushnote.view-state-microphone.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        let preferences = AppPreferences(defaults: defaults)
+        preferences.microphoneCaptureEnabled = false
+        preferences.selectedMicrophone = PreferredMicrophone(uid: "desk", displayName: "Desk Mic")
+        let state = AppViewState()
+
+        state.applyMicrophonePreferences(preferences)
+        state.microphoneLevel = 0.75
+
+        XCTAssertFalse(state.microphoneCaptureEnabled)
+        XCTAssertEqual(state.selectedMicrophone?.uid, "desk")
+        XCTAssertEqual(state.selectedMicrophone?.displayName, "Desk Mic")
+        XCTAssertEqual(state.microphoneLevel, 0.75)
+        XCTAssertEqual(state.recordingDiagnostics.diagnostics(for: .microphone).lifecycle, .disabled)
+    }
+
     func testSelectedFolderIDTracksOnlyFolderDestinations() {
         let state = AppViewState()
         let folderID = UUID()

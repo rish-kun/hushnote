@@ -128,7 +128,7 @@ struct LiveTranscriptWriteSetTests {
 
     @Test("A write that never landed stays pending for the next delta")
     func unconfirmedWritesAreRetried() {
-        var ledger = LiveTranscriptWriteSet()
+        let ledger = LiveTranscriptWriteSet()
         let first = segment("s1", start: 0, text: "Committed")
         _ = ledger.unwritten(in: snapshot([first]))
 

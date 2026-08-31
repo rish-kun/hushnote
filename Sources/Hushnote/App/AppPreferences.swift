@@ -18,6 +18,30 @@ enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// A durable microphone choice.
+///
+/// Core Audio device identifiers remain stable across launches; the display
+/// name is retained only so Settings can describe the choice before hardware
+/// enumeration has completed. Capture must resolve the UID again rather than
+/// treating the stored name as device identity.
+struct PreferredMicrophone: Codable, Equatable, Identifiable, Sendable {
+    let uid: String
+    let displayName: String?
+
+    var id: String { uid }
+
+    init?(uid: String, displayName: String? = nil) {
+        let normalizedUID = uid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedUID.isEmpty else { return nil }
+        self.uid = normalizedUID
+        self.displayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+    }
+}
+
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
+}
+
 /// Durable, non-secret application preferences.
 ///
 /// Credentials deliberately do not have a representation here; they remain in
@@ -32,6 +56,9 @@ struct AppPreferences {
         static let meetingTabs = "workspace.meetingTabs"
         static let modelStorageParentPath = "models.storage.parentPath"
         static let appearance = "appearance.mode"
+        static let microphoneCaptureEnabled = "recording.microphone.enabled"
+        static let microphoneDeviceUID = "recording.microphone.deviceUID"
+        static let microphoneDeviceName = "recording.microphone.deviceName"
     }
 
     /// Shared with the root scene and Settings' observing `@AppStorage`.
@@ -59,6 +86,38 @@ struct AppPreferences {
     var retainAudio: Bool {
         get { defaults.object(forKey: Key.retainAudio) as? Bool ?? true }
         nonmutating set { defaults.set(newValue, forKey: Key.retainAudio) }
+    }
+
+    /// New installs capture the local speaker. A stored false is an explicit
+    /// choice and must not be confused with UserDefaults' absent-key false.
+    var microphoneCaptureEnabled: Bool {
+        get { defaults.object(forKey: Key.microphoneCaptureEnabled) as? Bool ?? true }
+        nonmutating set { defaults.set(newValue, forKey: Key.microphoneCaptureEnabled) }
+    }
+
+    /// Nil means the current system-default input device. Setting nil clears
+    /// both pieces so a stale name never survives a cleared device identity.
+    var selectedMicrophone: PreferredMicrophone? {
+        get {
+            guard let uid = defaults.string(forKey: Key.microphoneDeviceUID) else { return nil }
+            return PreferredMicrophone(
+                uid: uid,
+                displayName: defaults.string(forKey: Key.microphoneDeviceName)
+            )
+        }
+        nonmutating set {
+            guard let newValue else {
+                defaults.removeObject(forKey: Key.microphoneDeviceUID)
+                defaults.removeObject(forKey: Key.microphoneDeviceName)
+                return
+            }
+            defaults.set(newValue.uid, forKey: Key.microphoneDeviceUID)
+            if let displayName = newValue.displayName {
+                defaults.set(displayName, forKey: Key.microphoneDeviceName)
+            } else {
+                defaults.removeObject(forKey: Key.microphoneDeviceName)
+            }
+        }
     }
 
     var localModelPath: String {

@@ -30,6 +30,8 @@ typealias SystemAudioCaptureFactory = @Sendable (
     _ noticeHandler: @escaping @Sendable (CaptureNotice) -> Void
 ) -> any SystemAudioCapturing
 
+typealias MicrophoneAudioCaptureFactory = @Sendable () -> MicrophoneAudioCapture
+
 /// Owns one meeting capture using macOS's system-audio-only Core Audio tap.
 public actor AudioPipeline {
     public nonisolated let events: AsyncStream<AudioCaptureEvent>
@@ -37,25 +39,54 @@ public actor AudioPipeline {
     private let eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
     private let rootDirectory: URL
     private let captureFactory: SystemAudioCaptureFactory
-    private var capture: (any SystemAudioCapturing)?
-    private var output: CaptureOutputBridge?
+    private let microphoneCaptureFactory: MicrophoneAudioCaptureFactory
+    private var systemCapture: (any SystemAudioCapturing)?
+    private var microphoneCapture: MicrophoneAudioCapture?
+    private var systemOutput: CaptureOutputBridge?
+    private var microphoneOutput: CaptureOutputBridge?
+    private var timeline: CapturedMediaTimelineCoordinator?
+    private var completedSourceArtifacts: [AudioCaptureSourceArtifact] = []
+    private var selectedMicrophone: MicrophoneInputDevice?
+    /// Invalidates work across actor reentrancy. Permission prompts and
+    /// `MicrophoneAudioCapture` calls suspend this actor, so ownership cannot
+    /// be inferred from which method started first.
+    private var microphoneConfigurationGeneration: UInt64 = 0
+    private var activeMicrophoneTakeID: UUID?
     private var currentStatus: AudioCaptureStatus = .idle
     private var sessionID: UUID?
     private var sessionDirectory: URL?
     private var systemAudioURL: URL?
+    private var timelineStartMilliseconds: Int64 = 0
 
     public init(rootDirectory: URL? = nil) {
-        self.init(rootDirectory: rootDirectory) { sampleHandler, noticeHandler in
-            SystemAudioTapCapture(sampleHandler: sampleHandler, noticeHandler: noticeHandler)
-        }
+        self.init(
+            rootDirectory: rootDirectory,
+            captureFactory: { sampleHandler, noticeHandler in
+                SystemAudioTapCapture(sampleHandler: sampleHandler, noticeHandler: noticeHandler)
+            },
+            microphoneCaptureFactory: { MicrophoneAudioCapture() }
+        )
     }
 
     init(rootDirectory: URL?, captureFactory: @escaping SystemAudioCaptureFactory) {
+        self.init(
+            rootDirectory: rootDirectory,
+            captureFactory: captureFactory,
+            microphoneCaptureFactory: { MicrophoneAudioCapture() }
+        )
+    }
+
+    init(
+        rootDirectory: URL?,
+        captureFactory: @escaping SystemAudioCaptureFactory,
+        microphoneCaptureFactory: @escaping MicrophoneAudioCaptureFactory
+    ) {
         let pair = AsyncStream<AudioCaptureEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
         events = pair.stream
         eventContinuation = pair.continuation
         self.rootDirectory = rootDirectory ?? Self.defaultCaptureDirectory()
         self.captureFactory = captureFactory
+        self.microphoneCaptureFactory = microphoneCaptureFactory
     }
 
     deinit {
@@ -63,12 +94,18 @@ public actor AudioPipeline {
     }
 
     public var status: AudioCaptureStatus { currentStatus }
+    public var timelinePositionMilliseconds: Int64 {
+        timeline?.positionMilliseconds ?? timelineStartMilliseconds
+    }
 
-    /// Starts a bot-free capture governed exclusively by the macOS System Audio
-    /// Recording Only permission. No microphone or screen pixels are accessed.
+    /// Starts a bot-free capture. System audio is always written; microphone
+    /// capture is optional and remains a separate original when enabled.
     @discardableResult
-    public func start(sessionID id: UUID = UUID()) async throws -> UUID {
-        guard capture == nil else { throw AudioPipelineError.alreadyRunning }
+    public func start(
+        sessionID id: UUID = UUID(),
+        configuration: AudioCaptureConfiguration = .init()
+    ) async throws -> UUID {
+        guard systemCapture == nil else { throw AudioPipelineError.alreadyRunning }
         updateStatus(.preparing)
 
         let directory = rootDirectory.appending(path: id.uuidString, directoryHint: .isDirectory)
@@ -82,10 +119,15 @@ public actor AudioPipeline {
             // A meeting can be started more than once — the failure banner offers
             // "Try Again" against the same meeting ID. Each attempt gets its own
             // take so a retry can never destroy the audio of the attempt before it.
-            let systemURL = try Self.allocateTakeURL(in: directory)
+            let systemURL = try Self.allocateTakeURL(for: .system, in: directory)
+            let timeline = CapturedMediaTimelineCoordinator(
+                meetingStartMilliseconds: configuration.timelineStartMilliseconds
+            )
 
             let output = try CaptureOutputBridge(
-                systemAudioURL: systemURL,
+                source: .system,
+                audioURL: systemURL,
+                timelineCoordinator: timeline,
                 eventContinuation: eventContinuation
             )
             // Every failure route is stamped with the session that owns it.
@@ -112,60 +154,148 @@ public actor AudioPipeline {
             self.sessionID = id
             self.sessionDirectory = directory
             self.systemAudioURL = systemURL
-            self.output = output
-            self.capture = capture
+            self.timelineStartMilliseconds = configuration.timelineStartMilliseconds
+            self.timeline = timeline
+            self.systemOutput = output
+            self.systemCapture = capture
+            completedSourceArtifacts = []
+            selectedMicrophone = nil
 
+            eventContinuation.yield(.sourceHealth(.init(source: .system, state: .arming)))
             output.begin()
             try capture.start()
+            eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
+
+            if configuration.capturesMicrophone {
+                let generation = advanceMicrophoneConfigurationGeneration()
+                do {
+                    try await startMicrophone(
+                        deviceUID: configuration.microphoneDeviceUID,
+                        generation: generation
+                    )
+                } catch {
+                    // System audio is already durable and healthy. An expected
+                    // microphone failure is source-specific, not a reason to
+                    // discard the meeting.
+                }
+            } else {
+                eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .disabled)))
+            }
             updateStatus(.recording)
             return id
         } catch {
-            output?.finish()
-            capture?.stop()
-            capture = nil
-            output = nil
+            systemOutput?.finish()
+            systemCapture?.stop()
+            if let microphoneCapture { try? await microphoneCapture.stop() }
             sessionID = nil
             sessionDirectory = nil
             systemAudioURL = nil
+            resetSession()
             let mappedError = Self.mapCaptureError(error)
             updateStatus(.failed(mappedError.localizedDescription))
             throw mappedError
         }
     }
 
-    public func pause() throws {
-        guard currentStatus == .recording, let output, let capture else {
+    public func pause() async throws {
+        guard currentStatus == .recording, let systemOutput, let systemCapture else {
             throw AudioPipelineError.notRunning
         }
-        try capture.pause()
-        output.pause()
+        try systemCapture.pause()
+        // Freeze the shared media clock before crossing to the microphone
+        // actor. A disappearing microphone must not delay the global pause
+        // boundary or turn a healthy system recording into a failed meeting.
+        systemOutput.pause()
+        microphoneOutput?.pause()
+        let microphone = microphoneCapture
+        let takeID = activeMicrophoneTakeID
+        if let microphone {
+            do {
+                try await microphone.pause()
+            } catch {
+                // A toggle may have replaced this take while the await yielded.
+                // Only a failure from the still-current take is actionable.
+                if activeMicrophoneTakeID == takeID, microphoneCapture === microphone {
+                    await closeMicrophoneTake()
+                    eventContinuation.yield(.sourceHealth(.init(
+                        source: .microphone,
+                        state: .unavailable(error.localizedDescription)
+                    )))
+                }
+            }
+        }
         updateStatus(.paused)
     }
 
-    public func resume() throws {
-        guard currentStatus == .paused, let output, let capture else {
+    public func resume() async throws {
+        guard currentStatus == .paused, let systemOutput, let systemCapture else {
             throw AudioPipelineError.notRunning
         }
         // Accept samples before starting the device, mirroring `pause()`, which
         // stops accepting before it stops the device. The other order discards
         // whatever the HAL delivers between the two calls — and the device
         // starts delivering before `resume()` even returns.
-        output.resume()
+        systemOutput.resume()
+        microphoneOutput?.resume()
         do {
-            try capture.resume()
+            try systemCapture.resume()
         } catch {
             // The device never restarted, so nothing may be accepted into a
             // meeting the user still sees as paused.
-            output.pause()
+            systemOutput.pause()
+            microphoneOutput?.pause()
             throw error
+        }
+        let microphone = microphoneCapture
+        let takeID = activeMicrophoneTakeID
+        if let microphone {
+            do {
+                try await microphone.resume()
+            } catch {
+                if activeMicrophoneTakeID == takeID, microphoneCapture === microphone {
+                    await closeMicrophoneTake()
+                    eventContinuation.yield(.sourceHealth(.init(
+                        source: .microphone,
+                        state: .unavailable(error.localizedDescription)
+                    )))
+                }
+            }
         }
         updateStatus(.recording)
     }
 
+    /// Applies the microphone toggle to the current meeting. Enabling or
+    /// changing devices opens a fresh take; disabling closes the current one.
+    /// System audio remains untouched throughout.
+    public func setMicrophoneCaptureEnabled(
+        _ isEnabled: Bool,
+        deviceUID: String? = nil
+    ) async throws {
+        guard currentStatus == .recording || currentStatus == .paused else {
+            throw AudioPipelineError.notRunning
+        }
+        let generation = advanceMicrophoneConfigurationGeneration()
+        if !isEnabled {
+            await closeMicrophoneTake()
+            if microphoneConfigurationGeneration == generation {
+                eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .disabled)))
+            }
+            return
+        }
+
+        if microphoneCapture != nil, selectedMicrophone?.id == deviceUID ||
+            (deviceUID == nil && selectedMicrophone?.isDefault == true) {
+            return
+        }
+        if microphoneCapture != nil { await closeMicrophoneTake() }
+        guard microphoneConfigurationGeneration == generation else { return }
+        try await startMicrophone(deviceUID: deviceUID, generation: generation)
+    }
+
     @discardableResult
     public func stop() async throws -> AudioCaptureArtifacts {
-        guard let capture,
-              let output,
+        guard let systemCapture,
+              let systemOutput,
               let sessionID,
               let sessionDirectory,
               let systemAudioURL
@@ -174,13 +304,29 @@ public actor AudioPipeline {
         }
 
         updateStatus(.stopping)
-        capture.stop()
-        output.finish()
+        _ = advanceMicrophoneConfigurationGeneration()
+        systemCapture.stop()
+        await closeMicrophoneTake()
+        systemOutput.finish()
+        let systemArtifact = systemOutput.sourceArtifact
+        let sourceArtifacts = [systemArtifact] + completedSourceArtifacts
+        // Use exact written-frame durations for the durable session boundary.
+        // The addressing timeline rounds every callback to milliseconds, and
+        // accumulating that sub-millisecond loss would undercount long takes.
+        let sessionDuration = sourceArtifacts.reduce(Int64(0)) { duration, artifact in
+            max(
+                duration,
+                artifact.timelineStartMilliseconds
+                    + artifact.durationMilliseconds
+                    - timelineStartMilliseconds
+            )
+        }
         let artifacts = AudioCaptureArtifacts(
             sessionID: sessionID,
             directoryURL: sessionDirectory,
             systemAudioURL: systemAudioURL,
-            durationMilliseconds: output.durationMilliseconds
+            durationMilliseconds: sessionDuration,
+            sourceArtifacts: sourceArtifacts
         )
         resetSession()
         updateStatus(.stopped)
@@ -193,8 +339,16 @@ public actor AudioPipeline {
     /// destroy the previous attempt's audio the instant a retry began — before
     /// capture had even restarted, and even if the retry then failed.
     static func allocateTakeURL(in directory: URL, fileManager: FileManager = .default) throws -> URL {
+        try allocateTakeURL(for: .system, in: directory, fileManager: fileManager)
+    }
+
+    static func allocateTakeURL(
+        for source: AudioSource,
+        in directory: URL,
+        fileManager: FileManager = .default
+    ) throws -> URL {
         for index in 0..<10_000 {
-            let candidate = directory.appending(path: "system-\(index).caf")
+            let candidate = directory.appending(path: "\(source.rawValue)-\(index).caf")
             if !fileManager.fileExists(atPath: candidate.path) { return candidate }
         }
         throw AudioPipelineError.writerFailed(
@@ -233,19 +387,174 @@ public actor AudioPipeline {
     private func captureDidFail(_ message: String, session: UUID) async {
         // A failure only speaks for the session that raised it. Anything else
         // is a message from a meeting that is already over.
-        guard sessionID == session, let capture else { return }
-        capture.stop()
-        output?.finish()
+        guard sessionID == session, let systemCapture else { return }
+        currentStatus = .stopping
+        _ = advanceMicrophoneConfigurationGeneration()
+        systemCapture.stop()
+        await closeMicrophoneTake()
+        systemOutput?.finish()
         resetSession()
         updateStatus(.failed(message))
     }
 
+    private func startMicrophone(deviceUID: String?, generation: UInt64) async throws {
+        guard let sessionID, let sessionDirectory, let timeline else {
+            throw AudioPipelineError.notRunning
+        }
+        guard microphoneConfigurationGeneration == generation else { return }
+        let takeID = UUID()
+        activeMicrophoneTakeID = takeID
+        eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .arming)))
+        let url = try Self.allocateTakeURL(for: .microphone, in: sessionDirectory)
+        let output = try CaptureOutputBridge(
+            source: .microphone,
+            audioURL: url,
+            timelineCoordinator: timeline,
+            eventContinuation: eventContinuation
+        )
+        output.failureHandler = { [weak self] message in
+            Task {
+                await self?.microphoneDidFail(
+                    message,
+                    session: sessionID,
+                    takeID: takeID
+                )
+            }
+        }
+        let capture = microphoneCaptureFactory()
+        output.begin()
+
+        do {
+            let device = try await capture.start(
+                selectedDeviceUID: deviceUID,
+                sampleHandler: { [weak output] buffer, presentationSeconds in
+                    output?.consume(buffer, presentationSeconds: presentationSeconds)
+                }
+            )
+            guard sessionID == self.sessionID,
+                  microphoneConfigurationGeneration == generation,
+                  activeMicrophoneTakeID == takeID
+            else {
+                try? await capture.stop()
+                output.finish()
+                try? FileManager.default.removeItem(at: url)
+                return
+            }
+            if currentStatus == .paused {
+                output.pause()
+                try await capture.pause()
+                guard sessionID == self.sessionID,
+                      microphoneConfigurationGeneration == generation,
+                      activeMicrophoneTakeID == takeID
+                else {
+                    try? await capture.stop()
+                    output.finish()
+                    try? FileManager.default.removeItem(at: url)
+                    return
+                }
+            }
+            microphoneOutput = output
+            microphoneCapture = capture
+            selectedMicrophone = device
+            eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .healthy)))
+        } catch {
+            try? await capture.stop()
+            output.finish()
+            let isCurrent = sessionID == self.sessionID
+                && microphoneConfigurationGeneration == generation
+                && activeMicrophoneTakeID == takeID
+            if isCurrent {
+                microphoneOutput = nil
+                microphoneCapture = nil
+                selectedMicrophone = nil
+                activeMicrophoneTakeID = nil
+            }
+            if output.durationMilliseconds == 0 {
+                try? FileManager.default.removeItem(at: url)
+            } else if isCurrent {
+                completedSourceArtifacts.append(output.sourceArtifact)
+            }
+            if isCurrent {
+                eventContinuation.yield(.sourceHealth(.init(
+                    source: .microphone,
+                    state: .unavailable(error.localizedDescription)
+                )))
+            }
+            if isCurrent { throw error }
+            return
+        }
+    }
+
+    private func closeMicrophoneTake() async {
+        // Relinquish actor-owned state before awaiting another actor. If a new
+        // take starts during teardown, this close must only finish its snapshot.
+        let capture = microphoneCapture
+        let output = microphoneOutput
+        let device = selectedMicrophone
+        activeMicrophoneTakeID = nil
+        microphoneCapture = nil
+        microphoneOutput = nil
+        selectedMicrophone = nil
+
+        if let capture { try? await capture.stop() }
+        if let output {
+            output.finish()
+            if output.durationMilliseconds > 0 {
+                completedSourceArtifacts.append(
+                    microphoneArtifact(from: output, device: device)
+                )
+            } else {
+                try? FileManager.default.removeItem(at: output.sourceArtifact.audioURL)
+            }
+        }
+    }
+
+    private func microphoneArtifact(
+        from output: CaptureOutputBridge,
+        device: MicrophoneInputDevice?
+    ) -> AudioCaptureSourceArtifact {
+        let artifact = output.sourceArtifact
+        return AudioCaptureSourceArtifact(
+            source: artifact.source,
+            audioURL: artifact.audioURL,
+            timelineStartMilliseconds: artifact.timelineStartMilliseconds,
+            durationMilliseconds: artifact.durationMilliseconds,
+            deviceUID: device?.id,
+            deviceName: device?.name
+        )
+    }
+
+    func microphoneDidFail(_ message: String, session: UUID, takeID: UUID) async {
+        guard sessionID == session, activeMicrophoneTakeID == takeID else { return }
+        await closeMicrophoneTake()
+        eventContinuation.yield(.sourceHealth(.init(
+            source: .microphone,
+            state: .unavailable(message)
+        )))
+    }
+
     private func resetSession() {
-        capture = nil
-        output = nil
+        _ = advanceMicrophoneConfigurationGeneration()
+        systemCapture = nil
+        microphoneCapture = nil
+        systemOutput = nil
+        microphoneOutput = nil
+        timeline = nil
+        completedSourceArtifacts = []
+        selectedMicrophone = nil
+        activeMicrophoneTakeID = nil
         sessionID = nil
         sessionDirectory = nil
         systemAudioURL = nil
+        timelineStartMilliseconds = 0
+    }
+
+    var microphoneTakeIdentifier: UUID? { activeMicrophoneTakeID }
+
+    @discardableResult
+    private func advanceMicrophoneConfigurationGeneration() -> UInt64 {
+        microphoneConfigurationGeneration &+= 1
+        return microphoneConfigurationGeneration
     }
 
     private static func defaultCaptureDirectory() -> URL {

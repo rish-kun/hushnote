@@ -81,7 +81,10 @@ public actor WhisperKitFinalTranscriber {
             )
         }
         await progress?(.transcribing)
-        let ordered = tracks.sorted { $0.source.rawValue < $1.source.rawValue }
+        let ordered = tracks.sorted {
+            ($0.source.rawValue, $0.timelineStartMilliseconds, $0.fileURL.path)
+                < ($1.source.rawValue, $1.timelineStartMilliseconds, $1.fileURL.path)
+        }
         let results = await decoder.decodeFiles(
             paths: ordered.map { $0.fileURL.path },
             // See the live engine: `skipSpecialTokens` defaults to false, which
@@ -103,6 +106,7 @@ public actor WhisperKitFinalTranscriber {
 
         var segments: [TranscriptSegment] = []
         var failures: [any Error] = []
+        var nextOrdinal: [AudioSource: Int] = [:]
         for (index, result) in results.enumerated() {
             guard index < ordered.count else { continue }
             let source = ordered[index].source
@@ -118,13 +122,15 @@ public actor WhisperKitFinalTranscriber {
                 failures.append(error)
                 continue
             }
-            // One counter per source. Whisper's `(start, end)` is not unique, so
-            // identifiers must not be derived from it.
-            var ordinal = 0
+            // One counter per source across every take. Whisper's `(start,
+            // end)` is not unique, and a toggled microphone can contribute
+            // several files with the same source role.
+            var ordinal = nextOrdinal[source, default: 0]
+            let timelineOffset = ordered[index].timelineStartMilliseconds
             for item in transcription {
                 segments.append(contentsOf: item.segments.map { segment in
-                    let start = milliseconds(segment.start)
-                    let end = milliseconds(segment.end)
+                    let start = timelineOffset + milliseconds(segment.start)
+                    let end = timelineOffset + milliseconds(segment.end)
                     let id = TranscriptIdentifier.segment(
                         meetingID: meetingID,
                         source: source,
@@ -136,8 +142,8 @@ public actor WhisperKitFinalTranscriber {
                         TranscriptWord(
                             id: TranscriptIdentifier.word(segmentID: id, index: wordIndex),
                             text: WhisperSpecialToken.cleanedWordText(word.word),
-                            startMilliseconds: milliseconds(word.start),
-                            endMilliseconds: milliseconds(word.end),
+                            startMilliseconds: timelineOffset + milliseconds(word.start),
+                            endMilliseconds: timelineOffset + milliseconds(word.end),
                             confidence: word.probability
                         )
                     }
@@ -158,6 +164,7 @@ public actor WhisperKitFinalTranscriber {
                     )
                 }.filter { !$0.text.isEmpty })
             }
+            nextOrdinal[source] = ordinal
         }
 
         guard !segments.isEmpty else {

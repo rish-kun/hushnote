@@ -152,6 +152,8 @@ public struct MeetingAudioTrack: Codable, Equatable, Identifiable, Sendable {
     public var fileURL: URL
     public var sampleRate: Double
     public var channelCount: Int
+    /// Meeting-time position represented by frame zero of this file.
+    public var timelineStartMilliseconds: Int64
     public var durationMilliseconds: Int64
     public var isComplete: Bool
 
@@ -162,6 +164,7 @@ public struct MeetingAudioTrack: Codable, Equatable, Identifiable, Sendable {
         fileURL: URL,
         sampleRate: Double,
         channelCount: Int,
+        timelineStartMilliseconds: Int64 = 0,
         durationMilliseconds: Int64 = 0,
         isComplete: Bool = false
     ) {
@@ -171,8 +174,245 @@ public struct MeetingAudioTrack: Codable, Equatable, Identifiable, Sendable {
         self.fileURL = fileURL
         self.sampleRate = sampleRate
         self.channelCount = channelCount
+        self.timelineStartMilliseconds = timelineStartMilliseconds
         self.durationMilliseconds = durationMilliseconds
         self.isComplete = isComplete
+    }
+}
+
+public enum RecordingSessionOrigin: String, Codable, CaseIterable, Sendable {
+    case live
+    case continued
+    case imported
+    case legacy
+}
+
+public enum RecordingSessionState: String, Codable, CaseIterable, Sendable {
+    case capturing
+    case captured
+    case processing
+    case ready
+    case interrupted
+    case failed
+}
+
+/// One capture or import interval on a meeting's continuous media timeline.
+///
+/// The wall clock can advance while the captured-media clock is frozen by a
+/// pause or sleep gap. `timelineStartMilliseconds` and
+/// `capturedDurationMilliseconds` therefore remain explicit rather than being
+/// derived from the two dates.
+public struct RecordingSession: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var meetingID: UUID
+    public var ordinal: Int
+    public var origin: RecordingSessionOrigin
+    public var wallStartedAt: Date
+    public var wallEndedAt: Date?
+    public var timelineStartMilliseconds: Int64
+    public var capturedDurationMilliseconds: Int64
+    public var state: RecordingSessionState
+
+    public init(
+        id: UUID = UUID(),
+        meetingID: UUID,
+        ordinal: Int,
+        origin: RecordingSessionOrigin,
+        wallStartedAt: Date,
+        wallEndedAt: Date? = nil,
+        timelineStartMilliseconds: Int64,
+        capturedDurationMilliseconds: Int64 = 0,
+        state: RecordingSessionState
+    ) {
+        self.id = id
+        self.meetingID = meetingID
+        self.ordinal = ordinal
+        self.origin = origin
+        self.wallStartedAt = wallStartedAt
+        self.wallEndedAt = wallEndedAt
+        self.timelineStartMilliseconds = timelineStartMilliseconds
+        self.capturedDurationMilliseconds = capturedDurationMilliseconds
+        self.state = state
+    }
+}
+
+public enum SessionAudioSourceKind: String, Codable, CaseIterable, Sendable {
+    case system
+    case microphone
+    case importedMix
+    case importedParticipant
+}
+
+/// A stable logical source whose physical capture can rotate through many
+/// immutable takes.
+public struct SessionAudioSource: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var sessionID: UUID
+    public var ordinal: Int
+    public var kind: SessionAudioSourceKind
+    public var label: String?
+    public var deviceUID: String?
+    public var isExpected: Bool
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        ordinal: Int,
+        kind: SessionAudioSourceKind,
+        label: String? = nil,
+        deviceUID: String? = nil,
+        isExpected: Bool = true
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.ordinal = ordinal
+        self.kind = kind
+        self.label = label
+        self.deviceUID = deviceUID
+        self.isExpected = isExpected
+    }
+}
+
+/// One crash-recoverable source file. Takes are append-only; a device or format
+/// transition closes one take and allocates the next ordinal.
+public struct AudioTake: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var sourceID: UUID
+    public var ordinal: Int
+    public var fileURL: URL
+    public var timelineStartMilliseconds: Int64
+    public var sampleRate: Double
+    public var channelCount: Int
+    public var durationMilliseconds: Int64
+    public var isComplete: Bool
+
+    public init(
+        id: UUID = UUID(),
+        sourceID: UUID,
+        ordinal: Int,
+        fileURL: URL,
+        timelineStartMilliseconds: Int64,
+        sampleRate: Double,
+        channelCount: Int,
+        durationMilliseconds: Int64 = 0,
+        isComplete: Bool = false
+    ) {
+        self.id = id
+        self.sourceID = sourceID
+        self.ordinal = ordinal
+        self.fileURL = fileURL
+        self.timelineStartMilliseconds = timelineStartMilliseconds
+        self.sampleRate = sampleRate
+        self.channelCount = channelCount
+        self.durationMilliseconds = durationMilliseconds
+        self.isComplete = isComplete
+    }
+}
+
+public enum RecordingEventKind: String, Codable, CaseIterable, Sendable {
+    case continued
+    case pause
+    case sleepGap
+    case deviceChanged
+    case formatChanged
+    case sourceUnavailable
+    case sourceRecovered
+    case microphoneEnabled
+    case microphoneDisabled
+    case droppedAudio
+}
+
+/// A sparse durable boundary or diagnostic. Continuous levels and health
+/// samples deliberately remain transient.
+public struct RecordingEvent: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var sessionID: UUID
+    public var sourceID: UUID?
+    public var kind: RecordingEventKind
+    public var timelineMilliseconds: Int64
+    public var wallClockAt: Date
+    public var durationMilliseconds: Int64?
+    public var metadata: [String: String]
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        sourceID: UUID? = nil,
+        kind: RecordingEventKind,
+        timelineMilliseconds: Int64,
+        wallClockAt: Date,
+        durationMilliseconds: Int64? = nil,
+        metadata: [String: String] = [:]
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.sourceID = sourceID
+        self.kind = kind
+        self.timelineMilliseconds = timelineMilliseconds
+        self.wallClockAt = wallClockAt
+        self.durationMilliseconds = durationMilliseconds
+        self.metadata = metadata
+    }
+}
+
+public enum FinalizationJobState: String, Codable, CaseIterable, Sendable {
+    case queued
+    case transcribing
+    case diarizing
+    case merging
+    case succeeded
+    case failed
+}
+
+/// Durable processing state for one session. A retry updates the same row and
+/// increments `attemptCount`, so a session cannot accidentally run two final
+/// passes at once.
+public struct FinalizationJob: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var sessionID: UUID
+    public var state: FinalizationJobState
+    public var modelID: String
+    public var languageCode: String?
+    public var attemptCount: Int
+    public var progress: Double
+    public var queuedAt: Date
+    public var startedAt: Date?
+    public var finishedAt: Date?
+    public var errorMessage: String?
+    public var audioDurationMilliseconds: Int64
+    public var realtimeFactor: Double?
+    public var completionNotifiedAt: Date?
+
+    public init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        state: FinalizationJobState = .queued,
+        modelID: String,
+        languageCode: String? = nil,
+        attemptCount: Int = 0,
+        progress: Double = 0,
+        queuedAt: Date = Date(),
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        errorMessage: String? = nil,
+        audioDurationMilliseconds: Int64,
+        realtimeFactor: Double? = nil,
+        completionNotifiedAt: Date? = nil
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.state = state
+        self.modelID = modelID
+        self.languageCode = languageCode
+        self.attemptCount = attemptCount
+        self.progress = progress
+        self.queuedAt = queuedAt
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.errorMessage = errorMessage
+        self.audioDurationMilliseconds = audioDurationMilliseconds
+        self.realtimeFactor = realtimeFactor
+        self.completionNotifiedAt = completionNotifiedAt
     }
 }
 

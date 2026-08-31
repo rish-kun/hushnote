@@ -68,21 +68,9 @@ struct ActiveMeetingView: View {
             VStack(spacing: 0) {
                 recordingHeader(policy)
 
-                HStack {
-                    // Also a leaf view. `systemLevel` is written once per Core Audio
-                    // buffer — reading it here would re-render the whole transcript
-                    // tens of times a second.
-                    SystemLevelMeter()
-                    Spacer()
-                    if state.liveTranscriptionEnabled {
-                        Label("Live text is provisional", systemImage: "arrow.triangle.2.circlepath")
-                            .font(.caption)
-                            .foregroundStyle(HushnoteTheme.secondaryInk)
-                    }
-                }
-                .padding(.horizontal, policy.gutter)
-                .padding(.vertical, 11)
-                .background(HushnoteTheme.vermilion.opacity(0.045))
+                // All meter- and diagnostic-rate observation lives in this
+                // leaf so the notes editor and transcript parent stay stable.
+                ActiveRecordingEvidenceView(horizontalInset: policy.gutter)
 
                 HushnoteRule()
 
@@ -179,6 +167,88 @@ struct ActiveMeetingView: View {
             .keyboardShortcut(".", modifiers: [.command, .shift])
         }
         .fixedSize()
+    }
+}
+
+private struct ActiveRecordingEvidenceView: View {
+    let horizontalInset: CGFloat
+    @Environment(AppViewState.self) private var state
+    @Environment(AppCoordinator.self) private var coordinator
+
+    var body: some View {
+        let rows = RecordingDiagnosticsPolicy.rows(for: state.recordingDiagnostics)
+        let confidence = RecordingConfidencePolicy.line(for: state.recordingDiagnostics)
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 18) {
+                SystemLevelMeter()
+                if state.microphoneCaptureEnabled {
+                    MicrophoneLevelMeter()
+                }
+                Spacer(minLength: 12)
+                Button(state.microphoneCaptureEnabled ? "Mic On" : "Mic Off") {
+                    coordinator.setMicrophoneCaptureEnabled(!state.microphoneCaptureEnabled)
+                }
+                .hushnoteButton(.quiet)
+                .accessibilityLabel(
+                    state.microphoneCaptureEnabled
+                        ? "Disable microphone capture"
+                        : "Enable microphone capture"
+                )
+            }
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 20) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        diagnostic(row)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        diagnostic(row)
+                    }
+                }
+            }
+
+            HushnoteStatusLine(
+                text: confidence.text,
+                tone: statusTone(confidence.tone)
+            )
+        }
+        .padding(.horizontal, horizontalInset)
+        .padding(.vertical, 11)
+        .background(HushnoteTheme.vermilion.opacity(0.045))
+    }
+
+    private func diagnostic(_ row: RecordingDiagnosticRow) -> some View {
+        HStack(spacing: 5) {
+            Text(row.title.uppercased())
+                .font(.caption2.weight(.semibold))
+                .tracking(0.55)
+            Text("·")
+            Text(row.status.uppercased())
+                .font(.caption2.monospaced().weight(.medium))
+        }
+        .foregroundStyle(foreground(row.tone))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func foreground(_ tone: RecordingDiagnosticTone) -> Color {
+        switch tone {
+        case .good: HushnoteTheme.moss
+        case .warning, .attention: HushnoteTheme.vermilionInk
+        case .working: HushnoteTheme.ink
+        case .neutral: HushnoteTheme.secondaryInk
+        }
+    }
+
+    private func statusTone(_ tone: RecordingDiagnosticTone) -> HushnoteStatusTone {
+        switch tone {
+        case .good: .good
+        case .working: .working
+        case .warning, .attention: .warning
+        case .neutral: .neutral
+        }
     }
 }
 

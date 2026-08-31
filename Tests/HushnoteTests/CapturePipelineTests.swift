@@ -139,6 +139,24 @@ final class EventCollector: @unchecked Sendable {
             }
         }
     }
+
+    var chunks: [CapturedAudioChunk] {
+        lock.withLock {
+            events.compactMap { event in
+                if case .chunk(let chunk) = event { return chunk }
+                return nil
+            }
+        }
+    }
+
+    var sourceHealth: [AudioSourceCaptureHealth] {
+        lock.withLock {
+            events.compactMap { event in
+                if case .sourceHealth(let health) = event { return health }
+                return nil
+            }
+        }
+    }
 }
 
 /// Hands out one fake per `start()`, so a test can hold on to a previous
@@ -446,5 +464,392 @@ struct CaptureDurationTests {
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+}
+
+@Suite("Dual-source audio pipeline")
+struct DualSourceAudioPipelineTests {
+    @Test("System and microphone produce separate aligned originals")
+    func capturesSeparateOriginals() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let microphoneHardware = PipelineFakeMicrophoneHardwareSession()
+        let microphone = Self.microphoneCapture(hardware: microphoneHardware)
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: { microphone }
+        )
+        let collector = EventCollector()
+        let watcher = Task {
+            for await event in pipeline.events { collector.record(event) }
+        }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(
+            sessionID: UUID(),
+            configuration: .init(capturesMicrophone: true)
+        )
+        system.emit(milliseconds: 200, startingAt: 1_000)
+        microphoneHardware.emit(milliseconds: 200, startingAt: 1_000.05)
+        let artifacts = try await pipeline.stop()
+
+        let systemArtifact = try #require(artifacts.artifact(for: .system))
+        let microphoneArtifact = try #require(artifacts.artifact(for: .microphone))
+        #expect(systemArtifact.audioURL != microphoneArtifact.audioURL)
+        #expect(systemArtifact.durationMilliseconds == 200)
+        #expect(microphoneArtifact.durationMilliseconds == 200)
+        #expect(microphoneArtifact.deviceUID == "built-in")
+        #expect(artifacts.durationMilliseconds == 250)
+        let systemFile = try AVAudioFile(forReading: systemArtifact.audioURL)
+        let microphoneFile = try AVAudioFile(forReading: microphoneArtifact.audioURL)
+        #expect(systemFile.length == 9_600)
+        #expect(microphoneFile.length == 9_600)
+    }
+
+    @Test("Microphone can be disabled and re-enabled into a fresh take")
+    func liveToggleRotatesTakes() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let hardwareFactory = PipelineFakeMicrophoneHardwareFleet()
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: {
+                Self.microphoneCapture(hardware: hardwareFactory.next())
+            }
+        )
+
+        _ = try await pipeline.start(sessionID: UUID())
+        system.emit(milliseconds: 400, startingAt: 2_000)
+        try await pipeline.setMicrophoneCaptureEnabled(true)
+        hardwareFactory[0].emit(milliseconds: 100, startingAt: 2_000.1)
+        try await pipeline.setMicrophoneCaptureEnabled(false)
+        try await pipeline.setMicrophoneCaptureEnabled(true)
+        hardwareFactory[1].emit(milliseconds: 100, startingAt: 2_000.3)
+        let artifacts = try await pipeline.stop()
+
+        let microphoneTakes = artifacts.sourceArtifacts.filter { $0.source == .microphone }
+        #expect(microphoneTakes.count == 2)
+        #expect(Set(microphoneTakes.map(\.audioURL)).count == 2)
+        #expect(microphoneTakes.map(\.timelineStartMilliseconds) == [400, 500])
+    }
+
+    @Test("A denied microphone degrades that source without stopping system audio")
+    func permissionFailureIsSourceSpecific() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let microphone = Self.microphoneCapture(
+            permission: .denied,
+            hardware: PipelineFakeMicrophoneHardwareSession()
+        )
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: { microphone }
+        )
+        let collector = EventCollector()
+        let watcher = Task {
+            for await event in pipeline.events { collector.record(event) }
+        }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(
+            sessionID: UUID(),
+            configuration: .init(capturesMicrophone: true)
+        )
+        system.emit(milliseconds: 100)
+        try await CaptureDurationTests.until {
+            collector.sourceHealth.contains { health in
+                health.source == .microphone && {
+                    if case .unavailable = health.state { return true }
+                    return false
+                }()
+            }
+        }
+        #expect(await pipeline.status == .recording)
+        let artifacts = try await pipeline.stop()
+        #expect(artifacts.artifact(for: .system) != nil)
+        #expect(artifacts.artifact(for: .microphone) == nil)
+    }
+
+    @Test("Disabling during a permission request cannot resurrect a stale take")
+    func stalePermissionStartIsDiscarded() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let permission = SuspendedMicrophonePermission()
+        let hardware = PipelineFakeMicrophoneHardwareSession()
+        let microphone = MicrophoneAudioCapture(
+            deviceDiscovery: PipelineFakeMicrophoneDiscovery(),
+            permissionAuthorizer: permission,
+            sessionFactory: PipelineFakeMicrophoneHardwareFactory(session: hardware)
+        )
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: { microphone }
+        )
+        let collector = EventCollector()
+        let watcher = Task {
+            for await event in pipeline.events { collector.record(event) }
+        }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        let enabling = Task {
+            try await pipeline.setMicrophoneCaptureEnabled(true)
+        }
+        try await CaptureDurationTests.until { await permission.isWaiting }
+        try await pipeline.setMicrophoneCaptureEnabled(false)
+        await permission.resolve(true)
+        try await enabling.value
+
+        #expect(await pipeline.microphoneTakeIdentifier == nil)
+        #expect(!hardware.isRunning)
+        let microphoneHealth = collector.sourceHealth.filter { $0.source == .microphone }
+        let lastHealthy = microphoneHealth.lastIndex { $0.state == .healthy }
+        let lastDisabled = microphoneHealth.lastIndex { $0.state == .disabled }
+        #expect(lastDisabled != nil)
+        #expect(lastHealthy == nil || lastHealthy! < lastDisabled!)
+
+        let artifacts = try await pipeline.stop()
+        #expect(artifacts.artifact(for: .microphone) == nil)
+    }
+
+    @Test("A delayed failure from an old take cannot close its replacement")
+    func staleTakeFailureIsIgnored() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let hardwareFactory = PipelineFakeMicrophoneHardwareFleet()
+        let sessionID = UUID()
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: {
+                Self.microphoneCapture(hardware: hardwareFactory.next())
+            }
+        )
+
+        _ = try await pipeline.start(sessionID: sessionID)
+        try await pipeline.setMicrophoneCaptureEnabled(true)
+        let oldTakeID = try #require(await pipeline.microphoneTakeIdentifier)
+        hardwareFactory[0].emit(milliseconds: 100, startingAt: 1_000)
+        try await pipeline.setMicrophoneCaptureEnabled(false)
+        try await pipeline.setMicrophoneCaptureEnabled(true)
+        let replacementTakeID = try #require(await pipeline.microphoneTakeIdentifier)
+        #expect(replacementTakeID != oldTakeID)
+
+        await pipeline.microphoneDidFail(
+            "the old writer failed late",
+            session: sessionID,
+            takeID: oldTakeID
+        )
+
+        #expect(await pipeline.microphoneTakeIdentifier == replacementTakeID)
+        hardwareFactory[1].emit(milliseconds: 100, startingAt: 1_000.2)
+        let artifacts = try await pipeline.stop()
+        #expect(artifacts.sourceArtifacts.filter { $0.source == .microphone }.count == 2)
+    }
+
+    @Test("A microphone pause failure pauses system audio and closes only the microphone")
+    func microphonePauseFailureIsSourceSpecific() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let hardware = PipelineFakeMicrophoneHardwareSession()
+        hardware.pauseError = MicrophoneCaptureError.notRunning
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: {
+                Self.microphoneCapture(hardware: hardware)
+            }
+        )
+        let collector = EventCollector()
+        let watcher = Task {
+            for await event in pipeline.events { collector.record(event) }
+        }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(
+            sessionID: UUID(),
+            configuration: .init(capturesMicrophone: true)
+        )
+        system.emit(milliseconds: 100)
+        hardware.emit(milliseconds: 100, startingAt: 1_000)
+
+        try await pipeline.pause()
+
+        #expect(await pipeline.status == .paused)
+        #expect(!system.isRunning)
+        #expect(await pipeline.microphoneTakeIdentifier == nil)
+        #expect(collector.sourceHealth.contains { health in
+            guard health.source == .microphone else { return false }
+            if case .unavailable = health.state { return true }
+            return false
+        })
+        _ = try await pipeline.stop()
+    }
+
+    @Test("Stopping before the first microphone buffer removes the empty take")
+    func zeroFrameMicrophoneTakeIsRemoved() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let system = FakeSystemAudioCapture()
+        let hardware = PipelineFakeMicrophoneHardwareSession()
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                system.install(handler, notice: notice)
+                return system
+            },
+            microphoneCaptureFactory: {
+                Self.microphoneCapture(hardware: hardware)
+            }
+        )
+
+        _ = try await pipeline.start(
+            sessionID: UUID(),
+            configuration: .init(capturesMicrophone: true)
+        )
+        system.emit(milliseconds: 100)
+        let artifacts = try await pipeline.stop()
+
+        #expect(artifacts.artifact(for: .microphone) == nil)
+        let names = try FileManager.default.contentsOfDirectory(atPath: artifacts.directoryURL.path)
+        #expect(!names.contains(where: { $0.hasPrefix("microphone-") }))
+    }
+
+    private static func microphoneCapture(
+        permission: MicrophoneAuthorizationStatus = .authorized,
+        hardware: PipelineFakeMicrophoneHardwareSession
+    ) -> MicrophoneAudioCapture {
+        MicrophoneAudioCapture(
+            deviceDiscovery: PipelineFakeMicrophoneDiscovery(),
+            permissionAuthorizer: PipelineFakeMicrophonePermission(status: permission),
+            sessionFactory: PipelineFakeMicrophoneHardwareFactory(session: hardware)
+        )
+    }
+}
+
+private struct PipelineFakeMicrophoneDiscovery: MicrophoneDeviceDiscovering {
+    func availableDevices() throws -> [MicrophoneInputDevice] {
+        [MicrophoneInputDevice(
+            id: "built-in",
+            name: "MacBook Microphone",
+            isDefault: true,
+            audioDeviceID: 7
+        )]
+    }
+}
+
+private struct PipelineFakeMicrophonePermission: MicrophonePermissionAuthorizing {
+    let status: MicrophoneAuthorizationStatus
+
+    func authorizationStatus() async -> MicrophoneAuthorizationStatus { status }
+    func requestAccess() async -> Bool { status == .authorized }
+}
+
+private struct PipelineFakeMicrophoneHardwareFactory: MicrophoneHardwareSessionMaking {
+    let session: PipelineFakeMicrophoneHardwareSession
+
+    func makeSession() -> any MicrophoneHardwareSession { session }
+}
+
+private final class PipelineFakeMicrophoneHardwareFleet: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessions: [PipelineFakeMicrophoneHardwareSession] = []
+
+    func next() -> PipelineFakeMicrophoneHardwareSession {
+        lock.withLock {
+            let session = PipelineFakeMicrophoneHardwareSession()
+            sessions.append(session)
+            return session
+        }
+    }
+
+    subscript(index: Int) -> PipelineFakeMicrophoneHardwareSession {
+        lock.withLock { sessions[index] }
+    }
+}
+
+private final class PipelineFakeMicrophoneHardwareSession: MicrophoneHardwareSession, @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: MicrophoneSampleHandler?
+    private var running = false
+    var pauseError: Error?
+
+    var isRunning: Bool { lock.withLock { running } }
+
+    func start(device: MicrophoneInputDevice, sampleHandler: @escaping MicrophoneSampleHandler) throws {
+        lock.withLock {
+            handler = sampleHandler
+            running = true
+        }
+    }
+
+    func pause() throws {
+        if let pauseError { throw pauseError }
+        lock.withLock { running = false }
+    }
+    func resume() throws { lock.withLock { running = true } }
+    func stop() { lock.withLock { running = false } }
+
+    func emit(milliseconds: Int, startingAt presentationSeconds: Double) {
+        let frames = Int((Double(milliseconds) / 1_000 * 48_000).rounded())
+        let callback = lock.withLock { running ? handler : nil }
+        callback?(
+            FakeSystemAudioCapture.buffer(frames: frames, amplitude: 0.2),
+            presentationSeconds
+        )
+    }
+}
+
+private actor SuspendedMicrophonePermission: MicrophonePermissionAuthorizing {
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    var isWaiting: Bool { continuation != nil }
+
+    func authorizationStatus() async -> MicrophoneAuthorizationStatus { .notDetermined }
+
+    func requestAccess() async -> Bool {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func resolve(_ result: Bool) {
+        continuation?.resume(returning: result)
+        continuation = nil
     }
 }

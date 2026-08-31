@@ -15,6 +15,8 @@ struct AppPreferencesTests {
     func defaults() {
         let (_, preferences) = scratch()
         #expect(preferences.retainAudio)
+        #expect(preferences.microphoneCaptureEnabled)
+        #expect(preferences.selectedMicrophone == nil)
         #expect(preferences.selectedProvider == .local)
         #expect(preferences.modelStorageParentPath == nil)
         #expect(preferences.appearance == .system)
@@ -24,6 +26,11 @@ struct AppPreferencesTests {
     func roundTrip() {
         let (defaults, preferences) = scratch()
         preferences.retainAudio = false
+        preferences.microphoneCaptureEnabled = false
+        preferences.selectedMicrophone = PreferredMicrophone(
+            uid: "  BuiltInMicrophoneDevice  ",
+            displayName: "  MacBook Microphone  "
+        )
         preferences.selectedProvider = .codexCLI
         preferences.localModelPath = "/models/quiet.gguf"
         preferences.llamaExecutablePath = "/usr/local/bin/llama-server"
@@ -32,12 +39,27 @@ struct AppPreferencesTests {
 
         let restored = AppPreferences(defaults: defaults)
         #expect(restored.retainAudio == false)
+        #expect(restored.microphoneCaptureEnabled == false)
+        #expect(restored.selectedMicrophone?.uid == "BuiltInMicrophoneDevice")
+        #expect(restored.selectedMicrophone?.displayName == "MacBook Microphone")
         #expect(restored.selectedProvider == .codexCLI)
         #expect(restored.localModelPath == "/models/quiet.gguf")
         #expect(restored.llamaExecutablePath == "/usr/local/bin/llama-server")
         #expect(restored.modelStorageParentPath == "/Volumes/Models")
         #expect(restored.modelStoragePaths.whisperDownloadBase?.path == "/Volumes/Models/Hushnote Models/WhisperKit")
         #expect(restored.appearance == .dark)
+    }
+
+    @Test("Clearing the microphone choice removes its cached identity and name")
+    func clearMicrophoneChoice() {
+        let (defaults, preferences) = scratch()
+        preferences.selectedMicrophone = PreferredMicrophone(uid: "usb-mic", displayName: "Desk Mic")
+        preferences.selectedMicrophone = nil
+
+        #expect(AppPreferences(defaults: defaults).selectedMicrophone == nil)
+        #expect(defaults.string(forKey: "recording.microphone.deviceUID") == nil)
+        #expect(defaults.string(forKey: "recording.microphone.deviceName") == nil)
+        #expect(PreferredMicrophone(uid: "   ") == nil)
     }
 
     @Test("Malformed appearance values fall back to System")

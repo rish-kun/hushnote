@@ -410,6 +410,339 @@ public actor MeetingStore {
         }
     }
 
+    // MARK: - Recording sessions and finalization jobs
+
+    public func saveRecordingSession(_ session: RecordingSession) throws {
+        try Self.validate(session)
+        try database.write { db in
+            guard try MeetingRecord.exists(db, key: session.meetingID.uuidString) else {
+                throw PersistenceError.meetingNotFound(session.meetingID)
+            }
+            if let existing = try RecordingSessionRecord.fetchOne(db, key: session.id.uuidString),
+               existing.meetingID != session.meetingID.uuidString {
+                throw PersistenceError.invalidRecordingSession(
+                    "an existing session cannot move to another meeting"
+                )
+            }
+            try RecordingSessionRecord(session).save(db)
+        }
+    }
+
+    public func recordingSession(id: UUID) throws -> RecordingSession? {
+        try database.read { db in
+            try RecordingSessionRecord.fetchOne(db, key: id.uuidString)?.model()
+        }
+    }
+
+    public func recordingSessions(meetingID: UUID) throws -> [RecordingSession] {
+        try database.read { db in
+            try RecordingSessionRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("ordinal"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func saveSessionAudioSource(_ source: SessionAudioSource) throws {
+        try Self.validate(source)
+        try database.write { db in
+            guard try RecordingSessionRecord.exists(db, key: source.sessionID.uuidString) else {
+                throw PersistenceError.recordingSessionNotFound(source.sessionID)
+            }
+            if let existing = try SessionAudioSourceRecord.fetchOne(db, key: source.id.uuidString),
+               existing.sessionID != source.sessionID.uuidString {
+                throw PersistenceError.invalidAudioSource(
+                    "an existing source cannot move to another session"
+                )
+            }
+            try SessionAudioSourceRecord(source).save(db)
+        }
+    }
+
+    public func sessionAudioSources(sessionID: UUID) throws -> [SessionAudioSource] {
+        try database.read { db in
+            try SessionAudioSourceRecord
+                .filter(Column("sessionID") == sessionID.uuidString)
+                .order(Column("ordinal"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func saveAudioTake(_ take: AudioTake) throws {
+        try Self.validate(take)
+        try database.write { db in
+            guard try SessionAudioSourceRecord.exists(db, key: take.sourceID.uuidString) else {
+                throw PersistenceError.audioSourceNotFound(take.sourceID)
+            }
+            if let existing = try AudioTakeRecord.fetchOne(db, key: take.id.uuidString) {
+                guard existing.sourceID == take.sourceID.uuidString,
+                      existing.ordinal == take.ordinal,
+                      existing.filePath == take.fileURL.path else {
+                    throw PersistenceError.invalidAudioTake(
+                        "an existing take's source, ordinal, and path are immutable"
+                    )
+                }
+            }
+            try AudioTakeRecord(take).save(db)
+        }
+    }
+
+    public func audioTakes(sourceID: UUID) throws -> [AudioTake] {
+        try database.read { db in
+            try AudioTakeRecord
+                .filter(Column("sourceID") == sourceID.uuidString)
+                .order(Column("timelineStartMilliseconds"), Column("ordinal"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func audioTakes(sessionID: UUID) throws -> [AudioTake] {
+        try database.read { db in
+            try AudioTakeRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT takes.*
+                    FROM audioTakes AS takes
+                    JOIN sessionAudioSources AS sources ON sources.id = takes.sourceID
+                    WHERE sources.sessionID = ?
+                    ORDER BY takes.timelineStartMilliseconds, sources.ordinal, takes.ordinal, takes.id
+                    """,
+                arguments: [sessionID.uuidString]
+            ).map { try $0.model() }
+        }
+    }
+
+    public func saveRecordingEvent(_ event: RecordingEvent) throws {
+        try Self.validate(event)
+        try database.write { db in
+            guard try RecordingSessionRecord.exists(db, key: event.sessionID.uuidString) else {
+                throw PersistenceError.recordingSessionNotFound(event.sessionID)
+            }
+            if let sourceID = event.sourceID {
+                guard let source = try SessionAudioSourceRecord.fetchOne(db, key: sourceID.uuidString)
+                else { throw PersistenceError.audioSourceNotFound(sourceID) }
+                guard source.sessionID == event.sessionID.uuidString else {
+                    throw PersistenceError.invalidRecordingEvent(
+                        "an event's source must belong to its session"
+                    )
+                }
+            }
+            try RecordingEventRecord(event).save(db)
+        }
+    }
+
+    public func recordingEvents(sessionID: UUID) throws -> [RecordingEvent] {
+        try database.read { db in
+            try RecordingEventRecord
+                .filter(Column("sessionID") == sessionID.uuidString)
+                .order(Column("timelineMilliseconds"), Column("wallClockAt"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func enqueueFinalizationJob(_ job: FinalizationJob) throws {
+        try Self.validate(job)
+        guard job.state == .queued else {
+            throw PersistenceError.invalidFinalizationJob("a new job must be queued")
+        }
+        try database.write { db in
+            guard try RecordingSessionRecord.exists(db, key: job.sessionID.uuidString) else {
+                throw PersistenceError.recordingSessionNotFound(job.sessionID)
+            }
+            guard try FinalizationJobRecord
+                .filter(Column("sessionID") == job.sessionID.uuidString)
+                .fetchOne(db) == nil else {
+                throw PersistenceError.invalidFinalizationJob(
+                    "a session already has a finalization job"
+                )
+            }
+            try FinalizationJobRecord(job).insert(db)
+        }
+    }
+
+    public func updateFinalizationJob(_ job: FinalizationJob) throws {
+        try Self.validate(job)
+        try database.write { db in
+            guard let existing = try FinalizationJobRecord.fetchOne(db, key: job.id.uuidString)
+            else { throw PersistenceError.finalizationJobNotFound(job.id) }
+            guard existing.sessionID == job.sessionID.uuidString else {
+                throw PersistenceError.invalidFinalizationJob(
+                    "an existing job cannot move to another session"
+                )
+            }
+            guard let existingState = FinalizationJobState(rawValue: existing.state),
+                  FinalizationJobTransitionPolicy.allows(from: existingState, to: job.state) else {
+                throw PersistenceError.invalidFinalizationJob(
+                    "the transition from \(existing.state) to \(job.state.rawValue) is not allowed"
+                )
+            }
+            try FinalizationJobRecord(job).updateChanges(db, from: existing)
+            try Self.updateSessionState(
+                id: job.sessionID,
+                to: FinalizationJobTransitionPolicy.sessionState(for: job.state),
+                in: db
+            )
+        }
+    }
+
+    /// Atomically claims the oldest queued session job.
+    ///
+    /// Capture ownership is an explicit input so a scheduler cannot begin a
+    /// heavy local decode merely because it observed a queue row while another
+    /// meeting is live. The transaction prevents two schedulers from claiming
+    /// the same session.
+    public func claimNextFinalizationJob(
+        liveCaptureActive: Bool,
+        at startedAt: Date = Date()
+    ) throws -> FinalizationJob? {
+        guard !liveCaptureActive else { return nil }
+        return try database.write { db in
+            guard let record = try FinalizationJobRecord.fetchOne(
+                db,
+                sql: """
+                    SELECT jobs.*
+                    FROM finalizationJobs AS jobs
+                    JOIN recordingSessions AS sessions ON sessions.id = jobs.sessionID
+                    JOIN meetings ON meetings.id = sessions.meetingID
+                    WHERE jobs.state = ? AND meetings.deletedAt IS NULL
+                    ORDER BY jobs.queuedAt, jobs.id
+                    LIMIT 1
+                    """,
+                arguments: [FinalizationJobState.queued.rawValue]
+            ) else { return nil }
+
+            var job = try record.model()
+            job.state = .transcribing
+            job.attemptCount += 1
+            job.progress = 0
+            job.startedAt = startedAt
+            job.finishedAt = nil
+            job.errorMessage = nil
+            try Self.validate(job)
+            try FinalizationJobRecord(job).updateChanges(db, from: record)
+            try Self.updateSessionState(id: job.sessionID, to: .processing, in: db)
+            return job
+        }
+    }
+
+    /// Returns a failed job to the queue without consuming a retry attempt.
+    /// The attempt is counted only when a worker successfully claims it.
+    @discardableResult
+    public func retryFinalizationJob(
+        id: UUID,
+        at queuedAt: Date = Date()
+    ) throws -> FinalizationJob {
+        try database.write { db in
+            guard let record = try FinalizationJobRecord.fetchOne(db, key: id.uuidString)
+            else { throw PersistenceError.finalizationJobNotFound(id) }
+            var job = try record.model()
+            guard job.state == .failed else {
+                throw PersistenceError.invalidFinalizationJob("only a failed job can be retried")
+            }
+            job.state = .queued
+            job.progress = 0
+            job.queuedAt = queuedAt
+            job.startedAt = nil
+            job.finishedAt = nil
+            job.errorMessage = nil
+            try FinalizationJobRecord(job).updateChanges(db, from: record)
+            try Self.updateSessionState(id: job.sessionID, to: .captured, in: db)
+            return job
+        }
+    }
+
+    /// Repairs capture and processing ownership after an unclean app exit.
+    ///
+    /// No transcript rows are touched. A capture that was open becomes an
+    /// honest interrupted session; processing sessions become captured again,
+    /// and any job that was mid-stage returns to the queue with its audio and
+    /// attempt count intact.
+    @discardableResult
+    public func recoverInterruptedRecordingWork() throws -> RecordingWorkRecoveryReport {
+        try database.write { db in
+            var report = RecordingWorkRecoveryReport()
+
+            let sessionRecords = try RecordingSessionRecord
+                .filter([
+                    RecordingSessionState.capturing.rawValue,
+                    RecordingSessionState.processing.rawValue,
+                ].contains(Column("state")))
+                .order(Column("meetingID"), Column("ordinal"), Column("id"))
+                .fetchAll(db)
+            for record in sessionRecords {
+                var session = try record.model()
+                switch session.state {
+                case .capturing:
+                    session.state = .interrupted
+                    report.interruptedSessionIDs.append(session.id)
+                case .processing:
+                    session.state = .captured
+                    report.resetProcessingSessionIDs.append(session.id)
+                case .captured, .ready, .interrupted, .failed:
+                    continue
+                }
+                try RecordingSessionRecord(session).updateChanges(db, from: record)
+            }
+
+            let runningStates = [
+                FinalizationJobState.transcribing.rawValue,
+                FinalizationJobState.diarizing.rawValue,
+                FinalizationJobState.merging.rawValue,
+            ]
+            let jobRecords = try FinalizationJobRecord
+                .filter(runningStates.contains(Column("state")))
+                .order(Column("queuedAt"), Column("id"))
+                .fetchAll(db)
+            for record in jobRecords {
+                var job = try record.model()
+                job.state = .queued
+                job.progress = 0
+                job.startedAt = nil
+                job.finishedAt = nil
+                job.errorMessage = nil
+                try FinalizationJobRecord(job).updateChanges(db, from: record)
+                report.requeuedJobIDs.append(job.id)
+            }
+
+            return report
+        }
+    }
+
+    public func finalizationJob(id: UUID) throws -> FinalizationJob? {
+        try database.read { db in
+            try FinalizationJobRecord.fetchOne(db, key: id.uuidString)?.model()
+        }
+    }
+
+    public func finalizationJob(sessionID: UUID) throws -> FinalizationJob? {
+        try database.read { db in
+            try FinalizationJobRecord
+                .filter(Column("sessionID") == sessionID.uuidString)
+                .fetchOne(db)?
+                .model()
+        }
+    }
+
+    public func finalizationJobs(meetingID: UUID) throws -> [FinalizationJob] {
+        try database.read { db in
+            try FinalizationJobRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT jobs.*
+                    FROM finalizationJobs AS jobs
+                    JOIN recordingSessions AS sessions ON sessions.id = jobs.sessionID
+                    WHERE sessions.meetingID = ?
+                    ORDER BY jobs.queuedAt, jobs.id
+                    """,
+                arguments: [meetingID.uuidString]
+            ).map { try $0.model() }
+        }
+    }
+
     public func upsertSegments(_ segments: [TranscriptSegment]) throws {
         guard !segments.isEmpty else { return }
         let meetingID = segments[0].meetingID
@@ -1006,9 +1339,8 @@ public actor MeetingStore {
     /// is explicit and happens first so a filesystem failure never loses the DB
     /// pointers required for a retry.
     public func deleteMeeting(id: UUID, deleteAudioFiles: Bool = true) throws {
-        let tracks = try audioTracks(meetingID: id)
         if deleteAudioFiles {
-            try Self.removeFiles(for: tracks)
+            try Self.removeFiles(at: audioFileURLs(meetingID: id))
         }
         try database.write { db in
             let deleted = try MeetingRecord.deleteOne(db, key: id.uuidString)
@@ -1069,13 +1401,131 @@ public actor MeetingStore {
     /// Removes retained/recovery audio and its metadata together. Call this
     /// after successful finalization when the meeting does not retain audio.
     public func deleteAudioFiles(meetingID: UUID) throws {
-        let tracks = try audioTracks(meetingID: meetingID)
-        try Self.removeFiles(for: tracks)
+        try Self.removeFiles(at: audioFileURLs(meetingID: meetingID))
         _ = try database.write { db in
-            try AudioTrackRecord
+            let legacyCount = try AudioTrackRecord
                 .filter(Column("meetingID") == meetingID.uuidString)
                 .deleteAll(db)
+            try db.execute(
+                sql: """
+                    DELETE FROM audioTakes
+                    WHERE sourceID IN (
+                        SELECT sources.id
+                        FROM sessionAudioSources AS sources
+                        JOIN recordingSessions AS sessions ON sessions.id = sources.sessionID
+                        WHERE sessions.meetingID = ?
+                    )
+                    """,
+                arguments: [meetingID.uuidString]
+            )
+            return legacyCount + db.changesCount
         }
+    }
+
+    /// Returns every original referenced by either persistence generation.
+    ///
+    /// v10 deliberately keeps `audioTracks` as a compatibility projection and
+    /// backfills the same files into `audioTakes`. `UNION` deduplicates those
+    /// paths so cleanup never tries to remove a migrated file twice.
+    private func audioFileURLs(meetingID: UUID) throws -> [URL] {
+        try database.read { db in
+            try String.fetchAll(
+                db,
+                sql: """
+                    SELECT filePath
+                    FROM audioTracks
+                    WHERE meetingID = ?
+                    UNION
+                    SELECT takes.filePath
+                    FROM audioTakes AS takes
+                    JOIN sessionAudioSources AS sources ON sources.id = takes.sourceID
+                    JOIN recordingSessions AS sessions ON sessions.id = sources.sessionID
+                    WHERE sessions.meetingID = ?
+                    ORDER BY filePath
+                    """,
+                arguments: [meetingID.uuidString, meetingID.uuidString]
+            ).map { URL(filePath: $0) }
+        }
+    }
+
+    private static func validate(_ session: RecordingSession) throws {
+        guard session.ordinal >= 0,
+              session.timelineStartMilliseconds >= 0,
+              session.capturedDurationMilliseconds >= 0 else {
+            throw PersistenceError.invalidRecordingSession(
+                "ordinal, timeline start, and captured duration must not be negative"
+            )
+        }
+        if let wallEndedAt = session.wallEndedAt, wallEndedAt < session.wallStartedAt {
+            throw PersistenceError.invalidRecordingSession(
+                "wall-clock end must not precede the start"
+            )
+        }
+    }
+
+    private static func validate(_ source: SessionAudioSource) throws {
+        guard source.ordinal >= 0 else {
+            throw PersistenceError.invalidAudioSource("ordinal must not be negative")
+        }
+        if let label = source.label, label.count > 200 {
+            throw PersistenceError.invalidAudioSource("label must use 200 characters or fewer")
+        }
+    }
+
+    private static func validate(_ take: AudioTake) throws {
+        guard take.ordinal >= 0,
+              !take.fileURL.path.isEmpty,
+              take.timelineStartMilliseconds >= 0,
+              take.sampleRate.isFinite,
+              take.sampleRate > 0,
+              take.channelCount > 0,
+              take.durationMilliseconds >= 0 else {
+            throw PersistenceError.invalidAudioTake(
+                "path, ordinal, timing, sample rate, and channel count must describe valid audio"
+            )
+        }
+    }
+
+    private static func validate(_ event: RecordingEvent) throws {
+        guard event.timelineMilliseconds >= 0,
+              event.durationMilliseconds.map({ $0 >= 0 }) ?? true else {
+            throw PersistenceError.invalidRecordingEvent(
+                "timeline position and duration must not be negative"
+            )
+        }
+    }
+
+    private static func validate(_ job: FinalizationJob) throws {
+        guard !job.modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              job.attemptCount >= 0,
+              job.progress.isFinite,
+              (0...1).contains(job.progress),
+              job.audioDurationMilliseconds >= 0,
+              job.realtimeFactor.map({ $0.isFinite && $0 > 0 }) ?? true else {
+            throw PersistenceError.invalidFinalizationJob(
+                "model, attempts, progress, audio duration, and realtime factor must be valid"
+            )
+        }
+        if let finishedAt = job.finishedAt,
+           let startedAt = job.startedAt,
+           finishedAt < startedAt {
+            throw PersistenceError.invalidFinalizationJob(
+                "finish time must not precede the start"
+            )
+        }
+    }
+
+    private static func updateSessionState(
+        id: UUID,
+        to state: RecordingSessionState,
+        in db: Database
+    ) throws {
+        guard let record = try RecordingSessionRecord.fetchOne(db, key: id.uuidString) else {
+            throw PersistenceError.recordingSessionNotFound(id)
+        }
+        var session = try record.model()
+        session.state = state
+        try RecordingSessionRecord(session).updateChanges(db, from: record)
     }
 
     private func validate(_ segments: [TranscriptSegment]) throws {
@@ -1134,12 +1584,12 @@ public actor MeetingStore {
         return tokens.map { "\"\($0)\"*" }.joined(separator: " AND ")
     }
 
-    private static func removeFiles(for tracks: [MeetingAudioTrack]) throws {
+    private static func removeFiles(at urls: [URL]) throws {
         let manager = FileManager.default
-        for track in tracks where manager.fileExists(atPath: track.fileURL.path) {
-            try manager.removeItem(at: track.fileURL)
+        for url in urls where manager.fileExists(atPath: url.path) {
+            try manager.removeItem(at: url)
         }
-        let directories = Set(tracks.map { $0.fileURL.deletingLastPathComponent() })
+        let directories = Set(urls.map { $0.deletingLastPathComponent() })
         for directory in directories {
             if (try? manager.contentsOfDirectory(atPath: directory.path).isEmpty) == true {
                 try? manager.removeItem(at: directory)

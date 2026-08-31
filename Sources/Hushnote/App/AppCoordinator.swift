@@ -39,6 +39,10 @@ final class AppCoordinator {
     @ObservationIgnored private let codexProvider = CodexAppServerInsightProvider()
     @ObservationIgnored private let logger = Logger(subsystem: "dev.rishit.hushnote", category: "coordinator")
     @ObservationIgnored private var audioPipeline: AudioPipeline?
+    @ObservationIgnored private var activeRecordingSession: RecordingSession?
+    @ObservationIgnored private var activeRecordingSources: [AudioSource: SessionAudioSource] = [:]
+    @ObservationIgnored private var sourcesWithDurableAudio: Set<AudioSource> = []
+    @ObservationIgnored private var microphoneConfigurationTask: Task<Void, Never>?
     @ObservationIgnored private var speechEngine: WhisperKitTranscriptionEngine?
     @ObservationIgnored private var diarizationEngine: FluidAudioDiarizationEngine?
     @ObservationIgnored private var loadedModel: SpeechModel?
@@ -110,6 +114,7 @@ final class AppCoordinator {
         self.state.liveTranscriptionEnabled = SpeechModelDefaults.liveTranscriptionEnabled(from: defaults)
         self.state.selectedProvider = preferences.selectedProvider
         self.state.retainAudio = preferences.retainAudio
+        self.state.applyMicrophonePreferences(preferences)
         self.state.meetingWorkspaceTabs = preferences.meetingTabs
         self.localModelPath = preferences.localModelPath
         self.localLlamaExecutablePath = preferences.llamaExecutablePath ?? Self.defaultLlamaServerPath
@@ -117,6 +122,7 @@ final class AppCoordinator {
 
     func bootstrap() async {
         refreshInstalledModels()
+        Task { await self.refreshMicrophoneDevices() }
         // Deliberately not awaited. `refreshInstalledModelSizes` walks every
         // installed model directory counting `st_blocks` per file -- thousands
         // of artifacts across several gigabytes -- and awaiting it here put a
@@ -130,6 +136,7 @@ final class AppCoordinator {
         Task { await self.refreshInstalledModelSizes() }
         do {
             _ = try await store.failInterruptedProviderRuns()
+            _ = try await store.recoverInterruptedRecordingWork()
             _ = try await store.purgeDeletedMeetings(
                 olderThan: Date().addingTimeInterval(-30 * 24 * 60 * 60)
             )
@@ -276,11 +283,28 @@ final class AppCoordinator {
             assembler = TranscriptAssembler(meetingID: meeting.id)
             sequenceNumbers = [:]
             liveWrites.reset()
+            sourcesWithDurableAudio = []
+            microphoneConfigurationTask?.cancel()
+            microphoneConfigurationTask = nil
+
+            let recordingGraph = try await prepareRecordingSession(for: meeting)
+            activeRecordingSession = recordingGraph.session
+            activeRecordingSources = recordingGraph.sources
+            state.recordingDiagnostics = initialRecordingDiagnostics(
+                microphoneEnabled: state.microphoneCaptureEnabled
+            )
 
             let pipeline = AudioPipeline(rootDirectory: applicationDataURL.appending(path: "RecoveryAudio"))
             audioPipeline = pipeline
             observeAudioEvents(pipeline, meetingID: meeting.id, generation: generation)
-            _ = try await pipeline.start(sessionID: meeting.id)
+            _ = try await pipeline.start(
+                sessionID: meeting.id,
+                configuration: .init(
+                    capturesMicrophone: state.microphoneCaptureEnabled,
+                    microphoneDeviceUID: state.selectedMicrophone?.uid,
+                    timelineStartMilliseconds: recordingGraph.session.timelineStartMilliseconds
+                )
+            )
             // AudioDeviceStart can deliver its first callback before `start()`
             // returns. Never regress the ready state that callback established.
             if state.recordingPhase == .preparing {
@@ -300,6 +324,13 @@ final class AppCoordinator {
             eventTask?.cancel()
             transcriptTask?.cancel()
             self.audioPipeline = nil
+            if var recordingSession = activeRecordingSession {
+                recordingSession.wallEndedAt = Date()
+                recordingSession.state = .failed
+                try? await store.saveRecordingSession(recordingSession)
+            }
+            activeRecordingSession = nil
+            activeRecordingSources = [:]
             if liveSessionGeneration == generation { liveSessionGeneration = nil }
             logger.error("Start failed: \(error.localizedDescription, privacy: .public)")
             try? await store.updateMeetingStatus(id: meeting.id, status: .failed, errorMessage: error.localizedDescription)
@@ -351,6 +382,7 @@ final class AppCoordinator {
                     await engine.cancel()
                     return
                 }
+                self.updateLiveTextDiagnostics(.available)
                 self.observeTranscript(stream, meetingID: meetingID, generation: generation)
             } catch {
                 self.logger.warning("Live transcription unavailable; recording continues: \(error.localizedDescription, privacy: .public)")
@@ -358,6 +390,7 @@ final class AppCoordinator {
                       self.liveSessionGeneration == generation,
                       self.state.activeMeetingID == meetingID,
                       self.state.recordingPhase.isCapturing else { return }
+                self.updateLiveTextDiagnostics(.unavailable)
                 self.state.recordingNotice = "Recording is safe. Live transcription is unavailable; the final pass will run after Stop."
             }
         }
@@ -384,6 +417,8 @@ final class AppCoordinator {
 
     func stopMeeting() async {
         guard let meetingID = state.activeMeetingID, let audioPipeline else { return }
+        microphoneConfigurationTask?.cancel()
+        microphoneConfigurationTask = nil
         defer {
             Task { @MainActor [weak self] in
                 await self?.applyQueuedModelStorageChangeIfPossible()
@@ -411,16 +446,54 @@ final class AppCoordinator {
             if let index = state.meetings.firstIndex(where: { $0.id == meetingID }) {
                 state.meetings[index].status = .finalizing
             }
-            let systemTrack = MeetingAudioTrack(
-                meetingID: meetingID,
-                source: .system,
-                fileURL: artifacts.systemAudioURL,
-                sampleRate: 48_000,
-                channelCount: 1,
-                durationMilliseconds: artifacts.durationMilliseconds,
-                isComplete: true
-            )
-            try await store.saveAudioTrack(systemTrack)
+            guard var recordingSession = activeRecordingSession else {
+                throw CoordinatorError.providerUnavailable("The recording session manifest is missing.")
+            }
+            recordingSession.wallEndedAt = Date()
+            recordingSession.capturedDurationMilliseconds = artifacts.durationMilliseconds
+            recordingSession.state = .captured
+            try await store.saveRecordingSession(recordingSession)
+            activeRecordingSession = recordingSession
+
+            var finalizationTracks: [MeetingAudioTrack] = []
+            for artifact in artifacts.sourceArtifacts where artifact.durationMilliseconds > 0 {
+                guard var source = activeRecordingSources[artifact.source] else { continue }
+                if artifact.source == .microphone, let deviceUID = artifact.deviceUID {
+                    source.deviceUID = deviceUID
+                    source.label = artifact.deviceName ?? source.label
+                    activeRecordingSources[.microphone] = source
+                    try await store.saveSessionAudioSource(source)
+                }
+                let existingTakes = try await store.audioTakes(sourceID: source.id)
+                let take = AudioTake(
+                    sourceID: source.id,
+                    ordinal: existingTakes.count,
+                    fileURL: artifact.audioURL,
+                    timelineStartMilliseconds: artifact.timelineStartMilliseconds,
+                    sampleRate: 48_000,
+                    channelCount: 1,
+                    durationMilliseconds: artifact.durationMilliseconds,
+                    isComplete: true
+                )
+                try await store.saveAudioTake(take)
+                let track = MeetingAudioTrack(
+                    meetingID: meetingID,
+                    source: artifact.source,
+                    fileURL: artifact.audioURL,
+                    sampleRate: 48_000,
+                    channelCount: 1,
+                    timelineStartMilliseconds: artifact.timelineStartMilliseconds,
+                    durationMilliseconds: artifact.durationMilliseconds,
+                    isComplete: true
+                )
+                finalizationTracks.append(track)
+                // Compatibility projection for export/recovery paths that have
+                // not yet moved from `audioTracks` to the session graph.
+                try await store.saveAudioTrack(track)
+            }
+            guard let systemTrack = finalizationTracks.first(where: { $0.source == .system }) else {
+                throw CoordinatorError.providerUnavailable("No system-audio take was finalized.")
+            }
 
             state.updateFinalization(
                 stage: LiveTranscriptionPolicy.stageAfterSavingAudio(
@@ -462,7 +535,7 @@ final class AppCoordinator {
                 )
                 let snapshot = try await finalizer.transcribe(
                     meetingID: meetingID,
-                    tracks: [systemTrack],
+                    tracks: finalizationTracks,
                     model: speechModel(named: state.draft.finalModel),
                     languageCode: languageCode,
                     revision: finalRevision,
@@ -531,6 +604,9 @@ final class AppCoordinator {
             }
 
             self.audioPipeline = nil
+            activeRecordingSession = nil
+            activeRecordingSources = [:]
+            sourcesWithDurableAudio = []
             setWorkspaceTab(.summary, for: meetingID)
             state.markFinished()
             // Insights are useful, but they must not hold the completed meeting
@@ -547,6 +623,13 @@ final class AppCoordinator {
                 updateListItem(meeting, excerpt: "Recording is safe. Retry finalization when ready.")
             }
             self.audioPipeline = nil
+            if var recordingSession = activeRecordingSession {
+                recordingSession.state = .failed
+                try? await store.saveRecordingSession(recordingSession)
+            }
+            activeRecordingSession = nil
+            activeRecordingSources = [:]
+            sourcesWithDurableAudio = []
             state.markFailed(.init(
                 kind: .finalization,
                 message: "The recording is safe, but finalization stopped: \(error.localizedDescription)",
@@ -1749,6 +1832,135 @@ final class AppCoordinator {
         preferences.retainAudio = retainsAudio
     }
 
+    func setMicrophoneCaptureEnabled(_ isEnabled: Bool) {
+        guard state.microphoneCaptureEnabled != isEnabled else { return }
+        state.microphoneCaptureEnabled = isEnabled
+        preferences.microphoneCaptureEnabled = isEnabled
+        guard let audioPipeline, state.recordingPhase.isCapturing else {
+            updateSourceDiagnostics(
+                source: .microphone,
+                state: isEnabled ? .arming : .disabled,
+                durableWriterAdvanced: false
+            )
+            return
+        }
+
+        // The preference is the desired state; diagnostics describe what the
+        // current capture has actually established. Keep the source in a calm
+        // working state until the pipeline reports healthy or unavailable.
+        updateSourceDiagnostics(
+            source: .microphone,
+            state: isEnabled ? .arming : .disabled,
+            durableWriterAdvanced: false
+        )
+
+        enqueueMicrophoneConfiguration(
+            enabled: isEnabled,
+            microphone: state.selectedMicrophone,
+            pipeline: audioPipeline
+        )
+    }
+
+    func setSelectedMicrophone(_ microphone: PreferredMicrophone?) {
+        guard state.selectedMicrophone != microphone else { return }
+        state.selectedMicrophone = microphone
+        preferences.selectedMicrophone = microphone
+        guard state.microphoneCaptureEnabled,
+              let audioPipeline,
+              state.recordingPhase.isCapturing else { return }
+        updateSourceDiagnostics(
+            source: .microphone,
+            state: .arming,
+            durableWriterAdvanced: false
+        )
+        enqueueMicrophoneConfiguration(
+            enabled: true,
+            microphone: microphone,
+            pipeline: audioPipeline
+        )
+    }
+
+    func refreshMicrophoneDevices() async {
+        do {
+            let devices = try await MicrophoneAudioCapture().availableDevices()
+            state.availableMicrophones = devices.compactMap {
+                PreferredMicrophone(uid: $0.id, displayName: $0.name)
+            }
+        } catch {
+            logger.info("Microphone discovery unavailable: \(error.localizedDescription, privacy: .public)")
+            state.availableMicrophones = []
+        }
+    }
+
+    private func enqueueMicrophoneConfiguration(
+        enabled: Bool,
+        microphone: PreferredMicrophone?,
+        pipeline: AudioPipeline
+    ) {
+        let previous = microphoneConfigurationTask
+        microphoneConfigurationTask = Task { [weak self] in
+            _ = await previous?.value
+            guard !Task.isCancelled else { return }
+            guard let self,
+                  self.audioPipeline === pipeline,
+                  self.state.recordingPhase.isCapturing else { return }
+
+            // Persist the user's expectation even when permission or hardware
+            // setup fails. The source manifest says what should have been
+            // present; health diagnostics say what actually happened.
+            await self.persistMicrophoneConfigurationBoundary(
+                enabled: enabled,
+                microphone: microphone,
+                pipeline: pipeline
+            )
+            do {
+                try await pipeline.setMicrophoneCaptureEnabled(
+                    enabled,
+                    deviceUID: microphone?.uid
+                )
+            } catch {
+                guard self.audioPipeline === pipeline,
+                      self.state.microphoneCaptureEnabled == enabled,
+                      self.state.selectedMicrophone == microphone else { return }
+                if enabled {
+                    self.updateSourceDiagnostics(
+                        source: .microphone,
+                        state: .unavailable(error.localizedDescription),
+                        durableWriterAdvanced: false
+                    )
+                }
+                self.state.recordingNotice = error.localizedDescription
+            }
+        }
+    }
+
+    private func persistMicrophoneConfigurationBoundary(
+        enabled: Bool,
+        microphone: PreferredMicrophone?,
+        pipeline: AudioPipeline
+    ) async {
+        guard var source = activeRecordingSources[.microphone],
+              let session = activeRecordingSession else { return }
+        source.isExpected = enabled
+        source.deviceUID = enabled ? microphone?.uid : source.deviceUID
+        source.label = enabled
+            ? (microphone?.displayName ?? "Microphone")
+            : source.label
+        activeRecordingSources[.microphone] = source
+        try? await store.saveSessionAudioSource(source)
+        let position = await pipeline.timelinePositionMilliseconds
+        try? await store.saveRecordingEvent(.init(
+            sessionID: session.id,
+            sourceID: source.id,
+            kind: enabled ? .microphoneEnabled : .microphoneDisabled,
+            timelineMilliseconds: position,
+            wallClockAt: Date(),
+            metadata: microphone.map {
+                ["deviceUID": $0.uid, "deviceName": $0.displayName ?? ""]
+            } ?? [:]
+        ))
+    }
+
     func setSelectedProvider(_ provider: InsightProviderChoice) {
         state.selectedProvider = provider
         preferences.selectedProvider = provider
@@ -2134,6 +2346,125 @@ final class AppCoordinator {
         }
     }
 
+    private func prepareRecordingSession(
+        for meeting: Meeting
+    ) async throws -> (session: RecordingSession, sources: [AudioSource: SessionAudioSource]) {
+        let existing = try await store.recordingSessions(meetingID: meeting.id)
+        let ordinal = (existing.map(\.ordinal).max() ?? -1) + 1
+        let timelineStart = existing.map {
+            $0.timelineStartMilliseconds + $0.capturedDurationMilliseconds
+        }.max() ?? 0
+        let session = RecordingSession(
+            meetingID: meeting.id,
+            ordinal: ordinal,
+            origin: existing.isEmpty ? .live : .continued,
+            wallStartedAt: Date(),
+            timelineStartMilliseconds: timelineStart,
+            state: .capturing
+        )
+        let system = SessionAudioSource(
+            sessionID: session.id,
+            ordinal: 0,
+            kind: .system,
+            label: "System Audio",
+            isExpected: true
+        )
+        let microphone = SessionAudioSource(
+            sessionID: session.id,
+            ordinal: 1,
+            kind: .microphone,
+            label: state.selectedMicrophone?.displayName ?? "Microphone",
+            deviceUID: state.selectedMicrophone?.uid,
+            isExpected: state.microphoneCaptureEnabled
+        )
+        try await store.saveRecordingSession(session)
+        try await store.saveSessionAudioSource(system)
+        try await store.saveSessionAudioSource(microphone)
+        return (session, [.system: system, .microphone: microphone])
+    }
+
+    private func initialRecordingDiagnostics(
+        microphoneEnabled: Bool
+    ) -> RecordingDiagnosticsSnapshot {
+        RecordingDiagnosticsSnapshot(
+            sources: [
+                .init(
+                    source: .system,
+                    lifecycle: .arming,
+                    durableWriterAdvanced: false,
+                    lastAudibleAge: nil
+                ),
+                .init(
+                    source: .microphone,
+                    isExpected: microphoneEnabled,
+                    isEnabled: microphoneEnabled,
+                    lifecycle: microphoneEnabled ? .arming : .disabled,
+                    durableWriterAdvanced: false,
+                    lastAudibleAge: nil
+                ),
+            ],
+            liveText: state.liveTranscriptionEnabled ? .arming : .disabled,
+            writer: .init(sampleRateHertz: 48_000)
+        )
+    }
+
+    private func updateSourceDiagnostics(
+        source: AudioSource,
+        state captureState: AudioSourceCaptureState? = nil,
+        durableWriterAdvanced: Bool? = nil,
+        droppedBufferCount: Int? = nil
+    ) {
+        let snapshot = state.recordingDiagnostics
+        var sources = snapshot.sources
+        let index = sources.firstIndex(where: { $0.source == source })
+        let current = index.map { sources[$0] } ?? RecordingSourceDiagnostics(source: source)
+
+        let expected = source == .system || self.state.microphoneCaptureEnabled
+        let enabled: Bool
+        let lifecycle: RecordingSourceLifecycle
+        switch captureState {
+        case .disabled:
+            enabled = false
+            lifecycle = .disabled
+        case .arming:
+            enabled = true
+            lifecycle = .arming
+        case .healthy:
+            enabled = true
+            lifecycle = .healthy
+        case .unavailable:
+            enabled = true
+            lifecycle = .unavailable
+        case nil:
+            enabled = current.isEnabled
+            lifecycle = current.lifecycle
+        }
+        let replacement = RecordingSourceDiagnostics(
+            source: source,
+            isExpected: expected,
+            isEnabled: enabled,
+            lifecycle: lifecycle,
+            durableWriterAdvanced: durableWriterAdvanced ?? current.durableWriterAdvanced,
+            lastAudibleAge: current.lastAudibleAge,
+            droppedBufferCount: droppedBufferCount ?? current.droppedBufferCount
+        )
+        if let index { sources[index] = replacement } else { sources.append(replacement) }
+        self.state.recordingDiagnostics = RecordingDiagnosticsSnapshot(
+            sources: sources,
+            liveText: snapshot.liveText,
+            writer: snapshot.writer
+        )
+    }
+
+    private func updateLiveTextDiagnostics(_ lifecycle: RecordingLiveTextLifecycle) {
+        let snapshot = state.recordingDiagnostics
+        state.recordingDiagnostics = RecordingDiagnosticsSnapshot(
+            sources: snapshot.sources,
+            liveText: lifecycle,
+            writer: snapshot.writer
+        )
+    }
+
     func revealApplicationData() {
         NSWorkspace.shared.activateFileViewerSelecting([applicationDataURL])
     }
@@ -2150,8 +2481,19 @@ final class AppCoordinator {
                 switch event {
                 case .level(let level):
                     let value = min(1, max(0, Double(level.rms) * 8))
-                    self.state.systemLevel = value
+                    if level.source == .system {
+                        self.state.systemLevel = value
+                    } else {
+                        self.state.microphoneLevel = value
+                    }
                 case .chunk(let chunk):
+                    if self.sourcesWithDurableAudio.insert(chunk.source).inserted {
+                        self.updateSourceDiagnostics(
+                            source: chunk.source,
+                            state: .healthy,
+                            durableWriterAdvanced: true
+                        )
+                    }
                     self.recordingDidReceiveFirstBuffer(
                         meetingID: meetingID,
                         generation: generation
@@ -2161,6 +2503,10 @@ final class AppCoordinator {
                     self.sequenceNumbers[chunk.source] = sequence
                     try? await speechEngine.push(chunk.audioFrame(meetingID: meetingID, sequenceNumber: sequence))
                 case .dropped(let report):
+                    self.updateSourceDiagnostics(
+                        source: .system,
+                        droppedBufferCount: report.totalDroppedBuffers
+                    )
                     self.logger.warning("""
                         Audio buffers dropped: \(report.backpressureBuffers, privacy: .public) to \
                         backpressure, \(report.formatMismatchBuffers, privacy: .public) to format \
@@ -2174,6 +2520,11 @@ final class AppCoordinator {
                             message: message,
                             meetingID: meetingID
                         ))
+                    }
+                case .sourceHealth(let health):
+                    self.updateSourceDiagnostics(source: health.source, state: health.state)
+                    if case .unavailable(let message) = health.state {
+                        self.state.recordingNotice = message
                     }
                 }
             }

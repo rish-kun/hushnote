@@ -11,25 +11,48 @@ import Foundation
 final class CaptureOutputBridge: @unchecked Sendable {
     var failureHandler: (@Sendable (String) -> Void)?
 
-    private let queue = DispatchQueue(label: "com.hushnote.audio-capture-state")
-    private let systemWriter: IncrementalCAFWriter
+    let source: AudioSource
+
+    private let queue: DispatchQueue
+    private let sourceWriter: IncrementalCAFWriter
+    private let timelineCoordinator: CapturedMediaTimelineCoordinator
+    private let timelineStartMilliseconds: Int64
     // One resampler for the whole session: its polyphase filter state has to
     // stay continuous across tap callbacks.
     private let resampler = SpeechFeedResampler(targetSampleRate: 16_000)
     private let eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
 
-    private var pauseInstant: ContinuousClock.Instant?
-    private var accumulatedPause: Duration = .zero
-    private var timelineOriginSeconds: Double?
-    private var lastEnd: [AudioSource: Int64] = [:]
     private var acceptingSamples = false
     private var finished = false
 
-    init(
+    convenience init(
         systemAudioURL: URL,
         eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
     ) throws {
-        systemWriter = try IncrementalCAFWriter(url: systemAudioURL)
+        try self.init(
+            source: .system,
+            audioURL: systemAudioURL,
+            timelineCoordinator: CapturedMediaTimelineCoordinator(),
+            eventContinuation: eventContinuation
+        )
+    }
+
+    /// Creates one source-specific output path. Pass the same timeline
+    /// coordinator to the system and microphone bridges so their independently
+    /// written originals share one host-time-aligned meeting clock.
+    init(
+        source: AudioSource,
+        audioURL: URL,
+        timelineCoordinator: CapturedMediaTimelineCoordinator,
+        eventContinuation: AsyncStream<AudioCaptureEvent>.Continuation
+    ) throws {
+        self.source = source
+        queue = DispatchQueue(
+            label: "com.hushnote.audio-capture-state.\(source.rawValue)"
+        )
+        sourceWriter = try IncrementalCAFWriter(url: audioURL)
+        self.timelineCoordinator = timelineCoordinator
+        timelineStartMilliseconds = timelineCoordinator.beginTake(for: source)
         self.eventContinuation = eventContinuation
     }
 
@@ -44,8 +67,22 @@ final class CaptureOutputBridge: @unchecked Sendable {
     var durationMilliseconds: Int64 {
         queue.sync {
             Self.milliseconds(
-                frames: systemWriter.framesWritten,
+                frames: sourceWriter.framesWritten,
                 sampleRate: IncrementalCAFWriter.recoverySampleRate
+            )
+        }
+    }
+
+    var sourceArtifact: AudioCaptureSourceArtifact {
+        queue.sync {
+            AudioCaptureSourceArtifact(
+                source: source,
+                audioURL: sourceWriter.url,
+                timelineStartMilliseconds: timelineStartMilliseconds,
+                durationMilliseconds: Self.milliseconds(
+                    frames: sourceWriter.framesWritten,
+                    sampleRate: IncrementalCAFWriter.recoverySampleRate
+                )
             )
         }
     }
@@ -58,17 +95,19 @@ final class CaptureOutputBridge: @unchecked Sendable {
 
     func pause() {
         queue.sync {
-            guard pauseInstant == nil, !finished else { return }
-            pauseInstant = .now
+            guard !finished else { return }
             acceptingSamples = false
+            timelineCoordinator.suspend(
+                reason: .pause,
+                at: ProcessInfo.processInfo.systemUptime
+            )
         }
     }
 
     func resume() {
         queue.sync {
-            guard let pauseInstant, !finished else { return }
-            accumulatedPause += pauseInstant.duration(to: .now)
-            self.pauseInstant = nil
+            guard !finished else { return }
+            timelineCoordinator.resume(at: ProcessInfo.processInfo.systemUptime)
             acceptingSamples = true
         }
     }
@@ -77,61 +116,53 @@ final class CaptureOutputBridge: @unchecked Sendable {
         queue.sync {
             guard !finished else { return }
             acceptingSamples = false
-            if let pauseInstant {
-                accumulatedPause += pauseInstant.duration(to: .now)
-                self.pauseInstant = nil
-            }
-            systemWriter.finish()
+            sourceWriter.finish()
             finished = true
         }
     }
 
     func consume(_ inputBuffer: AVAudioPCMBuffer, presentationSeconds: Double) {
-        let source = AudioSource.system
-
         queue.sync {
             guard acceptingSamples, !finished else { return }
             do {
-                // This write is deliberately first. AsyncStream never receives
-                // a chunk that is absent from the crash-recovery track.
-                let pcmBuffer = try systemWriter.append(inputBuffer)
-                guard pcmBuffer.frameLength > 0, pcmBuffer.format.sampleRate > 0 else { return }
-
-                // Duration is taken from the 48 kHz frames handed to the
-                // converter, never from the converted count: a rate converter's
-                // output lags its input by its own filter latency, so a
-                // per-callback output count is not a duration.
-                let chunkDuration = Int64(
-                    (Double(pcmBuffer.frameLength) / pcmBuffer.format.sampleRate * 1_000).rounded()
-                )
-                let sampleRate = resampler.targetSampleRate
-                let samples = try resampler.resample(pcmBuffer)
-                guard !samples.isEmpty else { return }
-                if timelineOriginSeconds == nil, presentationSeconds.isFinite {
-                    timelineOriginSeconds = presentationSeconds
-                }
-                let pausedMilliseconds = Self.milliseconds(accumulatedPause)
-                let presentationStart: Int64
-                if let timelineOriginSeconds, presentationSeconds.isFinite {
-                    presentationStart = max(
-                        0,
-                        Int64(((presentationSeconds - timelineOriginSeconds) * 1_000).rounded())
-                            - pausedMilliseconds
+                let recorded = try timelineCoordinator.record(
+                    source: source,
+                    presentationSeconds: presentationSeconds
+                ) {
+                    // The write is deliberately first. AsyncStream never
+                    // receives a chunk absent from the source's recovery track.
+                    let pcmBuffer = try sourceWriter.append(inputBuffer)
+                    guard pcmBuffer.frameLength > 0,
+                          pcmBuffer.format.sampleRate > 0
+                    else {
+                        return (
+                            value: pcmBuffer,
+                            durationMilliseconds: 0
+                        )
+                    }
+                    // Use recovery frames, not resampler output: a converter's
+                    // filter latency is not captured-media duration.
+                    let duration = Int64((
+                        Double(pcmBuffer.frameLength)
+                            / pcmBuffer.format.sampleRate * 1_000
+                    ).rounded())
+                    return (
+                        value: pcmBuffer,
+                        durationMilliseconds: duration
                     )
-                } else {
-                    presentationStart = lastEnd[source] ?? 0
                 }
-                let previousEnd = lastEnd[source] ?? 0
-                // Keep real capture gaps while preventing a malformed or
-                // repeated timestamp from moving the stream backwards.
-                let start = max(previousEnd, presentationStart)
-                let end = start + max(1, chunkDuration)
-                lastEnd[source] = end
+                guard let recorded,
+                      recorded.range.endMilliseconds > recorded.range.startMilliseconds
+                else { return }
+
+                let sampleRate = resampler.targetSampleRate
+                let samples = try resampler.resample(recorded.value)
+                guard !samples.isEmpty else { return }
 
                 eventContinuation.yield(.chunk(CapturedAudioChunk(
                     source: source,
-                    startMilliseconds: start,
-                    endMilliseconds: end,
+                    startMilliseconds: recorded.range.startMilliseconds,
+                    endMilliseconds: recorded.range.endMilliseconds,
                     sampleRate: sampleRate,
                     samples: samples
                 )))
@@ -146,12 +177,6 @@ final class CaptureOutputBridge: @unchecked Sendable {
     static func milliseconds(frames: AVAudioFramePosition, sampleRate: Double) -> Int64 {
         guard frames > 0, sampleRate > 0 else { return 0 }
         return Int64((Double(frames) / sampleRate * 1_000).rounded())
-    }
-
-    static func milliseconds(_ duration: Duration) -> Int64 {
-        let components = duration.components
-        return components.seconds * 1_000
-            + components.attoseconds / 1_000_000_000_000_000
     }
 
     static func level(for samples: [Float], source: AudioSource) -> AudioLevel {

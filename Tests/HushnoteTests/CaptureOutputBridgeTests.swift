@@ -263,3 +263,197 @@ struct CaptureTimelineTests {
         var values: [CapturedAudioChunk] { lock.withLock { storage } }
     }
 }
+
+@Suite("Dual-source capture output")
+struct DualSourceCaptureOutputTests {
+    @Test("Independent originals overlap on one host-time timeline")
+    func independentOriginalsShareTimeline() throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        let systemURL = directory.appending(path: "system-0.caf")
+        let microphoneURL = directory.appending(path: "microphone-0.caf")
+        let collector = EventCollector()
+        let timeline = CapturedMediaTimelineCoordinator()
+        let system = try CaptureOutputBridge(
+            source: .system,
+            audioURL: systemURL,
+            timelineCoordinator: timeline,
+            eventContinuation: collector.continuation
+        )
+        let microphone = try CaptureOutputBridge(
+            source: .microphone,
+            audioURL: microphoneURL,
+            timelineCoordinator: timeline,
+            eventContinuation: collector.continuation
+        )
+        system.begin()
+        microphone.begin()
+
+        system.consume(Self.buffer(milliseconds: 100), presentationSeconds: 1_000)
+        microphone.consume(Self.buffer(milliseconds: 200), presentationSeconds: 1_000.025)
+        system.finish()
+        microphone.finish()
+
+        let events = collector.finishAndCollect()
+        let chunks = events.compactMap { event -> CapturedAudioChunk? in
+            guard case .chunk(let chunk) = event else { return nil }
+            return chunk
+        }
+        #expect(chunks.count == 2)
+        let systemChunk = chunks.first { $0.source == .system }
+        let microphoneChunk = chunks.first { $0.source == .microphone }
+        #expect(systemChunk?.startMilliseconds == 0)
+        #expect(systemChunk?.endMilliseconds == 100)
+        #expect(microphoneChunk?.startMilliseconds == 25)
+        #expect(microphoneChunk?.endMilliseconds == 225)
+
+        let systemFile = try AVAudioFile(forReading: systemURL)
+        let microphoneFile = try AVAudioFile(forReading: microphoneURL)
+        #expect(systemFile.length == 4_800)
+        #expect(microphoneFile.length == 9_600)
+        #expect(systemFile.processingFormat.sampleRate == 48_000)
+        #expect(systemFile.processingFormat.channelCount == 1)
+        #expect(microphoneFile.processingFormat.sampleRate == 48_000)
+        #expect(microphoneFile.processingFormat.channelCount == 1)
+        #expect(system.sourceArtifact.durationMilliseconds == 100)
+        #expect(microphone.sourceArtifact.durationMilliseconds == 200)
+        #expect(system.sourceArtifact.audioURL == systemURL)
+        #expect(microphone.sourceArtifact.audioURL == microphoneURL)
+    }
+
+    @Test("Chunks and meters retain their source labels")
+    func eventsRetainSourceLabels() throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        let collector = EventCollector()
+        let timeline = CapturedMediaTimelineCoordinator()
+        let system = try CaptureOutputBridge(
+            source: .system,
+            audioURL: directory.appending(path: "system-0.caf"),
+            timelineCoordinator: timeline,
+            eventContinuation: collector.continuation
+        )
+        let microphone = try CaptureOutputBridge(
+            source: .microphone,
+            audioURL: directory.appending(path: "microphone-0.caf"),
+            timelineCoordinator: timeline,
+            eventContinuation: collector.continuation
+        )
+        system.begin()
+        microphone.begin()
+        system.consume(Self.buffer(milliseconds: 40), presentationSeconds: 20)
+        microphone.consume(Self.buffer(milliseconds: 40), presentationSeconds: 20)
+        system.finish()
+        microphone.finish()
+
+        let events = collector.finishAndCollect()
+        let chunkSources = events.compactMap { event -> AudioSource? in
+            guard case .chunk(let chunk) = event else { return nil }
+            return chunk.source
+        }
+        let levelSources = events.compactMap { event -> AudioSource? in
+            guard case .level(let level) = event else { return nil }
+            return level.source
+        }
+        #expect(chunkSources == [.system, .microphone])
+        #expect(levelSources == [.system, .microphone])
+    }
+
+    @Test("A shared pause rejects every source and resumes without a wall-time gap")
+    func pauseFreezesEverySource() throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        let collector = EventCollector()
+        let timeline = CapturedMediaTimelineCoordinator()
+        let system = try CaptureOutputBridge(
+            source: .system,
+            audioURL: directory.appending(path: "system-0.caf"),
+            timelineCoordinator: timeline,
+            eventContinuation: collector.continuation
+        )
+        let microphone = try CaptureOutputBridge(
+            source: .microphone,
+            audioURL: directory.appending(path: "microphone-0.caf"),
+            timelineCoordinator: timeline,
+            eventContinuation: collector.continuation
+        )
+        system.begin()
+        microphone.begin()
+        system.consume(Self.buffer(milliseconds: 100), presentationSeconds: 500)
+
+        system.pause()
+        // The microphone bridge is still locally armed, but the shared clock
+        // refuses the buffer before its source file is written.
+        microphone.consume(Self.buffer(milliseconds: 300), presentationSeconds: 505)
+        system.resume()
+        microphone.consume(Self.buffer(milliseconds: 100), presentationSeconds: 505.3)
+        system.finish()
+        microphone.finish()
+
+        let chunks = collector.finishAndCollect().compactMap { event -> CapturedAudioChunk? in
+            guard case .chunk(let chunk) = event else { return nil }
+            return chunk
+        }
+        #expect(chunks.count == 2)
+        #expect(chunks[1].source == .microphone)
+        #expect(chunks[1].startMilliseconds == 100)
+        #expect(chunks[1].endMilliseconds == 200)
+        #expect(microphone.sourceArtifact.durationMilliseconds == 100)
+    }
+
+    @Test("Legacy artifact initializer exposes its system original")
+    func legacyArtifactInitializerPreservesCompatibility() {
+        let directory = URL(fileURLWithPath: "/tmp/session")
+        let systemURL = directory.appending(path: "system-0.caf")
+        let artifacts = AudioCaptureArtifacts(
+            sessionID: UUID(),
+            directoryURL: directory,
+            systemAudioURL: systemURL,
+            durationMilliseconds: 1_250
+        )
+
+        #expect(artifacts.systemAudioURL == systemURL)
+        #expect(artifacts.durationMilliseconds == 1_250)
+        #expect(artifacts.artifact(for: .system)?.audioURL == systemURL)
+        #expect(artifacts.artifact(for: .system)?.durationMilliseconds == 1_250)
+        #expect(artifacts.artifact(for: .microphone) == nil)
+    }
+
+    private static func buffer(milliseconds: Int) -> AVAudioPCMBuffer {
+        let frames = Int((Double(milliseconds) / 1_000 * 48_000).rounded())
+        return FakeSystemAudioCapture.buffer(frames: frames, amplitude: 0.2)
+    }
+
+    private final class EventCollector: @unchecked Sendable {
+        let continuation: AsyncStream<AudioCaptureEvent>.Continuation
+        private let stream: AsyncStream<AudioCaptureEvent>
+
+        init() {
+            let pair = AsyncStream<AudioCaptureEvent>.makeStream(
+                bufferingPolicy: .unbounded
+            )
+            stream = pair.stream
+            continuation = pair.continuation
+        }
+
+        func finishAndCollect() -> [AudioCaptureEvent] {
+            continuation.finish()
+            let box = EventBox()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task { [stream] in
+                for await event in stream { box.append(event) }
+                semaphore.signal()
+            }
+            semaphore.wait()
+            return box.values
+        }
+    }
+
+    private final class EventBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [AudioCaptureEvent] = []
+
+        func append(_ event: AudioCaptureEvent) {
+            lock.withLock { storage.append(event) }
+        }
+
+        var values: [AudioCaptureEvent] { lock.withLock { storage } }
+    }
+}

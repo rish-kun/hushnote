@@ -263,6 +263,15 @@ struct SystemLevelMeter: View {
     }
 }
 
+/// Keeps microphone meter updates at the same leaf boundary as system audio.
+struct MicrophoneLevelMeter: View {
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        LevelMeter(level: state.microphoneLevel, label: "You", tint: HushnoteTheme.moss)
+    }
+}
+
 /// Reads `elapsed`, which ticks every second, in isolation for the same reason.
 struct ElapsedTimeLabel: View {
     var font: Font = .callout.monospacedDigit().weight(.medium)

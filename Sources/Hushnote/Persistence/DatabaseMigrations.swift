@@ -277,7 +277,187 @@ enum HushnoteDatabaseMigrations {
                 columns: ["createdAt"]
             )
         }
+        migrator.registerMigration("v10_recording_sessions") { db in
+            try db.create(table: "recordingSessions") { table in
+                table.column("id", .text).primaryKey()
+                table.column("meetingID", .text)
+                    .notNull()
+                    .references("meetings", onDelete: .cascade)
+                table.column("ordinal", .integer).notNull()
+                table.column("origin", .text).notNull()
+                table.column("wallStartedAt", .datetime).notNull()
+                table.column("wallEndedAt", .datetime)
+                table.column("timelineStartMilliseconds", .integer).notNull()
+                table.column("capturedDurationMilliseconds", .integer).notNull()
+                table.column("state", .text).notNull()
+                table.uniqueKey(["meetingID", "ordinal"])
+            }
+            try db.create(
+                index: "recordingSessions_on_meetingID_timeline",
+                on: "recordingSessions",
+                columns: ["meetingID", "timelineStartMilliseconds"]
+            )
+            try db.create(
+                index: "recordingSessions_on_state",
+                on: "recordingSessions",
+                columns: ["state"]
+            )
+
+            try db.create(table: "sessionAudioSources") { table in
+                table.column("id", .text).primaryKey()
+                table.column("sessionID", .text)
+                    .notNull()
+                    .references("recordingSessions", onDelete: .cascade)
+                table.column("ordinal", .integer).notNull()
+                table.column("kind", .text).notNull()
+                table.column("label", .text)
+                table.column("deviceUID", .text)
+                table.column("isExpected", .boolean).notNull()
+                table.uniqueKey(["sessionID", "ordinal"])
+            }
+            try db.create(
+                index: "sessionAudioSources_on_sessionID_kind",
+                on: "sessionAudioSources",
+                columns: ["sessionID", "kind"]
+            )
+
+            try db.create(table: "audioTakes") { table in
+                table.column("id", .text).primaryKey()
+                table.column("sourceID", .text)
+                    .notNull()
+                    .references("sessionAudioSources", onDelete: .cascade)
+                table.column("ordinal", .integer).notNull()
+                table.column("filePath", .text).notNull().unique()
+                table.column("timelineStartMilliseconds", .integer).notNull()
+                table.column("sampleRate", .double).notNull()
+                table.column("channelCount", .integer).notNull()
+                table.column("durationMilliseconds", .integer).notNull()
+                table.column("isComplete", .boolean).notNull()
+                table.uniqueKey(["sourceID", "ordinal"])
+            }
+            try db.create(
+                index: "audioTakes_on_sourceID_timeline",
+                on: "audioTakes",
+                columns: ["sourceID", "timelineStartMilliseconds"]
+            )
+
+            try db.create(table: "recordingEvents") { table in
+                table.column("id", .text).primaryKey()
+                table.column("sessionID", .text)
+                    .notNull()
+                    .references("recordingSessions", onDelete: .cascade)
+                table.column("sourceID", .text)
+                    .references("sessionAudioSources", onDelete: .setNull)
+                table.column("kind", .text).notNull()
+                table.column("timelineMilliseconds", .integer).notNull()
+                table.column("wallClockAt", .datetime).notNull()
+                table.column("durationMilliseconds", .integer)
+                table.column("metadataJSON", .blob).notNull()
+            }
+            try db.create(
+                index: "recordingEvents_on_sessionID_timeline",
+                on: "recordingEvents",
+                columns: ["sessionID", "timelineMilliseconds", "wallClockAt"]
+            )
+
+            try db.create(table: "finalizationJobs") { table in
+                table.column("id", .text).primaryKey()
+                table.column("sessionID", .text)
+                    .notNull()
+                    .unique()
+                    .references("recordingSessions", onDelete: .cascade)
+                table.column("state", .text).notNull()
+                table.column("modelID", .text).notNull()
+                table.column("languageCode", .text)
+                table.column("attemptCount", .integer).notNull()
+                table.column("progress", .double).notNull()
+                table.column("queuedAt", .datetime).notNull()
+                table.column("startedAt", .datetime)
+                table.column("finishedAt", .datetime)
+                table.column("errorMessage", .text)
+                table.column("audioDurationMilliseconds", .integer).notNull()
+                table.column("realtimeFactor", .double)
+                table.column("completionNotifiedAt", .datetime)
+            }
+            try db.create(
+                index: "finalizationJobs_on_state_queuedAt",
+                on: "finalizationJobs",
+                columns: ["state", "queuedAt"]
+            )
+
+            // Existing audio remains exactly where it is. Each meeting with a
+            // legacy track gets one synthetic session; parallel system and
+            // microphone tracks become distinct sources within that session.
+            // Nothing writes `transcriptSegments`, so the v5 FTS trigger cannot
+            // run during this backfill.
+            let tracks = try AudioTrackRecord
+                .order(Column("meetingID"), Column("source"), Column("id"))
+                .fetchAll(db)
+            let grouped = Dictionary(grouping: tracks, by: \.meetingID)
+            for meetingID in grouped.keys.sorted() {
+                guard let meeting = try MeetingRecord.fetchOne(db, key: meetingID),
+                      let parsedMeetingID = UUID(uuidString: meetingID),
+                      let meetingTracks = grouped[meetingID]
+                else {
+                    throw PersistenceError.corruptRecord("legacy audio graph for meeting \(meetingID)")
+                }
+
+                let session = RecordingSession(
+                    meetingID: parsedMeetingID,
+                    ordinal: 0,
+                    origin: .legacy,
+                    wallStartedAt: meeting.startedAt ?? meeting.createdAt,
+                    wallEndedAt: meeting.endedAt,
+                    timelineStartMilliseconds: 0,
+                    capturedDurationMilliseconds: meetingTracks
+                        .map(\.durationMilliseconds)
+                        .max() ?? 0,
+                    state: Self.legacySessionState(for: meeting.status)
+                )
+                try RecordingSessionRecord(session).insert(db)
+
+                for (ordinal, track) in meetingTracks.enumerated() {
+                    guard let kind = SessionAudioSourceKind(rawValue: track.source) else {
+                        throw PersistenceError.corruptRecord("legacy audio source \(track.id)")
+                    }
+                    let source = SessionAudioSource(
+                        sessionID: session.id,
+                        ordinal: ordinal,
+                        kind: kind,
+                        label: kind == .microphone ? "Microphone" : "System Audio",
+                        isExpected: true
+                    )
+                    try SessionAudioSourceRecord(source).insert(db)
+
+                    let take = AudioTake(
+                        id: UUID(uuidString: track.id) ?? UUID(),
+                        sourceID: source.id,
+                        ordinal: 0,
+                        fileURL: URL(filePath: track.filePath),
+                        timelineStartMilliseconds: 0,
+                        sampleRate: track.sampleRate,
+                        channelCount: track.channelCount,
+                        durationMilliseconds: track.durationMilliseconds,
+                        isComplete: track.isComplete
+                    )
+                    try AudioTakeRecord(take).insert(db)
+                }
+            }
+        }
         return migrator
+    }
+
+    private static func legacySessionState(for meetingStatus: String) -> RecordingSessionState {
+        switch MeetingStatus(rawValue: meetingStatus) {
+        case .ready:
+            .ready
+        case .failed:
+            .failed
+        case .recording, .finalizing, .interrupted:
+            .interrupted
+        case .idle, nil:
+            .captured
+        }
     }
 
     /// Whisper's control vocabulary leaked into stored transcripts until

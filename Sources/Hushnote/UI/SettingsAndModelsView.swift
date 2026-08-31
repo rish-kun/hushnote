@@ -797,6 +797,7 @@ struct SettingsView: View {
             }
             .padding(.vertical, 36)
         }
+        .task { await coordinator.refreshMicrophoneDevices() }
     }
 
     private func behaviorSettings(state: AppViewState) -> some View {
@@ -811,6 +812,34 @@ struct SettingsView: View {
             }
 
             settingsSection("CAPTURE") {
+                UtilitySettingRow(
+                    title: "Capture your microphone",
+                    consequence: "Adds your voice as a separate source track and labels it You. You can turn it off or back on during a recording."
+                ) {
+                    Toggle("Capture your microphone", isOn: Binding(
+                        get: { state.microphoneCaptureEnabled },
+                        set: { coordinator.setMicrophoneCaptureEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(HushnoteToggleStyle())
+                    .accessibilityLabel("Capture your microphone")
+                }
+
+                if state.microphoneCaptureEnabled {
+                    UtilitySettingRow(
+                        title: "Microphone input",
+                        consequence: "Uses the system default until a specific microphone is selected. Hushnote remembers a chosen device by its hardware identifier."
+                    ) {
+                        MicrophoneInputControl(
+                            selection: Binding(
+                                get: { state.selectedMicrophone },
+                                set: { coordinator.setSelectedMicrophone($0) }
+                            ),
+                            availableDevices: state.availableMicrophones
+                        )
+                    }
+                }
+
                 UtilitySettingRow(
                     title: "Live transcription",
                     consequence: "Loads a speech model during capture. Turn it off to write audio first and produce the final transcript after Stop."
@@ -843,7 +872,7 @@ struct SettingsView: View {
             settingsSection("RECORDING") {
                 UtilitySettingRow(
                     title: "System audio recording",
-                    consequence: "Hushnote records system audio only. macOS permission is managed in Privacy & Security."
+                    consequence: "System audio is always captured as its own track. macOS permission is managed in Privacy & Security."
                 ) {
                     Button("Open Privacy & Security") { coordinator.openPrivacySettings() }
                         .hushnoteButton(.secondary)
@@ -861,6 +890,31 @@ struct SettingsView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Hardware enumeration plugs into `availableDevices` without changing
+    /// the persistence or visual contract established here.
+    private struct MicrophoneInputControl: View {
+        @Binding var selection: PreferredMicrophone?
+        let availableDevices: [PreferredMicrophone]
+
+        var body: some View {
+            Menu {
+                Button("System default") { selection = nil }
+                ForEach(availableDevices) { device in
+                    Button(device.displayName ?? "Microphone") { selection = device }
+                }
+                if availableDevices.isEmpty {
+                    Text("Microphones appear after device discovery")
+                }
+            } label: {
+                Text(selection?.displayName ?? "System default")
+                    .lineLimit(1)
+            }
+            .hushnoteButton(.secondary)
+            .accessibilityLabel("Microphone input")
+            .accessibilityValue(selection?.displayName ?? "System default")
+        }
     }
 
     private struct AppearanceModeControl: View {

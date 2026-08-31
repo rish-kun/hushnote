@@ -231,6 +231,249 @@ struct AudioTrackRecord: Codable, FetchableRecord, PersistableRecord, TableRecor
     }
 }
 
+struct RecordingSessionRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "recordingSessions"
+
+    var id: String
+    var meetingID: String
+    var ordinal: Int
+    var origin: String
+    var wallStartedAt: Date
+    var wallEndedAt: Date?
+    var timelineStartMilliseconds: Int64
+    var capturedDurationMilliseconds: Int64
+    var state: String
+
+    init(_ session: RecordingSession) {
+        id = session.id.uuidString
+        meetingID = session.meetingID.uuidString
+        ordinal = session.ordinal
+        origin = session.origin.rawValue
+        wallStartedAt = session.wallStartedAt
+        wallEndedAt = session.wallEndedAt
+        timelineStartMilliseconds = session.timelineStartMilliseconds
+        capturedDurationMilliseconds = session.capturedDurationMilliseconds
+        state = session.state.rawValue
+    }
+
+    func model() throws -> RecordingSession {
+        guard let id = UUID(uuidString: id),
+              let meetingID = UUID(uuidString: meetingID),
+              let origin = RecordingSessionOrigin(rawValue: origin),
+              let state = RecordingSessionState(rawValue: state)
+        else {
+            throw PersistenceError.corruptRecord("recording session \(self.id)")
+        }
+        return RecordingSession(
+            id: id,
+            meetingID: meetingID,
+            ordinal: ordinal,
+            origin: origin,
+            wallStartedAt: wallStartedAt,
+            wallEndedAt: wallEndedAt,
+            timelineStartMilliseconds: timelineStartMilliseconds,
+            capturedDurationMilliseconds: capturedDurationMilliseconds,
+            state: state
+        )
+    }
+}
+
+struct SessionAudioSourceRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "sessionAudioSources"
+
+    var id: String
+    var sessionID: String
+    var ordinal: Int
+    var kind: String
+    var label: String?
+    var deviceUID: String?
+    var isExpected: Bool
+
+    init(_ source: SessionAudioSource) {
+        id = source.id.uuidString
+        sessionID = source.sessionID.uuidString
+        ordinal = source.ordinal
+        kind = source.kind.rawValue
+        label = source.label
+        deviceUID = source.deviceUID
+        isExpected = source.isExpected
+    }
+
+    func model() throws -> SessionAudioSource {
+        guard let id = UUID(uuidString: id),
+              let sessionID = UUID(uuidString: sessionID),
+              let kind = SessionAudioSourceKind(rawValue: kind)
+        else {
+            throw PersistenceError.corruptRecord("session audio source \(self.id)")
+        }
+        return SessionAudioSource(
+            id: id,
+            sessionID: sessionID,
+            ordinal: ordinal,
+            kind: kind,
+            label: label,
+            deviceUID: deviceUID,
+            isExpected: isExpected
+        )
+    }
+}
+
+struct AudioTakeRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "audioTakes"
+
+    var id: String
+    var sourceID: String
+    var ordinal: Int
+    var filePath: String
+    var timelineStartMilliseconds: Int64
+    var sampleRate: Double
+    var channelCount: Int
+    var durationMilliseconds: Int64
+    var isComplete: Bool
+
+    init(_ take: AudioTake) {
+        id = take.id.uuidString
+        sourceID = take.sourceID.uuidString
+        ordinal = take.ordinal
+        filePath = take.fileURL.path
+        timelineStartMilliseconds = take.timelineStartMilliseconds
+        sampleRate = take.sampleRate
+        channelCount = take.channelCount
+        durationMilliseconds = take.durationMilliseconds
+        isComplete = take.isComplete
+    }
+
+    func model() throws -> AudioTake {
+        guard let id = UUID(uuidString: id), let sourceID = UUID(uuidString: sourceID) else {
+            throw PersistenceError.corruptRecord("audio take \(self.id)")
+        }
+        return AudioTake(
+            id: id,
+            sourceID: sourceID,
+            ordinal: ordinal,
+            fileURL: URL(filePath: filePath),
+            timelineStartMilliseconds: timelineStartMilliseconds,
+            sampleRate: sampleRate,
+            channelCount: channelCount,
+            durationMilliseconds: durationMilliseconds,
+            isComplete: isComplete
+        )
+    }
+}
+
+struct RecordingEventRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "recordingEvents"
+
+    var id: String
+    var sessionID: String
+    var sourceID: String?
+    var kind: String
+    var timelineMilliseconds: Int64
+    var wallClockAt: Date
+    var durationMilliseconds: Int64?
+    var metadataJSON: Data
+
+    init(_ event: RecordingEvent) throws {
+        id = event.id.uuidString
+        sessionID = event.sessionID.uuidString
+        sourceID = event.sourceID?.uuidString
+        kind = event.kind.rawValue
+        timelineMilliseconds = event.timelineMilliseconds
+        wallClockAt = event.wallClockAt
+        durationMilliseconds = event.durationMilliseconds
+        metadataJSON = try JSONEncoder().encode(event.metadata)
+    }
+
+    func model() throws -> RecordingEvent {
+        guard let id = UUID(uuidString: id),
+              let sessionID = UUID(uuidString: sessionID),
+              let kind = RecordingEventKind(rawValue: kind)
+        else {
+            throw PersistenceError.corruptRecord("recording event \(self.id)")
+        }
+        let resolvedSourceID: UUID?
+        if let sourceID {
+            guard let parsed = UUID(uuidString: sourceID) else {
+                throw PersistenceError.corruptRecord("recording event \(self.id)")
+            }
+            resolvedSourceID = parsed
+        } else {
+            resolvedSourceID = nil
+        }
+        return RecordingEvent(
+            id: id,
+            sessionID: sessionID,
+            sourceID: resolvedSourceID,
+            kind: kind,
+            timelineMilliseconds: timelineMilliseconds,
+            wallClockAt: wallClockAt,
+            durationMilliseconds: durationMilliseconds,
+            metadata: try JSONDecoder().decode([String: String].self, from: metadataJSON)
+        )
+    }
+}
+
+struct FinalizationJobRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "finalizationJobs"
+
+    var id: String
+    var sessionID: String
+    var state: String
+    var modelID: String
+    var languageCode: String?
+    var attemptCount: Int
+    var progress: Double
+    var queuedAt: Date
+    var startedAt: Date?
+    var finishedAt: Date?
+    var errorMessage: String?
+    var audioDurationMilliseconds: Int64
+    var realtimeFactor: Double?
+    var completionNotifiedAt: Date?
+
+    init(_ job: FinalizationJob) {
+        id = job.id.uuidString
+        sessionID = job.sessionID.uuidString
+        state = job.state.rawValue
+        modelID = job.modelID
+        languageCode = job.languageCode
+        attemptCount = job.attemptCount
+        progress = job.progress
+        queuedAt = job.queuedAt
+        startedAt = job.startedAt
+        finishedAt = job.finishedAt
+        errorMessage = job.errorMessage
+        audioDurationMilliseconds = job.audioDurationMilliseconds
+        realtimeFactor = job.realtimeFactor
+        completionNotifiedAt = job.completionNotifiedAt
+    }
+
+    func model() throws -> FinalizationJob {
+        guard let id = UUID(uuidString: id),
+              let sessionID = UUID(uuidString: sessionID),
+              let state = FinalizationJobState(rawValue: state)
+        else {
+            throw PersistenceError.corruptRecord("finalization job \(self.id)")
+        }
+        return FinalizationJob(
+            id: id,
+            sessionID: sessionID,
+            state: state,
+            modelID: modelID,
+            languageCode: languageCode,
+            attemptCount: attemptCount,
+            progress: progress,
+            queuedAt: queuedAt,
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            errorMessage: errorMessage,
+            audioDurationMilliseconds: audioDurationMilliseconds,
+            realtimeFactor: realtimeFactor,
+            completionNotifiedAt: completionNotifiedAt
+        )
+    }
+}
+
 struct SegmentRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
     static let databaseTableName = "transcriptSegments"
 
@@ -425,7 +668,15 @@ public struct TranscriptReplacementReport: Equatable, Sendable {
 
 public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     case meetingNotFound(UUID)
+    case recordingSessionNotFound(UUID)
+    case audioSourceNotFound(UUID)
+    case finalizationJobNotFound(UUID)
     case invalidSegment(String)
+    case invalidRecordingSession(String)
+    case invalidAudioSource(String)
+    case invalidAudioTake(String)
+    case invalidRecordingEvent(String)
+    case invalidFinalizationJob(String)
     case corruptRecord(String)
     case invalidSearchQuery
     case invalidProviderRun(String)
@@ -438,7 +689,15 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .meetingNotFound(let id): "Meeting \(id) does not exist."
+        case .recordingSessionNotFound(let id): "Recording session \(id) does not exist."
+        case .audioSourceNotFound(let id): "Recording source \(id) does not exist."
+        case .finalizationJobNotFound(let id): "Finalization job \(id) does not exist."
         case .invalidSegment(let reason): "Invalid transcript segment: \(reason)"
+        case .invalidRecordingSession(let reason): "Invalid recording session: \(reason)"
+        case .invalidAudioSource(let reason): "Invalid recording source: \(reason)"
+        case .invalidAudioTake(let reason): "Invalid audio take: \(reason)"
+        case .invalidRecordingEvent(let reason): "Invalid recording event: \(reason)"
+        case .invalidFinalizationJob(let reason): "Invalid finalization job: \(reason)"
         case .corruptRecord(let description): "The database contains a corrupt \(description)."
         case .invalidSearchQuery: "Enter at least one searchable word."
         case .invalidProviderRun(let reason): "Invalid provider run: \(reason)"

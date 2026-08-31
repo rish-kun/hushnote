@@ -68,6 +68,44 @@ struct FinalTranscriberTests {
 
         #expect(configuration.downloadBase == folder)
     }
+
+    @Test("Rotated microphone takes keep meeting offsets and unique identities")
+    func rotatedTakesKeepOffsetsAndIDs() async throws {
+        let meetingID = UUID()
+        let decoder = StubFileDecoder([
+            .success([result(segments: [whisperSegment(start: 0, end: 1, text: "First")])]),
+            .success([result(segments: [whisperSegment(start: 0, end: 1, text: "Second")])]),
+        ])
+        let transcriber = WhisperKitFinalTranscriber(decoder: decoder)
+        let first = MeetingAudioTrack(
+            meetingID: meetingID,
+            source: .microphone,
+            fileURL: URL(filePath: "/tmp/hushnote-tests/microphone-0.caf"),
+            sampleRate: 48_000,
+            channelCount: 1,
+            timelineStartMilliseconds: 4_000,
+            isComplete: true
+        )
+        let second = MeetingAudioTrack(
+            meetingID: meetingID,
+            source: .microphone,
+            fileURL: URL(filePath: "/tmp/hushnote-tests/microphone-1.caf"),
+            sampleRate: 48_000,
+            channelCount: 1,
+            timelineStartMilliseconds: 9_000,
+            isComplete: true
+        )
+
+        let snapshot = try await transcriber.transcribe(
+            meetingID: meetingID,
+            tracks: [first, second],
+            model: SpeechModelCatalog.whisperSmall,
+            revision: 1
+        )
+
+        #expect(snapshot.segments.map(\.startMilliseconds) == [4_000, 9_000])
+        #expect(Set(snapshot.segments.map(\.id)).count == 2)
+    }
 }
 
 // MARK: - Fixtures

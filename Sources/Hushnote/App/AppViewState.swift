@@ -647,10 +647,40 @@ final class AppViewState {
     var recordingPhase = RecordingPhase.idle
     var elapsed: TimeInterval = 0
     var systemLevel = 0.0
+    /// Read only by `MicrophoneLevelMeter`; active workspace parents must not
+    /// observe this buffer-rate value.
+    var microphoneLevel = 0.0
     var searchText = ""
     var searchMatchedMeetingIDs: Set<UUID>?
     var selectedProvider = InsightProviderChoice.local
     var retainAudio = true
+    var microphoneCaptureEnabled = true
+    var selectedMicrophone: PreferredMicrophone?
+    var availableMicrophones: [PreferredMicrophone] = []
+    /// Low-frequency evidence for the meeting diagnostics surface. Moving
+    /// levels stay in their independent properties above.
+    var recordingDiagnostics = RecordingDiagnosticsSnapshot(
+        sources: [
+            RecordingSourceDiagnostics(
+                source: .system,
+                isExpected: false,
+                isEnabled: false,
+                lifecycle: .disabled,
+                durableWriterAdvanced: false,
+                lastAudibleAge: nil
+            ),
+            RecordingSourceDiagnostics(
+                source: .microphone,
+                isExpected: false,
+                isEnabled: false,
+                lifecycle: .disabled,
+                durableWriterAdvanced: false,
+                lastAudibleAge: nil
+            ),
+        ],
+        liveText: .disabled,
+        writer: .init(sampleRateHertz: nil)
+    )
     /// Whether the meeting is transcribed while it happens. Off trades the live
     /// feed for not paying the Neural Engine twice; the final pass then
     /// produces the only transcript. See `LiveTranscriptionPolicy`.
@@ -682,6 +712,11 @@ final class AppViewState {
     var storageReport: StorageReport?
     var isScanningStorage = false
     var storageDeletingRecordingIDs: Set<UUID> = []
+
+    func applyMicrophonePreferences(_ preferences: AppPreferences) {
+        microphoneCaptureEnabled = preferences.microphoneCaptureEnabled
+        selectedMicrophone = preferences.selectedMicrophone
+    }
 
     private var displayedInsightMeetingID: UUID? {
         if case .meeting(let id) = selection { return id }

@@ -10,6 +10,41 @@ public enum AudioCaptureStatus: Equatable, Sendable {
     case failed(String)
 }
 
+public struct AudioCaptureConfiguration: Equatable, Sendable {
+    public var capturesMicrophone: Bool
+    /// Nil follows the current system-default input device.
+    public var microphoneDeviceUID: String?
+    /// Meeting-time offset used when appending another recording session.
+    public var timelineStartMilliseconds: Int64
+
+    public init(
+        capturesMicrophone: Bool = false,
+        microphoneDeviceUID: String? = nil,
+        timelineStartMilliseconds: Int64 = 0
+    ) {
+        self.capturesMicrophone = capturesMicrophone
+        self.microphoneDeviceUID = microphoneDeviceUID
+        self.timelineStartMilliseconds = max(0, timelineStartMilliseconds)
+    }
+}
+
+public enum AudioSourceCaptureState: Equatable, Sendable {
+    case disabled
+    case arming
+    case healthy
+    case unavailable(String)
+}
+
+public struct AudioSourceCaptureHealth: Equatable, Sendable {
+    public let source: AudioSource
+    public let state: AudioSourceCaptureState
+
+    public init(source: AudioSource, state: AudioSourceCaptureState) {
+        self.source = source
+        self.state = state
+    }
+}
+
 /// A model-friendly copy of a captured PCM buffer. The matching CAF data is
 /// durably appended before this value is emitted by ``AudioPipeline``.
 public struct CapturedAudioChunk: Sendable {
@@ -92,6 +127,33 @@ public enum AudioCaptureEvent: Sendable {
     case chunk(CapturedAudioChunk)
     case level(AudioLevel)
     case dropped(AudioDropReport)
+    case sourceHealth(AudioSourceCaptureHealth)
+}
+
+/// One normalized original produced by a source-specific capture writer.
+public struct AudioCaptureSourceArtifact: Equatable, Sendable {
+    public let source: AudioSource
+    public let audioURL: URL
+    public let timelineStartMilliseconds: Int64
+    public let durationMilliseconds: Int64
+    public let deviceUID: String?
+    public let deviceName: String?
+
+    public init(
+        source: AudioSource,
+        audioURL: URL,
+        timelineStartMilliseconds: Int64 = 0,
+        durationMilliseconds: Int64,
+        deviceUID: String? = nil,
+        deviceName: String? = nil
+    ) {
+        self.source = source
+        self.audioURL = audioURL
+        self.timelineStartMilliseconds = timelineStartMilliseconds
+        self.durationMilliseconds = durationMilliseconds
+        self.deviceUID = deviceUID
+        self.deviceName = deviceName
+    }
 }
 
 public struct AudioCaptureArtifacts: Equatable, Sendable {
@@ -99,17 +161,28 @@ public struct AudioCaptureArtifacts: Equatable, Sendable {
     public let directoryURL: URL
     public let systemAudioURL: URL
     public let durationMilliseconds: Int64
+    public let sourceArtifacts: [AudioCaptureSourceArtifact]
 
     public init(
         sessionID: UUID,
         directoryURL: URL,
         systemAudioURL: URL,
-        durationMilliseconds: Int64
+        durationMilliseconds: Int64,
+        sourceArtifacts: [AudioCaptureSourceArtifact]? = nil
     ) {
         self.sessionID = sessionID
         self.directoryURL = directoryURL
         self.systemAudioURL = systemAudioURL
         self.durationMilliseconds = durationMilliseconds
+        self.sourceArtifacts = sourceArtifacts ?? [AudioCaptureSourceArtifact(
+            source: .system,
+            audioURL: systemAudioURL,
+            durationMilliseconds: durationMilliseconds
+        )]
+    }
+
+    public func artifact(for source: AudioSource) -> AudioCaptureSourceArtifact? {
+        sourceArtifacts.first { $0.source == source }
     }
 }
 
