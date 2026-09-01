@@ -75,10 +75,16 @@ struct ImportedMeetingRecording: Equatable, Sendable {
     /// Compatibility bridge for the current decoder. Imported audio is never
     /// the local microphone, so it enters attribution as system-side speech.
     func finalizationTracks() -> [MeetingAudioTrack] {
-        zip(sources, takes).map { _, take in
+        zip(sources, takes).map { source, take in
             MeetingAudioTrack(
                 meetingID: session.meetingID,
                 source: .system,
+                speakerID: source.kind == .importedParticipant
+                    ? "imported-participant-\(source.ordinal)"
+                    : nil,
+                speakerName: source.kind == .importedParticipant
+                    ? (source.label ?? "Participant \(source.ordinal + 1)")
+                    : nil,
                 fileURL: take.fileURL,
                 sampleRate: take.sampleRate,
                 channelCount: take.channelCount,

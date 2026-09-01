@@ -174,6 +174,12 @@ struct StorageAccountingTests {
         ))
         #expect(RecordingStorageCleanupPolicy.canRemove(
             meetingID: meetingID,
+            status: .ready,
+            activeMeetingID: UUID(),
+            recordingPhase: .recording
+        ))
+        #expect(RecordingStorageCleanupPolicy.canRemove(
+            meetingID: meetingID,
             status: .interrupted,
             activeMeetingID: nil,
             recordingPhase: .idle

@@ -194,8 +194,6 @@ final class RecordingSleepResilience {
 
         case .didWake:
             guard let boundary = sleepBoundary else { return }
-            let wakeMonotonic = monotonicClock()
-            let wakeWall = wallClock()
             var finalError: Error?
 
             for attempt in 0...retryPolicy.delaysSeconds.count {
@@ -204,6 +202,11 @@ final class RecordingSleepResilience {
                     guard !Task.isCancelled else { return }
                 }
                 do {
+                    // Include bounded device-recovery time in the honest gap.
+                    // Sampling only when didWake arrives would under-report a
+                    // wake whose audio devices need one or more retries.
+                    let wakeMonotonic = monotonicClock()
+                    let wakeWall = wallClock()
                     let omission = try await resume(wakeMonotonic)
                     let monotonicDuration = omission?.wallDurationMilliseconds
                         ?? Self.durationMilliseconds(

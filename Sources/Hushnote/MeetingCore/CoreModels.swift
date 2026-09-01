@@ -149,6 +149,10 @@ public struct MeetingAudioTrack: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var meetingID: UUID
     public var source: AudioSource
+    /// Optional stable identity supplied by a discrete imported participant
+    /// track. Live system mixes leave this nil and use diarization instead.
+    public var speakerID: String?
+    public var speakerName: String?
     public var fileURL: URL
     public var sampleRate: Double
     public var channelCount: Int
@@ -161,6 +165,8 @@ public struct MeetingAudioTrack: Codable, Equatable, Identifiable, Sendable {
         id: UUID = UUID(),
         meetingID: UUID,
         source: AudioSource,
+        speakerID: String? = nil,
+        speakerName: String? = nil,
         fileURL: URL,
         sampleRate: Double,
         channelCount: Int,
@@ -171,6 +177,8 @@ public struct MeetingAudioTrack: Codable, Equatable, Identifiable, Sendable {
         self.id = id
         self.meetingID = meetingID
         self.source = source
+        self.speakerID = speakerID
+        self.speakerName = speakerName
         self.fileURL = fileURL
         self.sampleRate = sampleRate
         self.channelCount = channelCount

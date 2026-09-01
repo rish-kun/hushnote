@@ -643,6 +643,9 @@ final class AppViewState {
     /// Sparse recording apparatus for the selected meeting. These boundaries
     /// are rendered beside the transcript and never become transcript prose.
     var recordingEvents: [RecordingEvent] = []
+    /// Durable user emphasis, kept by meeting so loading another workspace
+    /// cannot make markers appear to belong to the currently selected meeting.
+    var recordingMarkers: [UUID: [RecordingMarker]] = [:]
     /// A request to bring one paragraph into view, raised by the transcript
     /// index. Carried as identity rather than as a position, for the same
     /// reason every other transcript address in this app is.
@@ -716,6 +719,10 @@ final class AppViewState {
     var notesSaving: Set<UUID> = []
     var finalizationStage: FinalizationStage?
     var finalizationDetail: String?
+    /// Remaining work for background finalization, by meeting. This is kept
+    /// separate from the global recording phase because another meeting can
+    /// be actively capturing while older jobs wait in the queue.
+    var finalizationETAs: [UUID: FinalizationETARange] = [:]
     var alert: AppAlert?
     var audioExports: [UUID: AudioExportState] = [:]
     var storageReport: StorageReport?
@@ -788,6 +795,10 @@ final class AppViewState {
 
     func workspaceTab(for meetingID: UUID) -> WorkspaceTab {
         meetingWorkspaceTabs[meetingID] ?? .notes
+    }
+
+    func markers(for meetingID: UUID) -> [RecordingMarker] {
+        recordingMarkers[meetingID, default: []]
     }
 
     func setWorkspaceTab(_ tab: WorkspaceTab, for meetingID: UUID) {

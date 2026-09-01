@@ -191,6 +191,7 @@ private struct ActiveRecordingEvidenceView: View {
     let horizontalInset: CGFloat
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
+    @State private var cleanupPending: RecordingStorageUsage?
 
     var body: some View {
         let rows = RecordingDiagnosticsPolicy.rows(for: state.recordingDiagnostics)
@@ -231,10 +232,40 @@ private struct ActiveRecordingEvidenceView: View {
                 text: confidence.text,
                 tone: statusTone(confidence.tone)
             )
+
+            if state.recordingDiagnostics.writer.diskState != .healthy,
+               let candidate = cleanupCandidate {
+                Button("Remove \(StorageByteText.string(candidate.allocatedBytes)) of finalized audio") {
+                    cleanupPending = candidate
+                }
+                .hushnoteButton(.destructive)
+            }
         }
         .padding(.horizontal, horizontalInset)
         .padding(.vertical, 11)
         .background(HushnoteTheme.vermilion.opacity(0.045))
+        .confirmationDialog(
+            "Remove finalized audio?",
+            isPresented: Binding(
+                get: { cleanupPending != nil },
+                set: { if !$0 { cleanupPending = nil } }
+            ),
+            presenting: cleanupPending
+        ) { recording in
+            Button("Remove \(StorageByteText.string(recording.allocatedBytes))", role: .destructive) {
+                cleanupPending = nil
+                Task { await coordinator.removeRecordingAudio(meetingID: recording.meetingID) }
+            }
+            Button("Cancel", role: .cancel) { cleanupPending = nil }
+        } message: { recording in
+            Text("The retained raw audio for \(recording.title) will be removed. Its transcript, notes, and summaries remain available.")
+        }
+    }
+
+    private var cleanupCandidate: RecordingStorageUsage? {
+        state.storageReport?.recordingDetails
+            .filter { $0.allocatedBytes > 0 && coordinator.canRemoveRecordingAudio(meetingID: $0.meetingID) }
+            .max { $0.allocatedBytes < $1.allocatedBytes }
     }
 
     private func diagnostic(_ row: RecordingDiagnosticRow) -> some View {
@@ -771,7 +802,8 @@ struct CompletedMeetingView: View {
         case .transcript:
             TranscriptView(
                 isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
-                horizontalInset: policy.gutter
+                horizontalInset: policy.gutter,
+                markers: state.markers(for: meetingID)
             )
         case .ask: AskMeetingView(horizontalInset: policy.gutter, policy: policy)
         }
@@ -1618,6 +1650,7 @@ struct TranscriptView: View {
     let isEditable: Bool
     let horizontalInset: CGFloat
     var isRecording = false
+    var markers: [RecordingMarker] = []
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1642,6 +1675,9 @@ struct TranscriptView: View {
             paragraphs,
             includesOpenChapter: !isRecording
         )
+        let markerPlacements: [UUID: [RecordingMarker]] = isRecording
+            ? [:]
+            : TranscriptMarkerPolicy.placements(markers: markers, paragraphs: paragraphs)
         let liveParagraph = isRecording ? paragraphs.last?.id : nil
 
         GeometryReader { proxy in
@@ -1652,6 +1688,7 @@ struct TranscriptView: View {
                     paragraphs: paragraphs,
                     chapters: chapters,
                     recordingEvents: state.recordingEvents,
+                    markerPlacements: markerPlacements,
                     open: open,
                     liveParagraph: liveParagraph,
                     layout: layout
@@ -1697,6 +1734,7 @@ struct TranscriptView: View {
         paragraphs: [TranscriptParagraph],
         chapters: [TranscriptChapter],
         recordingEvents: [RecordingEvent],
+        markerPlacements: [UUID: [RecordingMarker]],
         open: UUID?,
         liveParagraph: UUID?,
         layout: TranscriptLayout
@@ -1705,6 +1743,17 @@ struct TranscriptView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(paragraphs) { paragraph in
+                        if let markers = markerPlacements[paragraph.id] {
+                            ForEach(markers) { marker in
+                                TranscriptMarkerBoundaryView(
+                                    marker: marker,
+                                    layout: layout,
+                                    seek: coordinator.playbackController.isAvailable
+                                        ? { coordinator.playbackController.seek(to: Double(marker.timelineMilliseconds) / 1_000) }
+                                        : nil
+                                )
+                            }
+                        }
                         ForEach(TranscriptPauseBoundaryPolicy.boundaries(
                             before: paragraph,
                             paragraphs: paragraphs,
@@ -2001,6 +2050,52 @@ private struct TranscriptPauseBoundaryView: View {
         .accessibilityLabel(
             "Paused for \(DurationText.spoken(boundary.durationSeconds)) at captured time \(DurationText.spoken(boundary.timelineSeconds))"
         )
+    }
+}
+
+/// A user emphasis marker in the transcript apparatus. It is intentionally
+/// quieter than a chapter rule and sits outside the prose so a summary or
+/// transcript export cannot mistake it for participant speech.
+private struct TranscriptMarkerBoundaryView: View {
+    let marker: RecordingMarker
+    let layout: TranscriptLayout
+    let seek: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: layout.marginGap) {
+            if layout.hasMargin {
+                markerLabel
+                    .frame(width: layout.marginWidth, alignment: .trailing)
+            }
+            if !layout.hasMargin {
+                markerLabel
+                    .frame(maxWidth: layout.measure, alignment: .leading)
+            }
+        }
+        .padding(.top, 14)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(marker.type.title) marker at \(DurationText.spoken(Double(marker.timelineMilliseconds) / 1_000))"
+        )
+    }
+
+    @ViewBuilder
+    private var markerLabel: some View {
+        if let seek {
+            Button(action: seek) {
+                labelContent
+            }
+            .buttonStyle(.plain)
+        } else {
+            labelContent
+        }
+    }
+
+    private var labelContent: some View {
+        Label(marker.type.title, systemImage: "bookmark.fill")
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(HushnoteTheme.moss)
+            .lineLimit(1)
     }
 }
 

@@ -35,6 +35,22 @@ struct SpeakerAttributorTests {
         #expect(result[0].speakerName == "Speaker B")
     }
 
+    @Test("Discrete imported participant identity outranks diarization")
+    func preservesImportedParticipantIdentity() {
+        let meetingID = UUID()
+        var segment = transcriptSegment("track", meetingID: meetingID, source: .system, start: 100, end: 300)
+        segment.speakerID = "imported-participant-1"
+        segment.speakerName = "Participant 2"
+
+        let result = SpeakerAttributor.assign(
+            turns: [SpeakerTurn(id: "turn", speakerID: "S1", startMilliseconds: 0, endMilliseconds: 400)],
+            to: [segment]
+        )
+
+        #expect(result[0].speakerID == "imported-participant-1")
+        #expect(result[0].speakerName == "Participant 2")
+    }
+
     @Test("Equal overlap resolves deterministically by speaker identifier")
     func deterministicTieBreak() {
         let meetingID = UUID()

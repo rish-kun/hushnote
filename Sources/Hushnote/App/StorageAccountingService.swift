@@ -95,7 +95,9 @@ struct StorageReport: Equatable, Sendable {
 }
 
 /// Recovery audio is the only copy of an interrupted meeting. Cleanup is
-/// intentionally limited to completed meetings and never races active capture.
+/// intentionally limited to completed meetings and never targets the active
+/// meeting. A different completed meeting remains safe to clean while capture
+/// owns its own session directory.
 enum RecordingStorageCleanupPolicy {
     static func canRemove(
         meetingID: UUID,
@@ -103,7 +105,7 @@ enum RecordingStorageCleanupPolicy {
         activeMeetingID: UUID?,
         recordingPhase: RecordingPhase
     ) -> Bool {
-        status == .ready && meetingID != activeMeetingID && !recordingPhase.isBusy
+        status == .ready && meetingID != activeMeetingID
     }
 }
 

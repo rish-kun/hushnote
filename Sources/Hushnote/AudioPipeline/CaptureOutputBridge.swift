@@ -177,7 +177,11 @@ final class CaptureOutputBridge: @unchecked Sendable {
                     sampleRate: sampleRate,
                     samples: samples
                 )))
-                eventContinuation.yield(.level(Self.level(for: samples, source: source)))
+                eventContinuation.yield(.level(Self.level(
+                    for: samples,
+                    source: source,
+                    timelineMilliseconds: recorded.range.endMilliseconds
+                )))
             } catch {
                 acceptingSamples = false
                 failureHandler?(error.localizedDescription)
@@ -190,10 +194,21 @@ final class CaptureOutputBridge: @unchecked Sendable {
         return Int64((Double(frames) / sampleRate * 1_000).rounded())
     }
 
-    static func level(for samples: [Float], source: AudioSource) -> AudioLevel {
+    static func level(
+        for samples: [Float],
+        source: AudioSource,
+        timelineMilliseconds: Int64? = nil
+    ) -> AudioLevel {
         // Without this the empty case divides by zero and reports NaN, which
         // poisons every meter arithmetic downstream of it.
-        guard !samples.isEmpty else { return AudioLevel(source: source, rms: 0, peak: 0) }
+        guard !samples.isEmpty else {
+            return AudioLevel(
+                source: source,
+                rms: 0,
+                peak: 0,
+                timelineMilliseconds: timelineMilliseconds
+            )
+        }
         var peak: Float = 0
         var energy: Double = 0
         for sample in samples {
@@ -203,7 +218,12 @@ final class CaptureOutputBridge: @unchecked Sendable {
         let rms = Float(sqrt(energy / Double(samples.count)))
         // A rate converter's ringing can overshoot full scale. A meter reports
         // full scale, never more.
-        return AudioLevel(source: source, rms: min(1, rms), peak: min(1, peak))
+        return AudioLevel(
+            source: source,
+            rms: min(1, rms),
+            peak: min(1, peak),
+            timelineMilliseconds: timelineMilliseconds
+        )
     }
 
 }

@@ -52,7 +52,7 @@ struct StorageDashboardView: View {
             }
             Button("Cancel", role: .cancel) { recordingPendingRemoval = nil }
         } message: { recording in
-            Text("This frees (StorageByteText.string(recording.allocatedBytes)). The meeting note, transcript, and summaries remain available.")
+            Text("This frees \(StorageByteText.string(recording.allocatedBytes)). The meeting note, transcript, and summaries remain available.")
         }
     }
 

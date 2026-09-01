@@ -153,16 +153,18 @@ struct CaptureLevelTests {
 }
 
 /// The chunk timeline is what aligns the transcript against the audio. It has
-/// to move forward, and it has to keep real gaps rather than papering over them.
+/// to move forward without inventing playable silence for host-clock jumps;
+/// omitted wall time is represented separately by recording events.
 @Suite("Chunk timeline")
 struct CaptureTimelineTests {
-    @Test("A gap in capture stays a gap, and time never runs backwards")
-    func timelineIsMonotonicAndGapPreserving() throws {
+    @Test("A host-clock gap does not invent audio, and time never runs backwards")
+    func timelineIsMonotonicAndFramePreserving() throws {
         let harness = try Harness()
 
         harness.consume(milliseconds: 100, at: 1_000.0)
         harness.consume(milliseconds: 100, at: 1_000.1)
-        // The device went quiet for five seconds.
+        // The device clock jumps five seconds without writing intervening
+        // frames. That wall interval must not become seekable audio.
         harness.consume(milliseconds: 100, at: 1_005.1)
         // A malformed or repeated timestamp arrives from the past.
         harness.consume(milliseconds: 100, at: 1_000.0)
@@ -174,7 +176,7 @@ struct CaptureTimelineTests {
         }
         #expect(chunks[0].startMilliseconds == 0)
         #expect(abs(chunks[1].startMilliseconds - 100) <= 1)
-        #expect(abs(chunks[2].startMilliseconds - 5_100) <= 1, "the five-second gap was not preserved")
+        #expect(abs(chunks[2].startMilliseconds - 200) <= 1, "the clock jump invented unwritten audio")
         #expect(chunks.allSatisfy { $0.endMilliseconds > $0.startMilliseconds })
         #expect(chunks.allSatisfy { abs(($0.endMilliseconds - $0.startMilliseconds) - 100) <= 1 })
     }

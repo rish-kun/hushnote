@@ -47,6 +47,7 @@ final class AppCoordinator {
     @ObservationIgnored private var sourcesWithDurableAudio: Set<AudioSource> = []
     @ObservationIgnored private var microphoneConfigurationTask: Task<Void, Never>?
     @ObservationIgnored private var backgroundFinalizationTask: Task<Void, Never>?
+    @ObservationIgnored private var recentFinalizationSamples: [FinalizationRuntimeSample] = []
     @ObservationIgnored private var speechEngine: WhisperKitTranscriptionEngine?
     @ObservationIgnored private var diarizationEngine: FluidAudioDiarizationEngine?
     @ObservationIgnored private var loadedModel: SpeechModel?
@@ -70,6 +71,8 @@ final class AppCoordinator {
     @ObservationIgnored private let downloader: any SpeechModelDownloading
     @ObservationIgnored private let storageAccounting: any StorageAccounting
     @ObservationIgnored private let recordingFreeSpace: any RecordingFreeSpaceChecking
+    @ObservationIgnored private let finalizationNotifier: any FinalizationNotifying
+    @ObservationIgnored private var finalizationAuthorizationTask: Task<Bool, Never>?
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let preferences: AppPreferences
     /// One per model, so a download can be cancelled by the row that started it.
@@ -93,6 +96,7 @@ final class AppCoordinator {
         downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
         storageAccounting: any StorageAccounting = StorageAccountingService(),
         recordingFreeSpace: any RecordingFreeSpaceChecking = VolumeRecordingFreeSpaceChecker(),
+        finalizationNotifier: any FinalizationNotifying = UserNotificationFinalizationNotifier(),
         shareTokens: any ShareTokenStoring = KeychainShareTokenStore(),
         makeSharePublisher: @escaping @Sendable (String, URL) -> any SharePublishing
             = { token, origin in HushnoteSharePublisher(origin: origin, deviceToken: token) },
@@ -102,6 +106,7 @@ final class AppCoordinator {
         self.downloader = downloader
         self.storageAccounting = storageAccounting
         self.recordingFreeSpace = recordingFreeSpace
+        self.finalizationNotifier = finalizationNotifier
         self.shareTokens = shareTokens
         self.makeSharePublisher = makeSharePublisher
         self.defaults = defaults
@@ -160,6 +165,22 @@ final class AppCoordinator {
             await loadShares()
             let ids = Set(meetings.map(\.id))
             state.meetingWorkspaceTabs = preferences.pruneMeetingTabs(keeping: ids)
+            // Resume durable work left by a previous launch. Query the queue
+            // itself rather than inferring pending work from meeting status:
+            // a meeting can have several appended sessions, and a failed job
+            // must remain retryable without being retried silently at launch.
+            let queuedJobs = try await store.queuedFinalizationJobs()
+            recentFinalizationSamples = try await store.recentCompletedFinalizationJobs()
+                .compactMap { job in
+                    job.realtimeFactor.map {
+                        FinalizationRuntimeSample(modelID: job.modelID, realtimeFactor: $0)
+                    }
+                }
+            for job in queuedJobs {
+                guard let session = try await store.recordingSession(id: job.sessionID) else { continue }
+                updateFinalizationETA(for: session.meetingID, job: job)
+            }
+            if !queuedJobs.isEmpty { enqueueBackgroundFinalization() }
             if let destination = preferences.sidebarDestination {
                 let resolved = AppViewState.resolvedSidebarDestination(
                     destination,
@@ -284,6 +305,11 @@ final class AppCoordinator {
                 updateListItem(durable, excerpt: "Imported audio is queued for transcription.")
             }
             await recoverMeeting(meeting.id, finalizationJobID: job.id)
+            if let finalizedMeeting = try? await store.meeting(id: meeting.id),
+               finalizedMeeting.status == .ready {
+                await generateInsights(meetingID: meeting.id)
+                await notifyReadyFinalization(jobID: job.id, meeting: finalizedMeeting)
+            }
         } catch {
             // A relational failure after normalization must not leave invisible
             // originals consuming storage. Once the graph is saved, recovery
@@ -360,6 +386,10 @@ final class AppCoordinator {
         // cannot create parallel continuation sessions.
         state.recordingPhase = .preparing
         state.recordingStartupStage = .arming
+        // Capture owns the latency-sensitive local audio/ML path. Cancelling
+        // the durable worker asks an in-flight decoder to yield; recovery below
+        // returns its claimed job to the queue without touching the audio.
+        backgroundFinalizationTask?.cancel()
         do {
             guard let meeting = try await store.meeting(id: meetingID),
                   ContinueRecordingPolicy.canContinue(
@@ -423,6 +453,7 @@ final class AppCoordinator {
             state.recordingPhase = .idle
             state.recordingStartupStage = .idle
             state.report(.storage, RecordingDiskProtection.refusalMessage(preflight))
+            enqueueBackgroundFinalization()
             return
         }
         let generation = UUID()
@@ -481,6 +512,8 @@ final class AppCoordinator {
             state.recordingDiagnostics = initialRecordingDiagnostics(
                 microphoneEnabled: state.microphoneCaptureEnabled
             )
+            state.recordingMarkers[meeting.id] =
+                (try? await store.recordingMarkers(meetingID: meeting.id)) ?? []
             if let preflight { updateDiskDiagnostics(preflight) }
 
             let pipeline = AudioPipeline(rootDirectory: applicationDataURL.appending(path: "RecoveryAudio"))
@@ -535,6 +568,7 @@ final class AppCoordinator {
                 message: error.localizedDescription,
                 meetingID: meeting.id
             ))
+            enqueueBackgroundFinalization()
         }
     }
 
@@ -754,13 +788,15 @@ final class AppCoordinator {
                 audioDurationMilliseconds: recordingSession.capturedDurationMilliseconds
             )
             try await store.enqueueFinalizationJob(job)
+            updateFinalizationETA(for: meetingID, job: job)
+            requestFinalizationNotificationAuthorization()
             self.audioPipeline = nil
             activeRecordingSession = nil
             activeContinuationBaseSegments = nil
             activeRecordingSources = [:]
             sourcesWithDurableAudio = []
             state.markFinished()
-            enqueueBackgroundFinalization(meetingID: meetingID, jobID: job.id)
+            enqueueBackgroundFinalization()
         } catch {
             logger.error("Finalization failed: \(error.localizedDescription, privacy: .public)")
             try? await store.updateMeetingStatus(id: meetingID, status: .interrupted, errorMessage: error.localizedDescription)
@@ -814,6 +850,7 @@ final class AppCoordinator {
         do {
             let segments = try await store.segments(meetingID: id)
             let recordingEvents = try await store.recordingEvents(meetingID: id)
+            let recordingMarkers = try await store.recordingMarkers(meetingID: id)
             let versions = try await store.summaryVersions(meetingID: id, limit: 50)
             let activeVersion = try await store.activeSummaryVersion(meetingID: id)
             if let meeting = try await store.meeting(id: id),
@@ -846,6 +883,7 @@ final class AppCoordinator {
                 state.replaceInsights(InsightWorkspaceState(), for: id)
             }
             cachedSegments[id] = segments
+            state.recordingMarkers[id] = recordingMarkers
             guard state.activeMeetingID != id else { return }
             state.transcript = segments.map(Self.lineItem)
             state.recordingEvents = recordingEvents
@@ -1483,8 +1521,22 @@ final class AppCoordinator {
             state.markFinalizing(stage: .savingAudio, progress: 0.05, detail: "Checking saved audio…")
         }
         var durableJob: FinalizationJob?
+        let processingStartedAt = Date()
         do {
             durableJob = try await prepareFinalizationJob(meetingID: id, preferredID: finalizationJobID)
+            // Capture may have started after the scheduler's last idle check
+            // but before this asynchronous preparation returned. Requeue the
+            // claim so the live meeting keeps exclusive processing ownership;
+            // the durable worker will pick this job up again when capture is
+            // idle.
+            if !presentsProgress,
+               state.recordingPhase.isBusy,
+               state.activeMeetingID != id,
+               let durableJob,
+               FinalizationJobTransitionPolicy.isRunning(durableJob.state) {
+                _ = try? await store.requeueRunningFinalizationJob(id: durableJob.id)
+                return
+            }
             try await registerRecoveryAudio(for: id)
             let tracks = try await durableFinalizationTracks(
                 meetingID: id,
@@ -1505,6 +1557,9 @@ final class AppCoordinator {
                 .filter { $0.stability == .final }
             let revision = (existing.map(\.revision).max() ?? 0) + 1
             let durableJobID = durableJob?.id
+            if let durableJob {
+                updateFinalizationETA(for: id, job: durableJob)
+            }
             var final = try await finalizer.transcribe(
                 meetingID: id,
                 tracks: tracks,
@@ -1530,11 +1585,15 @@ final class AppCoordinator {
                     }
                     if let self, let durableJobID {
                         let progressValue = progress == .loadingModel ? 0.25 : 0.55
-                        _ = try? await self.updateFinalizationJob(
+                        if let updated = try? await self.updateFinalizationJob(
                             id: durableJobID,
                             state: .transcribing,
                             progress: progressValue
-                        )
+                        ) {
+                            await MainActor.run {
+                                self.updateFinalizationETA(for: id, job: updated)
+                            }
+                        }
                     }
                 }
             ).segments
@@ -1549,6 +1608,7 @@ final class AppCoordinator {
                         state: .diarizing,
                         progress: 0.75
                     )
+                    if let durableJob { updateFinalizationETA(for: id, job: durableJob) }
                 }
                 do {
                     // The same engine as finalization, and for the same reason:
@@ -1598,6 +1658,7 @@ final class AppCoordinator {
                         state: .diarizing,
                         progress: 0.9
                     )
+                    if let durableJob { updateFinalizationETA(for: id, job: durableJob) }
                 }
                 durableJob = try await updateFinalizationJob(
                     id: jobID,
@@ -1605,6 +1666,22 @@ final class AppCoordinator {
                     progress: 1,
                     finishedAt: Date()
                 )
+                if var completed = durableJob,
+                   completed.audioDurationMilliseconds > 0 {
+                    let audioSeconds = Double(completed.audioDurationMilliseconds) / 1_000
+                    completed.realtimeFactor = max(
+                        0.001,
+                        Date().timeIntervalSince(processingStartedAt) / audioSeconds
+                    )
+                    try await store.updateFinalizationJob(completed)
+                    durableJob = completed
+                    recentFinalizationSamples.append(.init(
+                        modelID: completed.modelID,
+                        realtimeFactor: completed.realtimeFactor!
+                    ))
+                    recentFinalizationSamples = Array(recentFinalizationSamples.suffix(32))
+                }
+                clearFinalizationETA(for: id)
             }
             if MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(
                 meetingRetainsAudio: meeting.retainsAudio
@@ -1613,6 +1690,14 @@ final class AppCoordinator {
             }
             if presentsProgress { state.markFinished() }
         } catch {
+            if !presentsProgress, (error is CancellationError || Task.isCancelled) {
+                if let durableJob,
+                   FinalizationJobTransitionPolicy.isRunning(durableJob.state),
+                   let requeued = try? await store.requeueRunningFinalizationJob(id: durableJob.id) {
+                    updateFinalizationETA(for: id, job: requeued)
+                }
+                return
+            }
             if let jobID = durableJob?.id {
                 _ = try? await updateFinalizationJob(
                     id: jobID,
@@ -1621,6 +1706,15 @@ final class AppCoordinator {
                     finishedAt: Date(),
                     errorMessage: error.localizedDescription
                 )
+                clearFinalizationETA(for: id)
+                if let failedJob = try? await store.finalizationJob(id: jobID) {
+                    let failedTitle = (try? await store.meeting(id: id))?.title ?? "Meeting"
+                    await notifyTerminalFinalization(
+                        job: failedJob,
+                        meetingID: id,
+                        meetingTitle: failedTitle
+                    )
+                }
             }
             try? await store.updateMeetingStatus(id: id, status: .interrupted, errorMessage: error.localizedDescription)
             if var meeting = try? await store.meeting(id: id) {
@@ -1638,30 +1732,140 @@ final class AppCoordinator {
         }
     }
 
-    private func enqueueBackgroundFinalization(meetingID: UUID, jobID: UUID) {
+    private func enqueueBackgroundFinalization() {
         let previous = backgroundFinalizationTask
         backgroundFinalizationTask = Task { [weak self] in
             _ = await previous?.value
             guard let self else { return }
-            // Heavy local decoding yields ownership to live capture. Jobs stay
-            // durable and queued while a meeting is preparing, recording, or
-            // paused, then resume in FIFO order when capture is idle.
-            while self.state.recordingPhase.isCapturing {
+            // Heavy local decoding yields ownership to live capture. Drain
+            // the durable FIFO so jobs created after launch are picked up by
+            // the same serialized worker, while failed jobs remain in place
+            // for an explicit retry.
+            await self.drainBackgroundFinalizationQueue()
+        }
+    }
+
+    private func drainBackgroundFinalizationQueue() async {
+        while !Task.isCancelled {
+            while state.recordingPhase.isBusy {
                 do {
                     try await Task.sleep(for: .seconds(1))
                 } catch {
                     return
                 }
             }
+
+            let job: FinalizationJob
+            do {
+                guard let next = try await store.queuedFinalizationJobs().first else { return }
+                job = next
+            } catch {
+                logger.error("Unable to load queued finalization work: \(error.localizedDescription, privacy: .public)")
+                return
+            }
+
+            // Always use the store's FIFO result. A continuation or import can
+            // be registered after the task starts, and processing the captured
+            // job arguments directly would let an older queued job jump the
+            // line.
+            guard let meetingID = (try? await store.recordingSession(id: job.sessionID))?.meetingID else {
+                continue
+            }
+
             await self.recoverMeeting(
                 meetingID,
-                finalizationJobID: jobID,
+                finalizationJobID: job.id,
                 presentsProgress: false
             )
             if let finalizedMeeting = try? await self.store.meeting(id: meetingID),
                finalizedMeeting.status == .ready {
                 await self.generateInsights(meetingID: meetingID)
+                await self.notifyReadyFinalization(jobID: job.id, meeting: finalizedMeeting)
             }
+        }
+    }
+
+    private func requestFinalizationNotificationAuthorization() {
+        guard finalizationAuthorizationTask == nil else { return }
+        let notifier = finalizationNotifier
+        finalizationAuthorizationTask = Task {
+            await notifier.requestAuthorization()
+        }
+    }
+
+    private func updateFinalizationETA(for meetingID: UUID, job: FinalizationJob) {
+        let currentSample = job.realtimeFactor.map {
+            [FinalizationRuntimeSample(modelID: job.modelID, realtimeFactor: $0)]
+        } ?? []
+        let eta = FinalizationETAPolicy.estimate(
+            audioDurationMilliseconds: job.audioDurationMilliseconds,
+            modelID: job.modelID,
+            progress: job.progress,
+            recentSamples: recentFinalizationSamples + currentSample
+        )
+        state.finalizationETAs[meetingID] = eta
+        updateMeetingListExcerpt(meetingID, excerpt: eta.userFacingText)
+    }
+
+    private func clearFinalizationETA(for meetingID: UUID) {
+        state.finalizationETAs[meetingID] = nil
+    }
+
+    private func notifyTerminalFinalization(
+        job: FinalizationJob,
+        meetingID: UUID,
+        meetingTitle: String
+    ) async {
+        guard job.completionNotifiedAt == nil else { return }
+        if finalizationAuthorizationTask == nil {
+            requestFinalizationNotificationAuthorization()
+        }
+        guard let authorizationTask = finalizationAuthorizationTask,
+              await authorizationTask.value else { return }
+
+        let notification: FinalizationNotification
+        switch job.state {
+        case .succeeded:
+            notification = FinalizationNotification(
+                meetingID: meetingID,
+                title: "\(meetingTitle) is ready",
+                body: "Your transcript and summary are ready to review.",
+                kind: .ready
+            )
+        case .failed:
+            notification = FinalizationNotification(
+                meetingID: meetingID,
+                title: "\(meetingTitle) needs attention",
+                body: "Finalization stopped, but the original recording is safe.",
+                kind: .failed
+            )
+        case .queued, .transcribing, .diarizing, .merging:
+            return
+        }
+        do {
+            try await finalizationNotifier.send(notification)
+            _ = try await store.markFinalizationNotificationSent(id: job.id)
+        } catch {
+            logger.info("Finalization notification skipped: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func notifyReadyFinalization(jobID: UUID, meeting: Meeting) async {
+        guard let job = try? await store.finalizationJob(id: jobID),
+              job.state == .succeeded else { return }
+        await notifyTerminalFinalization(
+            job: job,
+            meetingID: meeting.id,
+            meetingTitle: meeting.title
+        )
+    }
+
+    private func updateMeetingListExcerpt(_ meetingID: UUID, excerpt: String) {
+        if let index = state.meetings.firstIndex(where: { $0.id == meetingID }) {
+            state.meetings[index].excerpt = excerpt
+        }
+        if let index = state.recentlyDeletedMeetings.firstIndex(where: { $0.id == meetingID }) {
+            state.recentlyDeletedMeetings[index].excerpt = excerpt
         }
     }
 
@@ -1727,6 +1931,12 @@ final class AppCoordinator {
                 tracks.append(MeetingAudioTrack(
                     meetingID: meetingID,
                     source: audioSource,
+                    speakerID: source.kind == .importedParticipant
+                        ? "imported-participant-\(source.ordinal)"
+                        : nil,
+                    speakerName: source.kind == .importedParticipant
+                        ? (source.label ?? "Participant \(source.ordinal + 1)")
+                        : nil,
                     fileURL: take.fileURL,
                     sampleRate: take.sampleRate,
                     channelCount: take.channelCount,
@@ -2200,12 +2410,20 @@ final class AppCoordinator {
               let audioPipeline else { return }
         let position = await audioPipeline.timelinePositionMilliseconds
         do {
-            try await store.saveRecordingMarker(.init(
+            let marker = RecordingMarker(
                 meetingID: meetingID,
                 sessionID: session.id,
                 type: type,
                 timelineMilliseconds: position
-            ))
+            )
+            try await store.saveRecordingMarker(marker)
+            state.recordingMarkers[meetingID, default: []].append(marker)
+            state.recordingMarkers[meetingID]?.sort {
+                if $0.timelineMilliseconds != $1.timelineMilliseconds {
+                    return $0.timelineMilliseconds < $1.timelineMilliseconds
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }
         } catch {
             state.recordingNotice = "That moment could not be saved: \(error.localizedDescription)"
         }
@@ -2390,6 +2608,21 @@ final class AppCoordinator {
         setSelection(.meeting(meetingID))
         setWorkspaceTab(.transcript, for: meetingID)
         state.transcriptJumpRequest = TranscriptJumpRequest(segmentID: segmentID)
+    }
+
+    /// Routes a terminal finalization notification into the same meeting
+    /// workspace the user would reach from the app, even when no window was
+    /// frontmost when the notification arrived.
+    func openMeetingSummary(_ meetingID: UUID) {
+        setSelection(.meeting(meetingID))
+        setWorkspaceTab(.summary, for: meetingID)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func openMeetingTranscript(_ meetingID: UUID) {
+        setSelection(.meeting(meetingID))
+        setWorkspaceTab(.transcript, for: meetingID)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func setSelection(_ destination: SidebarDestination?) {
@@ -2852,10 +3085,57 @@ final class AppCoordinator {
             lifecycle: lifecycle,
             durableWriterAdvanced: durableWriterAdvanced ?? current.durableWriterAdvanced,
             lastAudibleAge: current.lastAudibleAge,
+            lastAudibleTimestampMilliseconds: current.lastAudibleTimestampMilliseconds,
             droppedBufferCount: droppedBufferCount ?? current.droppedBufferCount
         )
         if let index { sources[index] = replacement } else { sources.append(replacement) }
         self.state.recordingDiagnostics = RecordingDiagnosticsSnapshot(
+            sources: sources,
+            liveText: snapshot.liveText,
+            writer: snapshot.writer
+        )
+    }
+
+    /// Converts the level callback into sample-clock-backed silence evidence.
+    /// A source can keep writing valid zero-energy buffers for minutes, so its
+    /// lifecycle is `.silent` while the writer remains healthy. The timestamp
+    /// is retained in the diagnostics snapshot and the age is recomputed from
+    /// the current chunk rather than from the UI's wall-clock timer.
+    private func updateSourceAudibility(_ level: AudioLevel) {
+        guard let timelineMilliseconds = level.timelineMilliseconds else { return }
+        let snapshot = state.recordingDiagnostics
+        var sources = snapshot.sources
+        let index = sources.firstIndex(where: { $0.source == level.source })
+        let current = index.map { sources[$0] }
+            ?? RecordingSourceDiagnostics(source: level.source)
+        guard current.isEnabled else { return }
+
+        let audible = RecordingSourceSilencePolicy.isAudible(rms: level.rms, peak: level.peak)
+        let lastAudibleTimestampMilliseconds = audible
+            ? timelineMilliseconds
+            : current.lastAudibleTimestampMilliseconds
+        let lifecycle: RecordingSourceLifecycle
+        switch current.lifecycle {
+        case .disabled, .unavailable, .reconnecting, .degraded:
+            lifecycle = current.lifecycle
+        case .arming, .healthy, .silent:
+            lifecycle = audible ? .healthy : .silent
+        }
+        let replacement = RecordingSourceDiagnostics(
+            source: level.source,
+            isExpected: current.isExpected,
+            isEnabled: current.isEnabled,
+            lifecycle: lifecycle,
+            durableWriterAdvanced: current.durableWriterAdvanced,
+            lastAudibleAge: RecordingSourceSilencePolicy.age(
+                currentTimelineMilliseconds: timelineMilliseconds,
+                lastAudibleTimestampMilliseconds: lastAudibleTimestampMilliseconds
+            ),
+            lastAudibleTimestampMilliseconds: lastAudibleTimestampMilliseconds,
+            droppedBufferCount: current.droppedBufferCount
+        )
+        if let index { sources[index] = replacement } else { sources.append(replacement) }
+        state.recordingDiagnostics = RecordingDiagnosticsSnapshot(
             sources: sources,
             liveText: snapshot.liveText,
             writer: snapshot.writer
@@ -2973,6 +3253,9 @@ final class AppCoordinator {
                 diskState: RecordingDiskProtection.diagnosticsState(for: assessment.level)
             )
         )
+        if assessment.level != .healthy, state.storageReport == nil, !state.isScanningStorage {
+            Task { [weak self] in await self?.refreshStorageReport() }
+        }
     }
 
     func revealApplicationData() {
@@ -2996,6 +3279,7 @@ final class AppCoordinator {
                     } else {
                         self.state.microphoneLevel = value
                     }
+                    self.updateSourceAudibility(level)
                 case .chunk(let chunk):
                     if self.sourcesWithDurableAudio.insert(chunk.source).inserted {
                         self.updateSourceDiagnostics(

@@ -138,6 +138,35 @@ struct FinalTranscriberTests {
             ordinal: 11
         ))
     }
+
+    @Test("A discrete imported track carries its participant identity into every segment")
+    func importedTrackPreservesParticipantIdentity() async throws {
+        let meetingID = UUID()
+        let decoder = StubFileDecoder([
+            .success([result(segments: [whisperSegment(start: 0, end: 1, text: "Hello")])]),
+        ])
+        let transcriber = WhisperKitFinalTranscriber(decoder: decoder)
+        let imported = MeetingAudioTrack(
+            meetingID: meetingID,
+            source: .system,
+            speakerID: "imported-participant-0",
+            speakerName: "Participant 1",
+            fileURL: URL(filePath: "/tmp/hushnote-tests/participant-0.caf"),
+            sampleRate: 48_000,
+            channelCount: 1,
+            isComplete: true
+        )
+
+        let snapshot = try await transcriber.transcribe(
+            meetingID: meetingID,
+            tracks: [imported],
+            model: SpeechModelCatalog.whisperSmall,
+            revision: 1
+        )
+
+        #expect(snapshot.segments.first?.speakerID == "imported-participant-0")
+        #expect(snapshot.segments.first?.speakerName == "Participant 1")
+    }
 }
 
 // MARK: - Fixtures

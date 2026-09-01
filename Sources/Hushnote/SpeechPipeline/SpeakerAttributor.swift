@@ -17,6 +17,13 @@ public enum SpeakerAttributor {
                 segment.speakerName = microphoneSpeakerName
                 return segment
             }
+            // Discrete participant tracks imported from a multitrack file
+            // already carry stronger identity evidence than acoustic
+            // clustering. Preserve that label while diarizing an unlabeled
+            // system mix beside it.
+            if segment.speakerID?.hasPrefix("imported-participant-") == true {
+                return segment
+            }
 
             let best = turns
                 .map { turn in (turn, intersection(turn: turn, segment: segment)) }

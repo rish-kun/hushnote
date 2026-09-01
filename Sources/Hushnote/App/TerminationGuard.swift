@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UserNotifications
 
 /// Whether the process may be allowed to die right now.
 enum TerminationDecision: Equatable {
@@ -53,7 +54,7 @@ enum TerminationGuard {
 
 /// Intercepts termination so a recording is never lost to a reflexive ⌘Q.
 @MainActor
-final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
+final class HushnoteAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     /// Set from `HushnoteApp.init` rather than injected, because the delegate is
     /// constructed by SwiftUI and must answer correctly even when no window has
     /// ever been opened — the `MenuBarExtra` keeps the app alive without one.
@@ -61,8 +62,52 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
     static weak var coordinator: AppCoordinator?
     static weak var quickNoteShortcut: GlobalQuickNoteShortcut?
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        UserNotificationFinalizationNotifier.registerCategories(on: center)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         Self.quickNoteShortcut?.stop()
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        let rawID = userInfo[UserNotificationCategory.meetingIDKey] as? String
+        let meetingID = rawID.flatMap(UUID.init(uuidString:))
+        let action = response.actionIdentifier
+        let category = response.notification.request.content.categoryIdentifier
+        // Capture only Sendable values before hopping to the main actor. The
+        // UNNotificationResponse and completion closure are task-isolated by
+        // UserNotifications and must not cross that boundary.
+        completionHandler()
+        Task { @MainActor in
+            if let meetingID,
+               action == UserNotificationCategory.openSummary
+                    || (action == UNNotificationDefaultActionIdentifier
+                        && category == UserNotificationCategory.ready) {
+                Self.coordinator?.openMeetingSummary(meetingID)
+            } else if let meetingID,
+                      action == UserNotificationCategory.reviewTranscript
+                        || (action == UNNotificationDefaultActionIdentifier
+                            && category == UserNotificationCategory.failed) {
+                Self.coordinator?.openMeetingTranscript(meetingID)
+            }
+            if meetingID != nil { NSApp.activate(ignoringOtherApps: true) }
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

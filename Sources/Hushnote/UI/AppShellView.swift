@@ -896,7 +896,8 @@ private struct SidebarNavigationView: View {
                         ForEach(meetings.prefix(8)) { meeting in
                             SidebarNavigationRow(
                                 title: meeting.title,
-                                subtitle: meeting.startedAt.formatted(.dateTime.month(.abbreviated).day()),
+                                subtitle: state.finalizationETAs[meeting.id]?.userFacingText
+                                    ?? meeting.startedAt.formatted(.dateTime.month(.abbreviated).day()),
                                 systemImage: "doc.text",
                                 isSelected: state.selection == .meeting(meeting.id)
                             ) { coordinator.setSelection(.meeting(meeting.id)) }
@@ -1562,6 +1563,11 @@ struct MeetingsHomeView: View {
                 .lineLimit(2)
                 .foregroundStyle(HushnoteTheme.secondaryInk)
                 .fixedSize(horizontal: false, vertical: true)
+            if let eta = state.finalizationETAs[meeting.id] {
+                Text(eta.userFacingText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(HushnoteTheme.vermilionInk)
+            }
             HStack(spacing: 9) {
                 Text(meeting.template.rawValue)
                 Text("·")

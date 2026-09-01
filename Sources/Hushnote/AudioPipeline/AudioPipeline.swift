@@ -58,7 +58,9 @@ public actor AudioPipeline {
     private var microphoneConfigurationGeneration: UInt64 = 0
     private var systemCaptureGeneration: UInt64 = 0
     private var isReconfiguringSystemCapture = false
+    private var isReconfiguringMicrophone = false
     private var activeMicrophoneTakeID: UUID?
+    private var microphoneFollowsDefaultInput = false
     private var currentStatus: AudioCaptureStatus = .idle
     private var sessionID: UUID?
     private var sessionDirectory: URL?
@@ -321,7 +323,7 @@ public actor AudioPipeline {
 
         statusBeforeSleep = currentStatus
         microphoneWasEnabledBeforeSleep = microphoneCapture != nil
-        microphoneDeviceUIDBeforeSleep = selectedMicrophone?.id
+        microphoneDeviceUIDBeforeSleep = microphoneFollowsDefaultInput ? nil : selectedMicrophone?.id
         timeline.suspend(reason: .sleep, at: monotonicSeconds)
         let boundary = timeline.positionMilliseconds
 
@@ -461,6 +463,7 @@ public actor AudioPipeline {
         }
         let generation = advanceMicrophoneConfigurationGeneration()
         if !isEnabled {
+            isReconfiguringMicrophone = false
             await closeMicrophoneTake()
             if microphoneConfigurationGeneration == generation {
                 eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .disabled)))
@@ -474,6 +477,7 @@ public actor AudioPipeline {
         }
         if microphoneCapture != nil { await closeMicrophoneTake() }
         guard microphoneConfigurationGeneration == generation else { return }
+        isReconfiguringMicrophone = false
         try await startMicrophone(deviceUID: deviceUID, generation: generation)
     }
 
@@ -597,6 +601,7 @@ public actor AudioPipeline {
         else { return }
 
         isReconfiguringSystemCapture = true
+        defer { isReconfiguringSystemCapture = false }
         _ = advanceSystemCaptureGeneration()
         closeSystemTake()
         let boundary = timeline.positionMilliseconds
@@ -623,7 +628,6 @@ public actor AudioPipeline {
                     timeline: timeline,
                     paused: currentStatus == .paused
                 )
-                isReconfiguringSystemCapture = false
                 eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
                 return
             } catch {
@@ -631,7 +635,6 @@ public actor AudioPipeline {
             }
         }
 
-        isReconfiguringSystemCapture = false
         let message = finalError?.localizedDescription
             ?? "The system audio device did not become available."
         eventContinuation.yield(.sourceHealth(.init(
@@ -730,6 +733,7 @@ public actor AudioPipeline {
         guard microphoneConfigurationGeneration == generation else { return }
         let takeID = UUID()
         activeMicrophoneTakeID = takeID
+        microphoneFollowsDefaultInput = deviceUID == nil
         eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .arming)))
         let url = try Self.allocateTakeURL(for: .microphone, in: sessionDirectory)
         let output = try CaptureOutputBridge(
@@ -755,6 +759,30 @@ public actor AudioPipeline {
                 selectedDeviceUID: deviceUID,
                 sampleHandler: { [weak output] buffer, presentationSeconds in
                     output?.consume(buffer, presentationSeconds: presentationSeconds)
+                },
+                noticeHandler: { [weak self] notice in
+                    switch notice {
+                    case .failure(let message):
+                        Task {
+                            await self?.microphoneDidFail(
+                                message,
+                                session: sessionID,
+                                takeID: takeID
+                            )
+                        }
+                    case .reconfigure(let kind, let detail):
+                        Task {
+                            await self?.microphoneNeedsReconfiguration(
+                                kind: kind,
+                                detail: detail,
+                                session: sessionID,
+                                takeID: takeID,
+                                generation: generation
+                            )
+                        }
+                    case .dropped:
+                        break
+                    }
                 }
             )
             guard sessionID == self.sessionID,
@@ -782,6 +810,7 @@ public actor AudioPipeline {
             microphoneOutput = output
             microphoneCapture = capture
             selectedMicrophone = device
+            microphoneFollowsDefaultInput = deviceUID == nil
             eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .healthy)))
         } catch {
             try? await capture.stop()
@@ -852,7 +881,70 @@ public actor AudioPipeline {
 
     func microphoneDidFail(_ message: String, session: UUID, takeID: UUID) async {
         guard sessionID == session, activeMicrophoneTakeID == takeID else { return }
+        isReconfiguringMicrophone = false
         await closeMicrophoneTake()
+        eventContinuation.yield(.sourceHealth(.init(
+            source: .microphone,
+            state: .unavailable(message)
+        )))
+    }
+
+    /// Rotates only the microphone take after Core Audio reports that the
+    /// selected input disappeared, changed format, or stopped delivering
+    /// callbacks. The shared timeline remains owned by system capture, so a
+    /// microphone outage never inserts a gap or pauses a healthy meeting.
+    private func microphoneNeedsReconfiguration(
+        kind: AudioCaptureTransitionKind,
+        detail: String?,
+        session: UUID,
+        takeID: UUID,
+        generation: UInt64
+    ) async {
+        guard sessionID == session,
+              activeMicrophoneTakeID == takeID,
+              microphoneConfigurationGeneration == generation,
+              !isReconfiguringMicrophone,
+              !isSleeping,
+              currentStatus == .recording || currentStatus == .paused,
+              let timeline
+        else { return }
+
+        isReconfiguringMicrophone = true
+        defer { isReconfiguringMicrophone = false }
+        let deviceUID = selectedMicrophone?.id
+        let followsDefault = microphoneFollowsDefaultInput
+        await closeMicrophoneTake()
+        let boundary = timeline.positionMilliseconds
+        eventContinuation.yield(.transition(.init(
+            source: .microphone,
+            kind: kind,
+            timelineMilliseconds: boundary,
+            detail: detail
+        )))
+        eventContinuation.yield(.sourceHealth(.init(source: .microphone, state: .arming)))
+
+        var finalError: Error?
+        for delay in reconfigurationRetryDelays {
+            await reconfigurationSleep(delay)
+            guard sessionID == session,
+                  isReconfiguringMicrophone,
+                  microphoneConfigurationGeneration == generation,
+                  !isSleeping,
+                  currentStatus == .recording || currentStatus == .paused
+            else { return }
+            do {
+                try await startMicrophone(
+                    deviceUID: followsDefault ? nil : deviceUID,
+                    generation: generation
+                )
+                return
+            } catch {
+                finalError = error
+            }
+        }
+
+        let message = finalError?.localizedDescription
+            ?? "The microphone did not become available."
         eventContinuation.yield(.sourceHealth(.init(
             source: .microphone,
             state: .unavailable(message)
@@ -878,7 +970,9 @@ public actor AudioPipeline {
         statusBeforeSleep = nil
         microphoneWasEnabledBeforeSleep = false
         microphoneDeviceUIDBeforeSleep = nil
+        microphoneFollowsDefaultInput = false
         isReconfiguringSystemCapture = false
+        isReconfiguringMicrophone = false
     }
 
     var microphoneTakeIdentifier: UUID? { activeMicrophoneTakeID }

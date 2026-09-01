@@ -29,6 +29,10 @@ struct RecordingSourceDiagnostics: Equatable, Sendable {
     /// Seconds since this source last carried audible energy. `nil` means the
     /// source has not established an audible baseline yet.
     let lastAudibleAge: TimeInterval?
+    /// Meeting-relative sample-clock position of the last audible window.
+    /// Unlike an age alone this survives a source update without accumulating
+    /// wall-clock drift and gives tests a stable, inspectable evidence point.
+    let lastAudibleTimestampMilliseconds: Int64?
     let droppedBufferCount: Int
 
     init(
@@ -38,6 +42,7 @@ struct RecordingSourceDiagnostics: Equatable, Sendable {
         lifecycle: RecordingSourceLifecycle = .healthy,
         durableWriterAdvanced: Bool = true,
         lastAudibleAge: TimeInterval? = 0,
+        lastAudibleTimestampMilliseconds: Int64? = nil,
         droppedBufferCount: Int = 0
     ) {
         self.source = source
@@ -46,10 +51,33 @@ struct RecordingSourceDiagnostics: Equatable, Sendable {
         self.lifecycle = lifecycle
         self.durableWriterAdvanced = durableWriterAdvanced
         self.lastAudibleAge = lastAudibleAge
+        self.lastAudibleTimestampMilliseconds = lastAudibleTimestampMilliseconds
         self.droppedBufferCount = max(0, droppedBufferCount)
     }
 
     var participatesInConfidence: Bool { isExpected && isEnabled }
+}
+
+/// A small, source-independent gate for turning level callbacks into silence
+/// evidence. It deliberately uses RMS (rather than peak) so a single click or
+/// converter spike cannot make an otherwise silent microphone look healthy.
+enum RecordingSourceSilencePolicy {
+    static let rmsThreshold: Float = 0.015
+
+    nonisolated static func isAudible(rms: Float, peak: Float) -> Bool {
+        rms >= rmsThreshold || (peak >= 0.08 && rms >= rmsThreshold * 0.5)
+    }
+
+    nonisolated static func age(
+        currentTimelineMilliseconds: Int64,
+        lastAudibleTimestampMilliseconds: Int64?
+    ) -> TimeInterval? {
+        guard let lastAudibleTimestampMilliseconds else { return nil }
+        return Double(max(
+            0,
+            currentTimelineMilliseconds - lastAudibleTimestampMilliseconds
+        )) / 1_000
+    }
 }
 
 enum RecordingLiveTextLifecycle: Equatable, Sendable {

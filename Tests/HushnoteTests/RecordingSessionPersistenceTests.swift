@@ -400,6 +400,102 @@ final class RecordingSessionPersistenceTests: XCTestCase {
         XCTAssertNil(recoveredJob?.startedAt)
     }
 
+    func testQueuedFinalizationJobsAreReturnedInFIFOOrderAndSkipDeletedMeetings() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let olderMeeting = Meeting(title: "Older queued")
+        let newerMeeting = Meeting(title: "Newer queued")
+        let deletedMeeting = Meeting(title: "Deleted queued")
+        try await store.saveMeeting(olderMeeting)
+        try await store.saveMeeting(newerMeeting)
+        try await store.saveMeeting(deletedMeeting)
+
+        func makeSession(for meeting: Meeting) -> RecordingSession {
+            RecordingSession(
+                meetingID: meeting.id,
+                ordinal: 0,
+                origin: .live,
+                wallStartedAt: Date(timeIntervalSince1970: 1),
+                timelineStartMilliseconds: 0,
+                capturedDurationMilliseconds: 1_000,
+                state: .captured
+            )
+        }
+        let olderSession = makeSession(for: olderMeeting)
+        let newerSession = makeSession(for: newerMeeting)
+        let deletedSession = makeSession(for: deletedMeeting)
+        try await store.saveRecordingSession(olderSession)
+        try await store.saveRecordingSession(newerSession)
+        try await store.saveRecordingSession(deletedSession)
+
+        let olderJob = FinalizationJob(
+            sessionID: olderSession.id,
+            modelID: "base",
+            queuedAt: Date(timeIntervalSince1970: 10),
+            audioDurationMilliseconds: 1_000
+        )
+        let newerJob = FinalizationJob(
+            sessionID: newerSession.id,
+            modelID: "base",
+            queuedAt: Date(timeIntervalSince1970: 20),
+            audioDurationMilliseconds: 1_000
+        )
+        let deletedJob = FinalizationJob(
+            sessionID: deletedSession.id,
+            modelID: "base",
+            queuedAt: Date(timeIntervalSince1970: 1),
+            audioDurationMilliseconds: 1_000
+        )
+        try await store.enqueueFinalizationJob(olderJob)
+        try await store.enqueueFinalizationJob(newerJob)
+        try await store.enqueueFinalizationJob(deletedJob)
+        try await store.softDeleteMeeting(id: deletedMeeting.id)
+
+        let queued = try await store.queuedFinalizationJobs()
+        XCTAssertEqual(queued.map(\.id), [olderJob.id, newerJob.id])
+    }
+
+    func testRunningFinalizationCanBeRequeuedWhenCaptureTakesOwnership() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let meeting = Meeting(title: "Capture takes ownership")
+        try await store.saveMeeting(meeting)
+        let session = RecordingSession(
+            meetingID: meeting.id,
+            ordinal: 0,
+            origin: .live,
+            wallStartedAt: Date(timeIntervalSince1970: 10),
+            timelineStartMilliseconds: 0,
+            capturedDurationMilliseconds: 1_000,
+            state: .captured
+        )
+        try await store.saveRecordingSession(session)
+        let job = FinalizationJob(
+            sessionID: session.id,
+            modelID: "base",
+            queuedAt: Date(timeIntervalSince1970: 20),
+            audioDurationMilliseconds: 1_000
+        )
+        try await store.enqueueFinalizationJob(job)
+        guard let claimed = try await store.claimNextFinalizationJob(
+            liveCaptureActive: false,
+            at: Date(timeIntervalSince1970: 21)
+        ) else {
+            XCTFail("Expected the queued job to be claimed")
+            return
+        }
+        let requeued = try await store.requeueRunningFinalizationJob(
+            id: claimed.id,
+            at: Date(timeIntervalSince1970: 22)
+        )
+
+        XCTAssertEqual(requeued.state, .queued)
+        XCTAssertEqual(requeued.attemptCount, 1)
+        XCTAssertNil(requeued.startedAt)
+        let queuedIDs = try await store.queuedFinalizationJobs().map(\.id)
+        let requeuedSession = try await store.recordingSession(id: session.id)
+        XCTAssertEqual(queuedIDs, [job.id])
+        XCTAssertEqual(requeuedSession?.state, .captured)
+    }
+
     func testFailedFinalizationAndSoftDeletionPreserveSourceOriginals() async throws {
         let store = try MeetingStore(inMemory: ())
         let meeting = Meeting(title: "Recoverable failure")

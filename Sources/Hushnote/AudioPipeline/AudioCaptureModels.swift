@@ -108,11 +108,21 @@ public struct AudioLevel: Equatable, Sendable {
     public let source: AudioSource
     public let rms: Float
     public let peak: Float
+    /// The end of the normalized audio window that produced this level. The
+    /// sample-clock position lets the diagnostics layer distinguish silence
+    /// from a stalled callback without borrowing wall-clock time.
+    public let timelineMilliseconds: Int64?
 
-    public init(source: AudioSource, rms: Float, peak: Float) {
+    public init(
+        source: AudioSource,
+        rms: Float,
+        peak: Float,
+        timelineMilliseconds: Int64? = nil
+    ) {
         self.source = source
         self.rms = rms
         self.peak = peak
+        self.timelineMilliseconds = timelineMilliseconds
     }
 }
 

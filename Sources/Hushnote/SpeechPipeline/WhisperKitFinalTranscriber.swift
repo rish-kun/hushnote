@@ -131,6 +131,8 @@ public actor WhisperKitFinalTranscriber {
             // several files with the same source role.
             var ordinal = nextOrdinal[source, default: 0]
             let timelineOffset = ordered[index].timelineStartMilliseconds
+            let trackSpeakerID = ordered[index].speakerID
+            let trackSpeakerName = ordered[index].speakerName
             for item in transcription {
                 segments.append(contentsOf: item.segments.map { segment in
                     let start = timelineOffset + milliseconds(segment.start)
@@ -163,6 +165,8 @@ public actor WhisperKitFinalTranscriber {
                         endMilliseconds: end,
                         text: WhisperSpecialToken.cleanedSegmentText(segment.text),
                         words: words,
+                        speakerID: trackSpeakerID,
+                        speakerName: trackSpeakerName,
                         confidence: exp(segment.avgLogprob),
                         stability: .final
                     )

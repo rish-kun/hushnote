@@ -686,6 +686,31 @@ public actor MeetingStore {
         }
     }
 
+    /// Marks the terminal notification as delivered exactly once. Returning
+    /// nil means another worker (or a previous launch) already recorded it.
+    /// The write intentionally does not alter the processing/session state.
+    @discardableResult
+    public func markFinalizationNotificationSent(
+        id: UUID,
+        at date: Date = Date()
+    ) throws -> FinalizationJob? {
+        try database.write { db in
+            guard let record = try FinalizationJobRecord.fetchOne(db, key: id.uuidString)
+            else { throw PersistenceError.finalizationJobNotFound(id) }
+            guard let state = FinalizationJobState(rawValue: record.state),
+                  state == .succeeded || state == .failed else {
+                throw PersistenceError.invalidFinalizationJob(
+                    "only a terminal job can be marked as notified"
+                )
+            }
+            guard record.completionNotifiedAt == nil else { return nil }
+            var job = try record.model()
+            job.completionNotifiedAt = date
+            try FinalizationJobRecord(job).updateChanges(db, from: record)
+            return job
+        }
+    }
+
     /// Atomically claims the oldest queued session job.
     ///
     /// Capture ownership is an explicit input so a scheduler cannot begin a
@@ -726,6 +751,79 @@ public actor MeetingStore {
         }
     }
 
+    /// Returns the work that can be resumed by a fresh process, in FIFO order.
+    ///
+    /// Running jobs are normalized back to `queued` by
+    /// `recoverInterruptedRecordingWork()` before this query is used. Failed
+    /// jobs intentionally stay out of this list: their audio is retained, but
+    /// retrying a user-visible failure is an explicit action. Excluding deleted
+    /// meetings also means a stale queue row can never resurrect a trashed
+    /// meeting during bootstrap.
+    public func queuedFinalizationJobs() throws -> [FinalizationJob] {
+        try database.read { db in
+            try FinalizationJobRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT jobs.*
+                    FROM finalizationJobs AS jobs
+                    JOIN recordingSessions AS sessions ON sessions.id = jobs.sessionID
+                    JOIN meetings ON meetings.id = sessions.meetingID
+                    WHERE jobs.state = ? AND meetings.deletedAt IS NULL
+                    ORDER BY jobs.queuedAt, jobs.id
+                    """,
+                arguments: [FinalizationJobState.queued.rawValue]
+            ).map { try $0.model() }
+        }
+    }
+
+    /// Recent measured runs seed ETA ranges after relaunch. Only successful
+    /// jobs with a valid real-time factor are evidence for future estimates.
+    public func recentCompletedFinalizationJobs(limit: Int = 32) throws -> [FinalizationJob] {
+        try database.read { db in
+            try FinalizationJobRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT *
+                    FROM finalizationJobs
+                    WHERE state = ? AND realtimeFactor IS NOT NULL
+                    ORDER BY finishedAt DESC, id
+                    LIMIT ?
+                    """,
+                arguments: [FinalizationJobState.succeeded.rawValue, max(1, limit)]
+            ).map { try $0.model() }
+        }
+    }
+
+    /// Puts an in-flight job back into the durable queue without consuming a
+    /// retry attempt. This closes the race where a new live capture starts
+    /// while a background worker is between its scheduler check and its first
+    /// decoder await.
+    @discardableResult
+    public func requeueRunningFinalizationJob(
+        id: UUID,
+        at queuedAt: Date = Date()
+    ) throws -> FinalizationJob {
+        try database.write { db in
+            guard let record = try FinalizationJobRecord.fetchOne(db, key: id.uuidString)
+            else { throw PersistenceError.finalizationJobNotFound(id) }
+            var job = try record.model()
+            guard FinalizationJobTransitionPolicy.isRunning(job.state) else {
+                throw PersistenceError.invalidFinalizationJob(
+                    "only a running job can be returned to the queue"
+                )
+            }
+            job.state = .queued
+            job.progress = 0
+            job.queuedAt = queuedAt
+            job.startedAt = nil
+            job.finishedAt = nil
+            job.errorMessage = nil
+            try FinalizationJobRecord(job).updateChanges(db, from: record)
+            try Self.updateSessionState(id: job.sessionID, to: .captured, in: db)
+            return job
+        }
+    }
+
     /// Returns a failed job to the queue without consuming a retry attempt.
     /// The attempt is counted only when a worker successfully claims it.
     @discardableResult
@@ -746,6 +844,9 @@ public actor MeetingStore {
             job.startedAt = nil
             job.finishedAt = nil
             job.errorMessage = nil
+            // A retry is a new terminal outcome: a previously delivered
+            // failure must not suppress the eventual ready notification.
+            job.completionNotifiedAt = nil
             try FinalizationJobRecord(job).updateChanges(db, from: record)
             try Self.updateSessionState(id: job.sessionID, to: .captured, in: db)
             return job

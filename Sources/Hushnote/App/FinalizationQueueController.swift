@@ -18,6 +18,23 @@ struct FinalizationETARange: Equatable, Sendable {
         self.lowerBoundSeconds = max(0, lowerBoundSeconds)
         self.upperBoundSeconds = max(self.lowerBoundSeconds, upperBoundSeconds)
     }
+
+    /// Human-readable copy intentionally stays a range. A single countdown
+    /// would imply precision the model cannot provide, especially on a first
+    /// run or while Core ML is loading.
+    var userFacingText: String {
+        guard upperBoundSeconds > 0 else { return "Almost ready" }
+        if upperBoundSeconds < 60 {
+            return "About \(lowerBoundSeconds)–\(upperBoundSeconds) sec left"
+        }
+        if lowerBoundSeconds < 60 {
+            let upperMinutes = max(1, Int(ceil(Double(upperBoundSeconds) / 60)))
+            return "About \(lowerBoundSeconds) sec–\(upperMinutes) min left"
+        }
+        let lowerMinutes = max(1, Int(ceil(Double(lowerBoundSeconds) / 60)))
+        let upperMinutes = max(lowerMinutes, Int(ceil(Double(upperBoundSeconds) / 60)))
+        return "About \(lowerMinutes)–\(upperMinutes) min left"
+    }
 }
 
 /// A deliberately broad estimate. Recent measurements for the selected model
