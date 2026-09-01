@@ -450,6 +450,62 @@ struct RecordingMarkerRecord: Codable, FetchableRecord, PersistableRecord, Table
     }
 }
 
+struct MeetingScreenshotRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "meetingScreenshots"
+
+    var id: String
+    var meetingID: String
+    var recordingSessionID: String?
+    var relativeFilePath: String
+    var timelineMilliseconds: Int64
+    var capturedAt: Date
+    var displayID: Int64
+    var pixelWidth: Int
+    var pixelHeight: Int
+
+    init(_ screenshot: MeetingScreenshot) {
+        id = screenshot.id.uuidString
+        meetingID = screenshot.meetingID.uuidString
+        recordingSessionID = screenshot.recordingSessionID?.uuidString
+        relativeFilePath = screenshot.relativeFilePath
+        timelineMilliseconds = screenshot.timelineMilliseconds
+        capturedAt = screenshot.capturedAt
+        displayID = Int64(screenshot.displayID)
+        pixelWidth = screenshot.pixelWidth
+        pixelHeight = screenshot.pixelHeight
+    }
+
+    func model() throws -> MeetingScreenshot {
+        guard let id = UUID(uuidString: id),
+              let meetingID = UUID(uuidString: meetingID) else {
+            throw PersistenceError.corruptRecord("meeting screenshot \(self.id)")
+        }
+        let sessionID: UUID?
+        if let recordingSessionID {
+            guard let parsed = UUID(uuidString: recordingSessionID) else {
+                throw PersistenceError.corruptRecord("meeting screenshot \(self.id)")
+            }
+            sessionID = parsed
+        } else {
+            sessionID = nil
+        }
+        guard displayID >= 0, displayID <= Int64(UInt32.max) else {
+            throw PersistenceError.corruptRecord("meeting screenshot \(self.id)")
+        }
+        return MeetingScreenshot(
+            id: id,
+            meetingID: meetingID,
+            recordingSessionID: sessionID,
+            relativeFilePath: relativeFilePath,
+            timelineMilliseconds: timelineMilliseconds,
+            capturedAt: capturedAt,
+            displayID: UInt32(displayID),
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        )
+    }
+}
+
 struct FinalizationJobRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
     static let databaseTableName = "finalizationJobs"
 
@@ -714,6 +770,8 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     case invalidAudioTake(String)
     case invalidRecordingEvent(String)
     case invalidRecordingMarker(String)
+    case screenshotNotFound(UUID)
+    case invalidScreenshot(String)
     case invalidFinalizationJob(String)
     case corruptRecord(String)
     case invalidSearchQuery
@@ -736,6 +794,8 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
         case .invalidAudioTake(let reason): "Invalid audio take: \(reason)"
         case .invalidRecordingEvent(let reason): "Invalid recording event: \(reason)"
         case .invalidRecordingMarker(let reason): "Invalid recording marker: \(reason)"
+        case .screenshotNotFound(let id): "Screenshot \(id) does not exist."
+        case .invalidScreenshot(let reason): "Invalid meeting screenshot: \(reason)"
         case .invalidFinalizationJob(let reason): "Invalid finalization job: \(reason)"
         case .corruptRecord(let description): "The database contains a corrupt \(description)."
         case .invalidSearchQuery: "Enter at least one searchable word."

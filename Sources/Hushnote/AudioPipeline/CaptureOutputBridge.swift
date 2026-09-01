@@ -19,6 +19,10 @@ final class CaptureOutputBridge: @unchecked Sendable {
     private let timelineStartMilliseconds: Int64
     private var firstRecordedStartMilliseconds: Int64?
     private var committedDurationMilliseconds: Int64 = 0
+    /// A source is verified only after its first non-empty recovery write. The
+    /// bridge is recreated for every take, so this naturally re-arms after a
+    /// device transition, wake, or retry.
+    private var emittedDurableHealth = false
     // One resampler for the whole session: its polyphase filter state has to
     // stay continuous across tap callbacks.
     private let resampler = SpeechFeedResampler(targetSampleRate: 16_000)
@@ -164,6 +168,18 @@ final class CaptureOutputBridge: @unchecked Sendable {
                 else { return }
                 if firstRecordedStartMilliseconds == nil {
                     firstRecordedStartMilliseconds = recorded.range.startMilliseconds
+                }
+
+                // The source writer has already accepted the frames above.
+                // Verify system audio at this durable boundary, not when the
+                // device merely reports that it started. Microphone writes
+                // remain source-local and must never establish system capture.
+                if source == .system, !emittedDurableHealth {
+                    emittedDurableHealth = true
+                    eventContinuation.yield(.sourceHealth(.init(
+                        source: .system,
+                        state: .healthy
+                    )))
                 }
 
                 let sampleRate = resampler.targetSampleRate

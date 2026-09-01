@@ -39,6 +39,25 @@ struct FloatingPanelPositioning {
         return clamp(savedOrigin, panelSize: panelSize, to: target)
     }
 
+    /// Returns an origin for a resize that keeps the panel's top edge fixed,
+    /// then keeps the resized frame inside the display it belongs to.
+    static func originPreservingTopEdge(
+        currentFrame: CGRect,
+        newSize: CGSize,
+        visibleFrames: [CGRect],
+        defaultVisibleFrame: CGRect? = nil
+    ) -> CGPoint {
+        clampedOrigin(
+            savedOrigin: CGPoint(
+                x: currentFrame.minX,
+                y: currentFrame.maxY - newSize.height
+            ),
+            panelSize: newSize,
+            visibleFrames: visibleFrames,
+            defaultVisibleFrame: defaultVisibleFrame
+        )
+    }
+
     private static func clamp(_ origin: CGPoint, panelSize: CGSize, to frame: CGRect) -> CGPoint {
         let maximumX = max(frame.minX, frame.maxX - panelSize.width)
         let maximumY = max(frame.minY, frame.maxY - panelSize.height)
@@ -64,6 +83,18 @@ struct FloatingPanelPositioning {
 }
 
 enum FloatingRecordingPanelPolicy {
+    /// The controller owns these dimensions instead of asking SwiftUI for a
+    /// transient fitting size while its hierarchy is changing.
+    static let compactPanelSize = CGSize(width: 390, height: 64)
+    // ExpandedRecordingPanel has a 370x352 frame and the content container
+    // contributes 8pt of padding on every edge.
+    static let expandedPanelSize = CGSize(width: 386, height: 368)
+    static let expandedContentSize = CGSize(width: 370, height: 352)
+
+    nonisolated static func panelSize(isExpanded: Bool) -> CGSize {
+        isExpanded ? expandedPanelSize : compactPanelSize
+    }
+
     nonisolated static func showsExpandedContent(
         requested: Bool,
         phase: RecordingPhase
@@ -82,6 +113,158 @@ enum FloatingRecordingPanelPolicy {
     }
 }
 
+/// The panel-facing boundary for a visual snapshot. The capture service owns
+/// screen selection, permissions, and durable attachment storage; the pill
+/// only needs to await completion so it can give deterministic feedback.
+typealias FloatingRecordingPanelSnapshotAction = @MainActor () async throws -> Void
+
+enum FloatingRecordingPanelSnapshotError: LocalizedError {
+    case unavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "Snapshot capture is unavailable right now."
+        }
+    }
+}
+
+enum FloatingSnapshotPolicy {
+    enum State: Equatable, Sendable {
+        case idle
+        case saving
+        case saved
+        case failed(String)
+
+        var buttonTitle: String {
+            switch self {
+            case .idle: "Snapshot"
+            case .saving: "Saving…"
+            case .saved: "Saved"
+            case .failed: "Try again"
+            }
+        }
+
+        var isActionEnabled: Bool {
+            switch self {
+            case .idle, .failed: true
+            case .saving, .saved: false
+            }
+        }
+
+        var accessibilityLabel: String {
+            switch self {
+            case .idle: "Take a screenshot of the display under the pointer"
+            case .saving: "Saving screenshot"
+            case .saved: "Screenshot saved to this meeting"
+            case .failed: "Retry screenshot"
+            }
+        }
+
+        var helpText: String {
+            switch self {
+            case .idle: "Save a screenshot of the display under the pointer to this meeting"
+            case .saving: "Saving screenshot to this meeting"
+            case .saved: "Screenshot saved to this meeting"
+            case .failed(let message): message
+            }
+        }
+    }
+
+    nonisolated static func canStart(_ state: State) -> Bool {
+        state.isActionEnabled
+    }
+}
+
+/// Presentation and interaction rules for the microphone control in the
+/// expanded recording panel. The panel keeps a request pending until the
+/// coordinator's serialized configuration task finishes; diagnostics then
+/// distinguish a healthy source from a source-specific setup failure.
+enum FloatingMicrophoneControlPolicy {
+    enum State: Equatable, Sendable {
+        case on
+        case off
+        case turningOn
+        case turningOff
+        case unavailable
+
+        var statusText: String {
+            switch self {
+            case .on: "On"
+            case .off: "Off"
+            case .turningOn: "Turning on…"
+            case .turningOff: "Turning off…"
+            case .unavailable: "Unavailable"
+            }
+        }
+
+        var actionTitle: String {
+            switch self {
+            case .on: "Turn off"
+            case .off: "Turn on"
+            case .turningOn: "Turning on…"
+            case .turningOff: "Turning off…"
+            case .unavailable: "Try again"
+            }
+        }
+
+        var isActionEnabled: Bool {
+            switch self {
+            case .turningOn, .turningOff: false
+            case .on, .off, .unavailable: true
+            }
+        }
+    }
+
+    nonisolated static func state(
+        enabled: Bool,
+        lifecycle: RecordingSourceLifecycle,
+        pendingRequest: Bool?
+    ) -> State {
+        if pendingRequest == true { return .turningOn }
+        if pendingRequest == false { return .turningOff }
+        if lifecycle == .unavailable { return .unavailable }
+        if lifecycle == .arming { return enabled ? .turningOn : .turningOff }
+        return enabled ? .on : .off
+    }
+
+    /// Returns the next desired value, or nil while an earlier request is
+    /// still in flight. This is the pure gate that keeps rapid clicks from
+    /// building a second toggle atop a queued coordinator request.
+    nonisolated static func requestedValue(
+        enabled: Bool,
+        lifecycle: RecordingSourceLifecycle,
+        pendingRequest: Bool?
+    ) -> Bool? {
+        guard pendingRequest == nil else { return nil }
+        // An unavailable source means the desired preference is still on but
+        // setup failed. Retry that intent; do not interpret the retry as a
+        // request to disable the microphone.
+        if retriesUnavailableSource(lifecycle) { return true }
+        return !enabled
+    }
+
+    nonisolated static func retriesUnavailableSource(
+        _ lifecycle: RecordingSourceLifecycle
+    ) -> Bool {
+        lifecycle == .unavailable
+    }
+
+    /// A queued request is allowed to reach the capture pipeline only while
+    /// it still describes the user's latest intent. This prevents an older
+    /// suspended request (for example, "on") from being applied after a
+    /// newer request ("off") has already updated the desired state.
+    nonisolated static func requestIsCurrent(
+        requestedEnabled: Bool,
+        requestedMicrophone: PreferredMicrophone?,
+        currentEnabled: Bool,
+        currentMicrophone: PreferredMicrophone?
+    ) -> Bool {
+        requestedEnabled == currentEnabled
+            && requestedMicrophone == currentMicrophone
+    }
+}
+
 private extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
 }
@@ -91,6 +274,7 @@ private extension CGRect {
 final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
     @ObservationIgnored private let state: AppViewState
     @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let snapshotAction: FloatingRecordingPanelSnapshotAction
     @ObservationIgnored private let panel: NSPanel
     @ObservationIgnored private var isRestoringPosition = false
 
@@ -100,13 +284,20 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
     init(
         state: AppViewState,
         coordinator: AppCoordinator,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        snapshotAction: @escaping FloatingRecordingPanelSnapshotAction = {
+            throw FloatingRecordingPanelSnapshotError.unavailable
+        }
     ) {
         self.state = state
         self.defaults = defaults
+        self.snapshotAction = snapshotAction
 
         panel = NSPanel(
-            contentRect: CGRect(origin: .zero, size: CGSize(width: 390, height: 64)),
+            contentRect: CGRect(
+                origin: .zero,
+                size: FloatingRecordingPanelPolicy.compactPanelSize
+            ),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -123,13 +314,18 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         panel.animationBehavior = .utilityWindow
 
         super.init()
-        let content = FloatingRecordingPanelContent { [weak self] in
-            self?.resizeToFitContent()
+        let content = FloatingRecordingPanelContent { [weak self] isExpanded in
+            self?.applyPanelSize(isExpanded: isExpanded)
+        } onSnapshot: { [snapshotAction] in
+            try await snapshotAction()
         }
         .environment(state)
         .environment(coordinator)
         let hostingView = NSHostingView(rootView: content)
-        hostingView.sizingOptions = [.preferredContentSize]
+        // The controller owns the panel frame. Letting AppKit infer it from
+        // SwiftUI's preferred size reintroduces the expansion measurement
+        // race this controller is responsible for avoiding.
+        hostingView.sizingOptions = []
         panel.contentView = hostingView
         panel.delegate = self
 
@@ -142,6 +338,14 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
 
         observePhase()
         syncVisibility()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
 
     @objc private func screenParametersDidChange() {
@@ -169,12 +373,6 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
     private func syncVisibility() {
         switch state.recordingPhase {
         case .preparing, .recording, .paused, .finalizing:
-            panel.contentView?.layoutSubtreeIfNeeded()
-            if let fittingSize = panel.contentView?.fittingSize,
-               fittingSize.width > 0,
-               fittingSize.height > 0 {
-                panel.setContentSize(fittingSize)
-            }
             restoreAndClampPosition()
             panel.orderFrontRegardless()
         case .idle, .failed:
@@ -182,32 +380,20 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func resizeToFitContent() {
-        Task { @MainActor [weak self] in
-            // Let SwiftUI commit the expanded/collapsed hierarchy before
-            // asking AppKit for its preferred size.
-            await Task.yield()
-            guard let self, let contentView = self.panel.contentView else { return }
-            contentView.layoutSubtreeIfNeeded()
-            let fittingSize = contentView.fittingSize
-            guard fittingSize.width > 0, fittingSize.height > 0 else { return }
+    private func applyPanelSize(isExpanded: Bool) {
+        let size = FloatingRecordingPanelPolicy.panelSize(isExpanded: isExpanded)
+        guard panel.frame.size != size else { return }
 
-            let previousTop = self.panel.frame.maxY
-            self.panel.setContentSize(fittingSize)
-            let proposed = CGPoint(
-                x: self.panel.frame.minX,
-                y: previousTop - self.panel.frame.height
-            )
-            let origin = FloatingPanelPositioning.clampedOrigin(
-                savedOrigin: proposed,
-                panelSize: self.panel.frame.size,
-                visibleFrames: NSScreen.screens.map(\.visibleFrame),
-                defaultVisibleFrame: NSScreen.main?.visibleFrame
-            )
-            self.isRestoringPosition = true
-            self.panel.setFrameOrigin(origin)
-            self.isRestoringPosition = false
-        }
+        let origin = FloatingPanelPositioning.originPreservingTopEdge(
+            currentFrame: panel.frame,
+            newSize: size,
+            visibleFrames: NSScreen.screens.map(\.visibleFrame),
+            defaultVisibleFrame: NSScreen.main?.visibleFrame
+        )
+        panel.setContentSize(size)
+        isRestoringPosition = true
+        panel.setFrameOrigin(origin)
+        isRestoringPosition = false
     }
 
     private func restoreAndClampPosition() {
@@ -234,7 +420,8 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
 }
 
 private struct FloatingRecordingPanelContent: View {
-    let onSizeChange: @MainActor () -> Void
+    let onSizeChange: @MainActor (Bool) -> Void
+    let onSnapshot: @MainActor () async throws -> Void
     @Environment(AppViewState.self) private var state
     @State private var isExpanded = false
 
@@ -244,17 +431,20 @@ private struct FloatingRecordingPanelContent: View {
                 requested: isExpanded,
                 phase: state.recordingPhase
             ) {
-                ExpandedRecordingPanel {
-                    isExpanded = false
-                    onSizeChange()
-                }
+                ExpandedRecordingPanel(
+                    collapse: {
+                        isExpanded = false
+                        onSizeChange(false)
+                    },
+                    onSnapshot: onSnapshot
+                )
             } else {
                 HStack(spacing: 6) {
                     RecordingPill()
                     if state.recordingPhase.isCapturing {
                         Button {
                             isExpanded = true
-                            onSizeChange()
+                            onSizeChange(true)
                         } label: {
                             Image(systemName: "chevron.down")
                                 .font(.caption2.weight(.semibold))
@@ -276,20 +466,23 @@ private struct FloatingRecordingPanelContent: View {
         .onExitCommand {
             guard isExpanded else { return }
             isExpanded = false
-            onSizeChange()
+            onSizeChange(false)
         }
         .onChange(of: state.recordingPhase) { _, phase in
             if !phase.isCapturing { isExpanded = false }
-            onSizeChange()
+            onSizeChange(isExpanded && phase.isCapturing)
         }
     }
 }
 
 private struct ExpandedRecordingPanel: View {
     let collapse: @MainActor () -> Void
+    let onSnapshot: @MainActor () async throws -> Void
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @State private var quickNote = ""
+    @State private var microphoneRequest: Bool?
+    @State private var snapshotState = FloatingSnapshotPolicy.State.idle
     @FocusState private var noteIsFocused: Bool
 
     var body: some View {
@@ -308,7 +501,11 @@ private struct ExpandedRecordingPanel: View {
             quickNoteField
         }
         .padding(14)
-        .frame(width: 370, alignment: .leading)
+        .frame(
+            width: FloatingRecordingPanelPolicy.expandedContentSize.width,
+            height: FloatingRecordingPanelPolicy.expandedContentSize.height,
+            alignment: .topLeading
+        )
         .background(HushnoteTheme.controlSurface, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 15, style: .continuous)
@@ -344,12 +541,54 @@ private struct ExpandedRecordingPanel: View {
         let system = RecordingDiagnosticsPolicy.sourceRow(
             state.recordingDiagnostics.diagnostics(for: .system)
         )
-        let microphone = RecordingDiagnosticsPolicy.sourceRow(
-            state.recordingDiagnostics.diagnostics(for: .microphone)
-        )
-        return HStack(spacing: 18) {
+        return VStack(alignment: .leading, spacing: 6) {
             health(system)
-            health(microphone)
+            microphoneControl
+        }
+    }
+
+    private var microphoneControl: some View {
+        let diagnostics = state.recordingDiagnostics.diagnostics(for: .microphone)
+        let row = RecordingDiagnosticsPolicy.sourceRow(diagnostics)
+        let control = FloatingMicrophoneControlPolicy.state(
+            enabled: state.microphoneCaptureEnabled,
+            lifecycle: diagnostics.lifecycle,
+            pendingRequest: microphoneRequest
+        )
+
+        return HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(row.title) · \(row.status)")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(diagnosticForeground(row.tone))
+                    .lineLimit(1)
+                if control == .unavailable {
+                    Text("Check permission or choose another input in Settings.")
+                        .font(.caption2)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                        .lineLimit(2)
+                }
+            }
+            Spacer(minLength: 4)
+            Button(control.actionTitle) {
+                requestMicrophoneChange()
+            }
+            .hushnoteButton(.secondary)
+            .disabled(!control.isActionEnabled)
+            .accessibilityLabel(
+                control == .unavailable
+                    ? "Try microphone again"
+                    : control.actionTitle + " microphone"
+            )
+            .accessibilityHint(
+                control == .unavailable
+                    ? "Retries microphone capture after checking permission or input settings."
+                    : "Changes microphone capture for this meeting."
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onChange(of: state.recordingPhase) { _, phase in
+            if !phase.isCapturing { microphoneRequest = nil }
         }
     }
 
@@ -363,6 +602,13 @@ private struct ExpandedRecordingPanel: View {
     }
 
     private var controls: some View {
+        ViewThatFits(in: .horizontal) {
+            controlsRow(compact: false)
+            controlsRow(compact: true)
+        }
+    }
+
+    private func controlsRow(compact: Bool) -> some View {
         HStack(spacing: 8) {
             Menu {
                 ForEach(RecordingMarkerType.allCases) { type in
@@ -371,12 +617,32 @@ private struct ExpandedRecordingPanel: View {
                     }
                 }
             } label: {
-                Label("Mark", systemImage: "bookmark")
+                if compact {
+                    Image(systemName: "bookmark")
+                } else {
+                    Label("Mark", systemImage: "bookmark")
+                }
             } primaryAction: {
                 Task { await coordinator.markMoment(.important) }
             }
             .hushnoteButton(.secondary)
+            .accessibilityLabel("Mark moment")
             .accessibilityHint("Marks Important; open the menu to choose another type")
+
+            Button {
+                requestSnapshot()
+            } label: {
+                if compact {
+                    Image(systemName: snapshotIcon)
+                } else {
+                    Label(snapshotState.buttonTitle, systemImage: snapshotIcon)
+                }
+            }
+            .hushnoteButton(.quiet)
+            .disabled(!FloatingSnapshotPolicy.canStart(snapshotState))
+            .help(snapshotState.helpText)
+            .accessibilityLabel(snapshotState.accessibilityLabel)
+            .accessibilityHint("Captures the display under the pointer without interrupting recording")
 
             Spacer(minLength: 8)
 
@@ -418,11 +684,67 @@ private struct ExpandedRecordingPanel: View {
         }
     }
 
+    private func diagnosticForeground(_ tone: RecordingDiagnosticTone) -> Color {
+        switch tone {
+        case .good: HushnoteTheme.moss
+        case .warning, .attention: HushnoteTheme.vermilionInk
+        case .working: HushnoteTheme.ink
+        case .neutral: HushnoteTheme.secondaryInk
+        }
+    }
+
     private func saveQuickNote() {
         let draft = quickNote
         Task {
             guard await coordinator.saveQuickNote(draft) else { return }
             quickNote = ""
+        }
+    }
+
+    private func requestMicrophoneChange() {
+        let lifecycle = state.recordingDiagnostics.diagnostics(for: .microphone).lifecycle
+        let requested = FloatingMicrophoneControlPolicy.requestedValue(
+            enabled: state.microphoneCaptureEnabled,
+            lifecycle: lifecycle,
+            pendingRequest: microphoneRequest
+        )
+        guard let requested else { return }
+
+        microphoneRequest = requested
+        Task { @MainActor in
+            let configuration = FloatingMicrophoneControlPolicy.retriesUnavailableSource(lifecycle)
+                ? coordinator.retryMicrophoneCapture()
+                : coordinator.setMicrophoneCaptureEnabled(requested)
+            await configuration?.value
+            guard !Task.isCancelled else { return }
+            microphoneRequest = nil
+        }
+    }
+
+    private func requestSnapshot() {
+        guard FloatingSnapshotPolicy.canStart(snapshotState) else { return }
+        snapshotState = .saving
+        Task { @MainActor in
+            do {
+                try await onSnapshot()
+                guard !Task.isCancelled else { return }
+                snapshotState = .saved
+                try? await Task.sleep(for: .seconds(1.5))
+                if !Task.isCancelled, case .saved = snapshotState {
+                    snapshotState = .idle
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                snapshotState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private var snapshotIcon: String {
+        switch snapshotState {
+        case .idle, .failed: "camera.viewfinder"
+        case .saving: "arrow.triangle.2.circlepath"
+        case .saved: "checkmark"
         }
     }
 }

@@ -192,6 +192,7 @@ private struct ActiveRecordingEvidenceView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @State private var cleanupPending: RecordingStorageUsage?
+    @State private var microphoneRequest: Bool?
 
     var body: some View {
         let rows = RecordingDiagnosticsPolicy.rows(for: state.recordingDiagnostics)
@@ -204,14 +205,21 @@ private struct ActiveRecordingEvidenceView: View {
                     MicrophoneLevelMeter()
                 }
                 Spacer(minLength: 12)
-                Button(state.microphoneCaptureEnabled ? "Mic On" : "Mic Off") {
-                    coordinator.setMicrophoneCaptureEnabled(!state.microphoneCaptureEnabled)
+                let microphone = state.recordingDiagnostics.diagnostics(for: .microphone)
+                let microphoneControl = FloatingMicrophoneControlPolicy.state(
+                    enabled: state.microphoneCaptureEnabled,
+                    lifecycle: microphone.lifecycle,
+                    pendingRequest: microphoneRequest
+                )
+                Button(microphoneControl.actionTitle) {
+                    requestMicrophoneChange(lifecycle: microphone.lifecycle)
                 }
                 .hushnoteButton(.quiet)
+                .disabled(!microphoneControl.isActionEnabled)
                 .accessibilityLabel(
-                    state.microphoneCaptureEnabled
-                        ? "Disable microphone capture"
-                        : "Enable microphone capture"
+                    microphoneControl == .unavailable
+                        ? "Try microphone again"
+                        : microphoneControl.actionTitle + " microphone"
                 )
             }
 
@@ -241,6 +249,9 @@ private struct ActiveRecordingEvidenceView: View {
                 .hushnoteButton(.destructive)
             }
         }
+        .onChange(of: state.recordingPhase) { _, phase in
+            if !phase.isCapturing { microphoneRequest = nil }
+        }
         .padding(.horizontal, horizontalInset)
         .padding(.vertical, 11)
         .background(HushnoteTheme.vermilion.opacity(0.045))
@@ -259,6 +270,24 @@ private struct ActiveRecordingEvidenceView: View {
             Button("Cancel", role: .cancel) { cleanupPending = nil }
         } message: { recording in
             Text("The retained raw audio for \(recording.title) will be removed. Its transcript, notes, and summaries remain available.")
+        }
+    }
+
+    private func requestMicrophoneChange(lifecycle: RecordingSourceLifecycle) {
+        let requested = FloatingMicrophoneControlPolicy.requestedValue(
+            enabled: state.microphoneCaptureEnabled,
+            lifecycle: lifecycle,
+            pendingRequest: microphoneRequest
+        )
+        guard let requested else { return }
+        microphoneRequest = requested
+        Task { @MainActor in
+            let configuration = FloatingMicrophoneControlPolicy.retriesUnavailableSource(lifecycle)
+                ? coordinator.retryMicrophoneCapture()
+                : coordinator.setMicrophoneCaptureEnabled(requested)
+            await configuration?.value
+            guard !Task.isCancelled else { return }
+            microphoneRequest = nil
         }
     }
 

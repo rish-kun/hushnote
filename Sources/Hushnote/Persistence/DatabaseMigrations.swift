@@ -468,6 +468,32 @@ enum HushnoteDatabaseMigrations {
                 columns: ["sessionID", "timelineMilliseconds", "wallClockAt"]
             )
         }
+        migrator.registerMigration("v12_meeting_screenshots") { db in
+            try db.create(table: "meetingScreenshots") { table in
+                table.column("id", .text).primaryKey()
+                table.column("meetingID", .text)
+                    .notNull()
+                    .references("meetings", onDelete: .cascade)
+                table.column("recordingSessionID", .text)
+                    .references("recordingSessions", onDelete: .setNull)
+                table.column("relativeFilePath", .text).notNull()
+                table.column("timelineMilliseconds", .integer).notNull()
+                table.column("capturedAt", .datetime).notNull()
+                table.column("displayID", .integer).notNull()
+                table.column("pixelWidth", .integer).notNull()
+                table.column("pixelHeight", .integer).notNull()
+            }
+            try db.create(
+                index: "meetingScreenshots_on_meetingID_timeline",
+                on: "meetingScreenshots",
+                columns: ["meetingID", "timelineMilliseconds", "capturedAt", "id"]
+            )
+            try db.create(
+                index: "meetingScreenshots_on_recordingSessionID_timeline",
+                on: "meetingScreenshots",
+                columns: ["recordingSessionID", "timelineMilliseconds", "capturedAt", "id"]
+            )
+        }
         return migrator
     }
 

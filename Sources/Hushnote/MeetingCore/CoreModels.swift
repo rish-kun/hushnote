@@ -410,6 +410,47 @@ public struct RecordingMarker: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// A still image captured from the display under the pointer while a meeting
+/// is being recorded. The file is kept outside SQLite; this value stores the
+/// durable timeline anchor and the relative path needed to resolve it.
+public struct MeetingScreenshot: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var meetingID: UUID
+    public var recordingSessionID: UUID?
+    public var relativeFilePath: String
+    public var timelineMilliseconds: Int64
+    public var capturedAt: Date
+    public var displayID: UInt32
+    public var pixelWidth: Int
+    public var pixelHeight: Int
+
+    public init(
+        id: UUID = UUID(),
+        meetingID: UUID,
+        recordingSessionID: UUID? = nil,
+        relativeFilePath: String,
+        timelineMilliseconds: Int64,
+        capturedAt: Date = Date(),
+        displayID: UInt32,
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) {
+        self.id = id
+        self.meetingID = meetingID
+        self.recordingSessionID = recordingSessionID
+        self.relativeFilePath = relativeFilePath
+        self.timelineMilliseconds = timelineMilliseconds
+        self.capturedAt = capturedAt
+        self.displayID = displayID
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+    }
+}
+
+/// Kept as a domain synonym for callers that refer to the action as a
+/// recording snapshot rather than a meeting screenshot.
+public typealias RecordingSnapshot = MeetingScreenshot
+
 public enum FinalizationJobState: String, Codable, CaseIterable, Sendable {
     case queued
     case transcribing

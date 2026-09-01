@@ -3,6 +3,21 @@ import XCTest
 @testable import Hushnote
 
 final class FloatingPanelPositioningTests: XCTestCase {
+    func testPanelSizingUsesDeterministicCompactAndExpandedDimensions() {
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.panelSize(isExpanded: false),
+            FloatingRecordingPanelPolicy.compactPanelSize
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.panelSize(isExpanded: true),
+            FloatingRecordingPanelPolicy.expandedPanelSize
+        )
+        XCTAssertGreaterThan(
+            FloatingRecordingPanelPolicy.expandedPanelSize.height,
+            FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
+    }
+
     func testDefaultPositionIsCenteredNearTopOfPreferredScreen() {
         let primary = CGRect(x: 0, y: 0, width: 1_440, height: 900)
         let secondary = CGRect(x: 1_440, y: 100, width: 1_920, height: 1_080)
@@ -54,6 +69,36 @@ final class FloatingPanelPositioningTests: XCTestCase {
         )
 
         XCTAssertEqual(origin, CGPoint(x: 1_000, y: 300))
+    }
+
+    func testResizePreservesTopEdgeWhenThereIsRoomOnDisplay() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let currentFrame = CGRect(x: 520, y: 700, width: 390, height: 64)
+        let newSize = CGSize(width: 386, height: 336)
+
+        let origin = FloatingPanelPositioning.originPreservingTopEdge(
+            currentFrame: currentFrame,
+            newSize: newSize,
+            visibleFrames: [screen]
+        )
+
+        XCTAssertEqual(origin, CGPoint(x: 520, y: 428))
+        XCTAssertEqual(origin.y + newSize.height, currentFrame.maxY)
+    }
+
+    func testResizeClampsToDisplayWhenExpandedPanelWouldCrossTopEdge() {
+        let screen = CGRect(x: 0, y: 25, width: 1_440, height: 875)
+        let currentFrame = CGRect(x: 1_200, y: 40, width: 390, height: 64)
+        let newSize = CGSize(width: 386, height: 336)
+
+        let origin = FloatingPanelPositioning.originPreservingTopEdge(
+            currentFrame: currentFrame,
+            newSize: newSize,
+            visibleFrames: [screen]
+        )
+
+        XCTAssertEqual(origin, CGPoint(x: 1_054, y: 25))
+        XCTAssertGreaterThanOrEqual(CGRect(origin: origin, size: newSize).minY, screen.minY)
     }
 
     func testNoScreensPreservesSavedOriginAndFallsBackToZero() {
@@ -109,5 +154,153 @@ final class FloatingPanelPositioningTests: XCTestCase {
             FloatingRecordingPanelPolicy.appendingQuickNote("First", to: ""),
             "First"
         )
+    }
+
+    func testMicrophoneControlShowsStableOnAndOffStates() {
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.state(
+                enabled: true,
+                lifecycle: .healthy,
+                pendingRequest: nil
+            ),
+            .on
+        )
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.state(
+                enabled: false,
+                lifecycle: .disabled,
+                pendingRequest: nil
+            ),
+            .off
+        )
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.State.on.statusText,
+            "On"
+        )
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.State.off.statusText,
+            "Off"
+        )
+    }
+
+    func testMicrophoneControlRepresentsRequestsAndKeepsUnavailableActionable() {
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.state(
+                enabled: true,
+                lifecycle: .arming,
+                pendingRequest: true
+            ),
+            .turningOn
+        )
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.state(
+                enabled: false,
+                lifecycle: .disabled,
+                pendingRequest: false
+            ),
+            .turningOff
+        )
+
+        let unavailable = FloatingMicrophoneControlPolicy.state(
+            enabled: true,
+            lifecycle: .unavailable,
+            pendingRequest: nil
+        )
+        XCTAssertEqual(unavailable, .unavailable)
+        XCTAssertTrue(unavailable.isActionEnabled)
+        XCTAssertEqual(unavailable.actionTitle, "Try again")
+    }
+
+    func testMicrophoneControlRefusesDuplicateRequestsUntilTheFirstCompletes() {
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.requestedValue(
+                enabled: false,
+                lifecycle: .disabled,
+                pendingRequest: nil
+            ),
+            true
+        )
+        XCTAssertNil(
+            FloatingMicrophoneControlPolicy.requestedValue(
+                enabled: false,
+                lifecycle: .arming,
+                pendingRequest: true
+            )
+        )
+        XCTAssertNil(
+            FloatingMicrophoneControlPolicy.requestedValue(
+                enabled: true,
+                lifecycle: .disabled,
+                pendingRequest: false
+            )
+        )
+    }
+
+    func testUnavailableMicrophoneRetryPreservesTheEnableIntent() {
+        XCTAssertTrue(
+            FloatingMicrophoneControlPolicy.retriesUnavailableSource(.unavailable)
+        )
+        XCTAssertFalse(
+            FloatingMicrophoneControlPolicy.retriesUnavailableSource(.healthy)
+        )
+        XCTAssertEqual(
+            FloatingMicrophoneControlPolicy.requestedValue(
+                enabled: true,
+                lifecycle: .unavailable,
+                pendingRequest: nil
+            ),
+            true
+        )
+    }
+
+    func testStaleMicrophoneRequestsCannotReachThePipeline() {
+        XCTAssertFalse(
+            FloatingMicrophoneControlPolicy.requestIsCurrent(
+                requestedEnabled: true,
+                requestedMicrophone: nil,
+                currentEnabled: false,
+                currentMicrophone: nil
+            )
+        )
+        XCTAssertFalse(
+            FloatingMicrophoneControlPolicy.requestIsCurrent(
+                requestedEnabled: true,
+                requestedMicrophone: PreferredMicrophone(uid: "built-in"),
+                currentEnabled: true,
+                currentMicrophone: PreferredMicrophone(uid: "headset")
+            )
+        )
+        XCTAssertTrue(
+            FloatingMicrophoneControlPolicy.requestIsCurrent(
+                requestedEnabled: false,
+                requestedMicrophone: nil,
+                currentEnabled: false,
+                currentMicrophone: nil
+            )
+        )
+    }
+
+    func testSnapshotPolicyUsesStableProgressCopyAndDisablesDuplicateCapture() {
+        XCTAssertEqual(FloatingSnapshotPolicy.State.idle.buttonTitle, "Snapshot")
+        XCTAssertTrue(FloatingSnapshotPolicy.canStart(.idle))
+
+        XCTAssertEqual(FloatingSnapshotPolicy.State.saving.buttonTitle, "Saving…")
+        XCTAssertFalse(FloatingSnapshotPolicy.canStart(.saving))
+
+        XCTAssertEqual(FloatingSnapshotPolicy.State.saved.buttonTitle, "Saved")
+        XCTAssertFalse(FloatingSnapshotPolicy.canStart(.saved))
+        XCTAssertEqual(
+            FloatingSnapshotPolicy.State.saved.accessibilityLabel,
+            "Screenshot saved to this meeting"
+        )
+    }
+
+    func testSnapshotPolicyAllowsRetryAfterFailureAndKeepsErrorForHelp() {
+        let failed = FloatingSnapshotPolicy.State.failed("Screen Recording permission is required.")
+
+        XCTAssertTrue(FloatingSnapshotPolicy.canStart(failed))
+        XCTAssertEqual(failed.buttonTitle, "Try again")
+        XCTAssertEqual(failed.helpText, "Screen Recording permission is required.")
+        XCTAssertEqual(failed.accessibilityLabel, "Retry screenshot")
     }
 }

@@ -6,11 +6,15 @@ import OSLog
 
 enum CoordinatorError: Error, LocalizedError {
     case noTranscript
+    case noActiveRecording
+    case screenshotInProgress
     case providerUnavailable(String)
 
     var errorDescription: String? {
         switch self {
         case .noTranscript: "This meeting does not have a transcript yet."
+        case .noActiveRecording: "A snapshot can only be taken while a meeting is recording."
+        case .screenshotInProgress: "A snapshot is already being saved."
         case .providerUnavailable(let reason): reason
         }
     }
@@ -82,6 +86,8 @@ final class AppCoordinator {
     @ObservationIgnored private var insightTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var insightGenerations: [UUID: UUID] = [:]
     @ObservationIgnored private let meetingAudioExporter = MeetingAudioExportService()
+    @ObservationIgnored private let meetingScreenshotService: MeetingScreenshotService
+    @ObservationIgnored private var isCapturingMeetingScreenshot = false
     @ObservationIgnored private let shareTokens: any ShareTokenStoring
     /// Built per call rather than held, because it needs the device token and
     /// the token does not exist until the first share is created.
@@ -116,6 +122,7 @@ final class AppCoordinator {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "Hushnote", directoryHint: .isDirectory)
         applicationDataURL = base
+        meetingScreenshotService = MeetingScreenshotService(applicationDataURL: base)
         do {
             try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
             store = try MeetingStore(databaseURL: base.appending(path: "hushnote.sqlite"))
@@ -137,6 +144,16 @@ final class AppCoordinator {
     func bootstrap() async {
         refreshInstalledModels()
         Task { await self.refreshMicrophoneDevices() }
+        Task { [meetingScreenshotService, store, logger] in
+            do {
+                let referenced = try await store.allMeetingScreenshotRelativePaths()
+                try await meetingScreenshotService.removeOrphanedFiles(
+                    referencedRelativePaths: referenced
+                )
+            } catch {
+                logger.error("Screenshot orphan cleanup failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
         // Deliberately not awaited. `refreshInstalledModelSizes` walks every
         // installed model directory counting `st_blocks` per file -- thousands
         // of artifacts across several gigabytes -- and awaiting it here put a
@@ -2429,6 +2446,52 @@ final class AppCoordinator {
         }
     }
 
+    /// Saves one visual attachment against the same sample-derived clock used
+    /// by markers and quick notes. Screen access is entirely independent from
+    /// the Core Audio capture session, so a denied or failed image leaves the
+    /// recording untouched.
+    func captureMeetingScreenshot() async throws {
+        guard !isCapturingMeetingScreenshot else { throw CoordinatorError.screenshotInProgress }
+        guard state.recordingPhase.isCapturing,
+              let meetingID = state.activeMeetingID,
+              let session = activeRecordingSession,
+              session.meetingID == meetingID,
+              let audioPipeline
+        else { throw CoordinatorError.noActiveRecording }
+
+        isCapturingMeetingScreenshot = true
+        defer { isCapturingMeetingScreenshot = false }
+
+        let request = MeetingScreenshotRequest(
+            meetingID: meetingID,
+            recordingSessionID: session.id,
+            timelineMilliseconds: await audioPipeline.timelinePositionMilliseconds
+        )
+
+        do {
+            let result = try await meetingScreenshotService.capture(request)
+            do {
+                try await store.saveMeetingScreenshot(result.screenshot)
+            } catch {
+                // The database row is the durable owner of this attachment. If
+                // registration fails, remove the just-installed file so an
+                // unreferenced private screenshot is not left behind.
+                try? FileManager.default.removeItem(at: result.fileURL)
+                throw error
+            }
+            state.recordingNotice = "Snapshot saved."
+        } catch let error as MeetingScreenshotError {
+            if error == .permissionDenied {
+                meetingScreenshotService.openScreenRecordingSettings()
+            }
+            state.recordingNotice = error.localizedDescription
+            throw error
+        } catch {
+            state.recordingNotice = "The snapshot could not be saved: \(error.localizedDescription)"
+            throw error
+        }
+    }
+
     /// Captures a note against the same sample-derived meeting clock as markers.
     /// It neither reads nor requires the provisional transcript.
     @discardableResult
@@ -2446,8 +2509,9 @@ final class AppCoordinator {
         return true
     }
 
-    func setMicrophoneCaptureEnabled(_ isEnabled: Bool) {
-        guard state.microphoneCaptureEnabled != isEnabled else { return }
+    @discardableResult
+    func setMicrophoneCaptureEnabled(_ isEnabled: Bool) -> Task<Void, Never>? {
+        guard state.microphoneCaptureEnabled != isEnabled else { return nil }
         state.microphoneCaptureEnabled = isEnabled
         preferences.microphoneCaptureEnabled = isEnabled
         guard let audioPipeline, state.recordingPhase.isCapturing else {
@@ -2456,7 +2520,7 @@ final class AppCoordinator {
                 state: isEnabled ? .arming : .disabled,
                 durableWriterAdvanced: false
             )
-            return
+            return nil
         }
 
         // The preference is the desired state; diagnostics describe what the
@@ -2468,8 +2532,32 @@ final class AppCoordinator {
             durableWriterAdvanced: false
         )
 
-        enqueueMicrophoneConfiguration(
+        return enqueueMicrophoneConfiguration(
             enabled: isEnabled,
+            microphone: state.selectedMicrophone,
+            pipeline: audioPipeline
+        )
+    }
+
+    /// Re-attempts microphone setup after a source-specific failure without
+    /// changing the user's desired preference. The floating panel exposes
+    /// this only as its unavailable-source "Try again" action.
+    @discardableResult
+    func retryMicrophoneCapture() -> Task<Void, Never>? {
+        guard state.microphoneCaptureEnabled,
+              state.recordingPhase.isCapturing,
+              FloatingMicrophoneControlPolicy.retriesUnavailableSource(
+                  state.recordingDiagnostics.diagnostics(for: .microphone).lifecycle
+              ),
+              let audioPipeline else { return nil }
+
+        updateSourceDiagnostics(
+            source: .microphone,
+            state: .arming,
+            durableWriterAdvanced: false
+        )
+        return enqueueMicrophoneConfiguration(
+            enabled: true,
             microphone: state.selectedMicrophone,
             pipeline: audioPipeline
         )
@@ -2487,7 +2575,7 @@ final class AppCoordinator {
             state: .arming,
             durableWriterAdvanced: false
         )
-        enqueueMicrophoneConfiguration(
+        _ = enqueueMicrophoneConfiguration(
             enabled: true,
             microphone: microphone,
             pipeline: audioPipeline
@@ -2510,14 +2598,20 @@ final class AppCoordinator {
         enabled: Bool,
         microphone: PreferredMicrophone?,
         pipeline: AudioPipeline
-    ) {
+    ) -> Task<Void, Never> {
         let previous = microphoneConfigurationTask
-        microphoneConfigurationTask = Task { [weak self] in
+        let task = Task { [weak self] in
             _ = await previous?.value
             guard !Task.isCancelled else { return }
             guard let self,
                   self.audioPipeline === pipeline,
-                  self.state.recordingPhase.isCapturing else { return }
+                  self.state.recordingPhase.isCapturing,
+                  FloatingMicrophoneControlPolicy.requestIsCurrent(
+                      requestedEnabled: enabled,
+                      requestedMicrophone: microphone,
+                      currentEnabled: self.state.microphoneCaptureEnabled,
+                      currentMicrophone: self.state.selectedMicrophone
+                  ) else { return }
 
             // Persist the user's expectation even when permission or hardware
             // setup fails. The source manifest says what should have been
@@ -2527,6 +2621,14 @@ final class AppCoordinator {
                 microphone: microphone,
                 pipeline: pipeline
             )
+            guard self.audioPipeline === pipeline,
+                  self.state.recordingPhase.isCapturing,
+                  FloatingMicrophoneControlPolicy.requestIsCurrent(
+                      requestedEnabled: enabled,
+                      requestedMicrophone: microphone,
+                      currentEnabled: self.state.microphoneCaptureEnabled,
+                      currentMicrophone: self.state.selectedMicrophone
+                  ) else { return }
             do {
                 try await pipeline.setMicrophoneCaptureEnabled(
                     enabled,
@@ -2546,6 +2648,8 @@ final class AppCoordinator {
                 self.state.recordingNotice = error.localizedDescription
             }
         }
+        microphoneConfigurationTask = task
+        return task
     }
 
     private func persistMicrophoneConfigurationBoundary(
@@ -3097,10 +3201,10 @@ final class AppCoordinator {
     }
 
     /// Converts the level callback into sample-clock-backed silence evidence.
-    /// A source can keep writing valid zero-energy buffers for minutes, so its
-    /// lifecycle is `.silent` while the writer remains healthy. The timestamp
-    /// is retained in the diagnostics snapshot and the age is recomputed from
-    /// the current chunk rather than from the UI's wall-clock timer.
+    /// A source can keep writing valid zero-energy buffers for minutes. System
+    /// audio is verified once at its first durable write and then remains
+    /// healthy while level callbacks continue to fluctuate; levels are still
+    /// retained as evidence for the microphone silence diagnostic.
     private func updateSourceAudibility(_ level: AudioLevel) {
         guard let timelineMilliseconds = level.timelineMilliseconds else { return }
         let snapshot = state.recordingDiagnostics
@@ -3114,13 +3218,11 @@ final class AppCoordinator {
         let lastAudibleTimestampMilliseconds = audible
             ? timelineMilliseconds
             : current.lastAudibleTimestampMilliseconds
-        let lifecycle: RecordingSourceLifecycle
-        switch current.lifecycle {
-        case .disabled, .unavailable, .reconnecting, .degraded:
-            lifecycle = current.lifecycle
-        case .arming, .healthy, .silent:
-            lifecycle = audible ? .healthy : .silent
-        }
+        let lifecycle = RecordingSourceHealthPolicy.lifecycleAfterLevel(
+            source: level.source,
+            current: current.lifecycle,
+            audible: audible
+        )
         let replacement = RecordingSourceDiagnostics(
             source: level.source,
             isExpected: current.isExpected,
@@ -3269,8 +3371,26 @@ final class AppCoordinator {
     ) {
         eventTask?.cancel()
         eventTask = Task { [weak self] in
+            let observerIdentity = AudioEventObservationIdentity(
+                meetingID: meetingID,
+                generation: generation
+            )
             for await event in pipeline.events {
                 guard let self else { return }
+                // AsyncStream buffers a small tail when its producer is
+                // stopped. Validate every event before touching levels,
+                // diagnostics, speech, or durable recording state: a prior
+                // pipeline/session must never mutate the next meeting.
+                guard let activeMeetingID = self.state.activeMeetingID,
+                      let activeGeneration = self.liveSessionGeneration else { return }
+                guard AudioEventObservationPolicy.accepts(
+                    observer: observerIdentity,
+                    current: AudioEventObservationIdentity(
+                        meetingID: activeMeetingID,
+                        generation: activeGeneration
+                    ),
+                    isCurrentPipeline: self.audioPipeline === pipeline
+                ) else { return }
                 switch event {
                 case .level(let level):
                     let value = min(1, max(0, Double(level.rms) * 8))
@@ -3288,10 +3408,12 @@ final class AppCoordinator {
                             durableWriterAdvanced: true
                         )
                     }
-                    self.recordingDidReceiveFirstBuffer(
-                        meetingID: meetingID,
-                        generation: generation
-                    )
+                    if chunk.source == .system {
+                        self.recordingDidReceiveFirstBuffer(
+                            meetingID: meetingID,
+                            generation: generation
+                        )
+                    }
                     guard let speechEngine = self.speechEngine, self.loadedModel != nil else { continue }
                     let sequence = self.sequenceNumbers[chunk.source, default: 0] + 1
                     self.sequenceNumbers[chunk.source] = sequence
@@ -3318,7 +3440,25 @@ final class AppCoordinator {
                         ))
                     }
                 case .sourceHealth(let health):
-                    self.updateSourceDiagnostics(source: health.source, state: health.state)
+                    let current = self.state.recordingDiagnostics.diagnostics(for: health.source)
+                    guard RecordingSourceHealthPolicy.accepts(
+                        observed: health.state,
+                        current: current.lifecycle
+                    ) else { continue }
+                    // System `.healthy` is emitted by CaptureOutputBridge only
+                    // after its first non-empty CAF write. Carry that durable
+                    // evidence with the health event so the diagnostics row
+                    // cannot briefly claim "Not writing" between the two
+                    // events. Microphone health still means setup succeeded;
+                    // its writer evidence arrives with its own chunk.
+                    self.updateSourceDiagnostics(
+                        source: health.source,
+                        state: health.state,
+                        durableWriterAdvanced: health.source == .system
+                            && health.state == .healthy
+                            ? true
+                            : nil
+                    )
                     if case .unavailable(let message) = health.state {
                         self.state.recordingNotice = message
                     }

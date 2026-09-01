@@ -19,7 +19,10 @@ struct HushnoteApp: App {
         _recordingPanel = State(
             initialValue: FloatingRecordingPanelController(
                 state: state,
-                coordinator: coordinator
+                coordinator: coordinator,
+                snapshotAction: {
+                    try await coordinator.captureMeetingScreenshot()
+                }
             )
         )
         let quickNotePanel = QuickNotePanelController(state: state, coordinator: coordinator)

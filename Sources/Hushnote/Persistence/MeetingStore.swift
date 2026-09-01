@@ -5,6 +5,9 @@ import GRDB
 /// transcript state. Writes are serialized by GRDB and grouped transactionally.
 public actor MeetingStore {
     private let database: any DatabaseWriter
+    /// Root used to resolve relative meeting attachments such as screenshots.
+    /// It is the directory containing the SQLite file in normal app use.
+    private let applicationDataURL: URL
 
     public init(databaseURL: URL) throws {
         try FileManager.default.createDirectory(
@@ -21,9 +24,10 @@ public actor MeetingStore {
         let database = try DatabasePool(path: databaseURL.path, configuration: configuration)
         try HushnoteDatabaseMigrations.migrator.migrate(database)
         self.database = database
+        self.applicationDataURL = databaseURL.deletingLastPathComponent().standardizedFileURL
     }
 
-    public init(inMemory: Void = ()) throws {
+    public init(inMemory: Void = (), applicationDataURL: URL? = nil) throws {
         var configuration = Configuration()
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
@@ -31,6 +35,8 @@ public actor MeetingStore {
         let database = try DatabaseQueue(configuration: configuration)
         try HushnoteDatabaseMigrations.migrator.migrate(database)
         self.database = database
+        self.applicationDataURL = (applicationDataURL ?? FileManager.default.temporaryDirectory)
+            .standardizedFileURL
     }
 
     public func saveMeeting(_ meeting: Meeting) throws {
@@ -602,6 +608,81 @@ public actor MeetingStore {
                 .order(Column("timelineMilliseconds"), Column("wallClockAt"), Column("id"))
                 .fetchAll(db)
                 .map { try $0.model() }
+        }
+    }
+
+    // MARK: - Meeting screenshots
+
+    /// Persists the metadata only after the capture service has atomically
+    /// installed the PNG. The relative path is intentionally constrained to
+    /// the app-owned attachment root so a corrupt row cannot point cleanup at
+    /// an arbitrary user file.
+    public func saveMeetingScreenshot(_ screenshot: MeetingScreenshot) throws {
+        try Self.validate(screenshot)
+        try database.write { db in
+            guard try MeetingRecord.exists(db, key: screenshot.meetingID.uuidString) else {
+                throw PersistenceError.meetingNotFound(screenshot.meetingID)
+            }
+            if let sessionID = screenshot.recordingSessionID {
+                guard let session = try RecordingSessionRecord.fetchOne(db, key: sessionID.uuidString)
+                else { throw PersistenceError.recordingSessionNotFound(sessionID) }
+                guard session.meetingID == screenshot.meetingID.uuidString else {
+                    throw PersistenceError.invalidScreenshot(
+                        "the screenshot's session must belong to its meeting"
+                    )
+                }
+            }
+            if let existing = try MeetingScreenshotRecord.fetchOne(db, key: screenshot.id.uuidString),
+               existing.meetingID != screenshot.meetingID.uuidString {
+                throw PersistenceError.invalidScreenshot(
+                    "an existing screenshot cannot move to another meeting"
+                )
+            }
+            try MeetingScreenshotRecord(screenshot).save(db)
+        }
+    }
+
+    public func meetingScreenshot(id: UUID) throws -> MeetingScreenshot? {
+        try database.read { db in
+            try MeetingScreenshotRecord.fetchOne(db, key: id.uuidString)?.model()
+        }
+    }
+
+    public func meetingScreenshots(meetingID: UUID) throws -> [MeetingScreenshot] {
+        try database.read { db in
+            try MeetingScreenshotRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("timelineMilliseconds"), Column("capturedAt"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func meetingScreenshots(recordingSessionID: UUID) throws -> [MeetingScreenshot] {
+        try database.read { db in
+            try MeetingScreenshotRecord
+                .filter(Column("recordingSessionID") == recordingSessionID.uuidString)
+                .order(Column("timelineMilliseconds"), Column("capturedAt"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func allMeetingScreenshotRelativePaths() throws -> Set<String> {
+        try database.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT relativeFilePath FROM meetingScreenshots"))
+        }
+    }
+
+    /// Removes one attachment's bytes before its row. A missing file is
+    /// tolerated so a cleanup retry can still remove metadata left by an
+    /// interrupted filesystem operation.
+    public func deleteMeetingScreenshot(id: UUID) throws {
+        try Self.removeFiles(at: screenshotFileURLs(id: id))
+        try database.write { db in
+            guard try MeetingScreenshotRecord.deleteOne(db, key: id.uuidString) else {
+                throw PersistenceError.screenshotNotFound(id)
+            }
         }
     }
 
@@ -1537,6 +1618,10 @@ public actor MeetingStore {
     /// is explicit and happens first so a filesystem failure never loses the DB
     /// pointers required for a retry.
     public func deleteMeeting(id: UUID, deleteAudioFiles: Bool = true) throws {
+        // Screenshot attachments are part of the meeting graph regardless of
+        // the caller's retained-audio choice. Remove bytes first so a storage
+        // failure leaves every relational pointer available for retry.
+        try Self.removeFiles(at: screenshotFileURLs(meetingID: id))
         if deleteAudioFiles {
             try Self.removeFiles(at: audioFileURLs(meetingID: id))
         }
@@ -1646,6 +1731,49 @@ public actor MeetingStore {
         }
     }
 
+    private func screenshotFileURLs(meetingID: UUID) throws -> [URL] {
+        try database.read { db in
+            try String.fetchAll(
+                db,
+                sql: """
+                    SELECT relativeFilePath
+                    FROM meetingScreenshots
+                    WHERE meetingID = ?
+                    ORDER BY relativeFilePath
+                    """,
+                arguments: [meetingID.uuidString]
+            ).map { try screenshotFileURL(relativePath: $0) }
+        }
+    }
+
+    private func screenshotFileURLs(id: UUID) throws -> [URL] {
+        try database.read { db in
+            guard let path = try String.fetchOne(
+                db,
+                sql: "SELECT relativeFilePath FROM meetingScreenshots WHERE id = ?",
+                arguments: [id.uuidString]
+            ) else { return [] }
+            return [try screenshotFileURL(relativePath: path)]
+        }
+    }
+
+    private func screenshotFileURL(relativePath: String) throws -> URL {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: true)
+        guard !relativePath.isEmpty,
+              !relativePath.hasPrefix("/"),
+              !relativePath.contains("\\"),
+              !components.contains("..")
+        else { throw PersistenceError.invalidScreenshot("the attachment path is unsafe") }
+
+        let root = applicationDataURL.standardizedFileURL
+        let resolved = root.appending(path: relativePath).standardizedFileURL
+        let rootComponents = root.pathComponents
+        guard resolved != root,
+              Array(resolved.pathComponents.prefix(rootComponents.count)) == rootComponents
+        else { throw PersistenceError.invalidScreenshot("the attachment path leaves app storage") }
+        return resolved
+    }
+
     private static func validate(_ session: RecordingSession) throws {
         guard session.ordinal >= 0,
               session.timelineStartMilliseconds >= 0,
@@ -1697,6 +1825,24 @@ public actor MeetingStore {
         guard marker.timelineMilliseconds >= 0 else {
             throw PersistenceError.invalidRecordingMarker(
                 "timeline position must not be negative"
+            )
+        }
+    }
+
+    private static func validate(_ screenshot: MeetingScreenshot) throws {
+        let path = screenshot.relativeFilePath
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard !path.isEmpty,
+              !path.hasPrefix("/"),
+              !path.contains("\\"),
+              !components.contains(".."),
+              components.first == "Screenshots",
+              path.lowercased().hasSuffix(".png"),
+              screenshot.timelineMilliseconds >= 0,
+              screenshot.pixelWidth > 0,
+              screenshot.pixelHeight > 0 else {
+            throw PersistenceError.invalidScreenshot(
+                "path, timeline, and pixel dimensions must describe an app-owned PNG"
             )
         }
     }

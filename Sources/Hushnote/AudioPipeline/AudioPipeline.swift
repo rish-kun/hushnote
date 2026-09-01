@@ -208,7 +208,6 @@ public actor AudioPipeline {
             eventContinuation.yield(.sourceHealth(.init(source: .system, state: .arming)))
             output.begin()
             try capture.start()
-            eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
 
             if configuration.capturesMicrophone {
                 let generation = advanceMicrophoneConfigurationGeneration()
@@ -236,6 +235,10 @@ public actor AudioPipeline {
             systemAudioURL = nil
             resetSession()
             let mappedError = Self.mapCaptureError(error)
+            eventContinuation.yield(.sourceHealth(.init(
+                source: .system,
+                state: .unavailable(mappedError.localizedDescription)
+            )))
             updateStatus(.failed(mappedError.localizedDescription))
             throw mappedError
         }
@@ -413,7 +416,6 @@ public actor AudioPipeline {
 
         systemCapture = capture
         systemOutput = output
-        eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
 
         let omission: CapturedMediaOmission?
         if statusBeforeSleep == .recording {
@@ -577,6 +579,10 @@ public actor AudioPipeline {
         // A failure only speaks for the session that raised it. Anything else
         // is a message from a meeting that is already over.
         guard sessionID == session, systemCaptureGeneration == generation else { return }
+        eventContinuation.yield(.sourceHealth(.init(
+            source: .system,
+            state: .unavailable(message)
+        )))
         currentStatus = .stopping
         _ = advanceMicrophoneConfigurationGeneration()
         closeSystemTake()
@@ -628,7 +634,6 @@ public actor AudioPipeline {
                     timeline: timeline,
                     paused: currentStatus == .paused
                 )
-                eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
                 return
             } catch {
                 finalError = error

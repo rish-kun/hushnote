@@ -269,6 +269,82 @@ struct SystemCaptureReconfigurationTests {
     }
 }
 
+@Suite("System capture verification")
+struct SystemCaptureVerificationTests {
+    @Test("System audio stays arming until a recovery chunk is written")
+    func verifiesOnFirstDurableChunk() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fleet = FakeCaptureFleet()
+        let collector = EventCollector()
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in fleet.next(handler, notice) }
+        )
+        let watcher = Task { for await event in pipeline.events { collector.record(event) } }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(!collector.sourceHealth.contains {
+            $0.source == .system && $0.state == .healthy
+        })
+
+        fleet[0].emit(milliseconds: 100)
+        try await CaptureDurationTests.until {
+            collector.sourceHealth.contains {
+                $0.source == .system && $0.state == .healthy
+            }
+        }
+        _ = try await pipeline.stop()
+    }
+
+    @Test("Each recreated system take re-arms before it can verify")
+    func recreationRequiresAnotherDurableChunk() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fleet = FakeCaptureFleet()
+        let collector = EventCollector()
+        let pipeline = AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in fleet.next(handler, notice) },
+            microphoneCaptureFactory: { MicrophoneAudioCapture() },
+            reconfigurationRetryDelays: [0],
+            reconfigurationSleep: { _ in }
+        )
+        let watcher = Task { for await event in pipeline.events { collector.record(event) } }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[0].emit(milliseconds: 100)
+        try await CaptureDurationTests.until {
+            collector.sourceHealth.contains {
+                $0.source == .system && $0.state == .healthy
+            }
+        }
+        let healthyCount = collector.sourceHealth.filter {
+            $0.source == .system && $0.state == .healthy
+        }.count
+
+        fleet[0].report(.reconfigure(.deviceChanged, detail: "output changed"))
+        try await CaptureDurationTests.until { fleet.count == 2 && fleet[1].isRunning }
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(
+            collector.sourceHealth.filter {
+                $0.source == .system && $0.state == .healthy
+            }.count == healthyCount
+        )
+
+        fleet[1].emit(milliseconds: 100)
+        try await CaptureDurationTests.until {
+            collector.sourceHealth.filter {
+                $0.source == .system && $0.state == .healthy
+            }.count > healthyCount
+        }
+        _ = try await pipeline.stop()
+    }
+}
+
 /// Hands out one fake per `start()`, so a test can hold on to a previous
 /// session's device after the pipeline has moved on.
 final class FakeCaptureFleet: @unchecked Sendable {
