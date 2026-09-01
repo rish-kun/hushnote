@@ -7,6 +7,8 @@ struct HushnoteApp: App {
     @State private var state: AppViewState
     @State private var coordinator: AppCoordinator
     @State private var recordingPanel: FloatingRecordingPanelController
+    @State private var quickNotePanel: QuickNotePanelController
+    private let quickNoteShortcut: GlobalQuickNoteShortcut
     @NSApplicationDelegateAdaptor(HushnoteAppDelegate.self) private var appDelegate
 
     init() {
@@ -20,6 +22,10 @@ struct HushnoteApp: App {
                 coordinator: coordinator
             )
         )
+        let quickNotePanel = QuickNotePanelController(state: state, coordinator: coordinator)
+        _quickNotePanel = State(initialValue: quickNotePanel)
+        quickNoteShortcut = GlobalQuickNoteShortcut { quickNotePanel.show() }
+        HushnoteAppDelegate.quickNoteShortcut = quickNoteShortcut
         // Published before any window exists so ⌘Q is guarded even when the app
         // is running from the menu bar alone.
         HushnoteAppDelegate.state = state
@@ -52,6 +58,8 @@ struct HushnoteApp: App {
             }
             CommandGroup(after: .newItem) {
                 if state.recordingPhase.isCapturing {
+                    Button("Quick Note…") { quickNotePanel.show() }
+                        .keyboardShortcut("n", modifiers: [.control, .option])
                     Button(state.recordingPhase == .paused ? "Resume recording" : "Pause recording") {
                         Task { await coordinator.togglePause() }
                     }

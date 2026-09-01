@@ -22,6 +22,7 @@ final class AppCoordinator {
     let state: AppViewState
     let applicationDataURL: URL
     let store: MeetingStore
+    @ObservationIgnored let playbackController = MeetingPlaybackController()
 
     var localModelPath = ""
     var localLlamaExecutablePath = AppCoordinator.defaultLlamaServerPath
@@ -40,13 +41,18 @@ final class AppCoordinator {
     @ObservationIgnored private let logger = Logger(subsystem: "dev.rishit.hushnote", category: "coordinator")
     @ObservationIgnored private var audioPipeline: AudioPipeline?
     @ObservationIgnored private var activeRecordingSession: RecordingSession?
+    @ObservationIgnored private var activePauseEvent: RecordingEvent?
+    @ObservationIgnored private var activeContinuationBaseSegments: [TranscriptSegment]?
     @ObservationIgnored private var activeRecordingSources: [AudioSource: SessionAudioSource] = [:]
     @ObservationIgnored private var sourcesWithDurableAudio: Set<AudioSource> = []
     @ObservationIgnored private var microphoneConfigurationTask: Task<Void, Never>?
+    @ObservationIgnored private var backgroundFinalizationTask: Task<Void, Never>?
     @ObservationIgnored private var speechEngine: WhisperKitTranscriptionEngine?
     @ObservationIgnored private var diarizationEngine: FluidAudioDiarizationEngine?
     @ObservationIgnored private var loadedModel: SpeechModel?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
+    @ObservationIgnored private var diskHeadroomTask: Task<Void, Never>?
+    @ObservationIgnored private var sleepResilience: RecordingSleepResilience?
     @ObservationIgnored private var transcriptTask: Task<Void, Never>?
     @ObservationIgnored private var liveSetupTask: Task<Void, Never>?
     /// Invalidates asynchronous live-ASR setup whenever capture stops or a new
@@ -63,6 +69,7 @@ final class AppCoordinator {
     @ObservationIgnored private var pendingNoteTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private let downloader: any SpeechModelDownloading
     @ObservationIgnored private let storageAccounting: any StorageAccounting
+    @ObservationIgnored private let recordingFreeSpace: any RecordingFreeSpaceChecking
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let preferences: AppPreferences
     /// One per model, so a download can be cancelled by the row that started it.
@@ -85,6 +92,7 @@ final class AppCoordinator {
         state: AppViewState,
         downloader: any SpeechModelDownloading = WhisperKitModelDownloader(),
         storageAccounting: any StorageAccounting = StorageAccountingService(),
+        recordingFreeSpace: any RecordingFreeSpaceChecking = VolumeRecordingFreeSpaceChecker(),
         shareTokens: any ShareTokenStoring = KeychainShareTokenStore(),
         makeSharePublisher: @escaping @Sendable (String, URL) -> any SharePublishing
             = { token, origin in HushnoteSharePublisher(origin: origin, deviceToken: token) },
@@ -93,6 +101,7 @@ final class AppCoordinator {
         self.state = state
         self.downloader = downloader
         self.storageAccounting = storageAccounting
+        self.recordingFreeSpace = recordingFreeSpace
         self.shareTokens = shareTokens
         self.makeSharePublisher = makeSharePublisher
         self.defaults = defaults
@@ -191,6 +200,102 @@ final class AppCoordinator {
         }
     }
 
+    func importRecording(from sourceURL: URL, into requestedMeetingID: UUID? = nil) async {
+        let requestedStatus = requestedMeetingID.flatMap { id in
+            state.meetings.first(where: { $0.id == id })?.status
+        }
+        guard MeetingRecordingImportPolicy.canImport(
+            into: requestedStatus,
+            recordingIsBusy: state.recordingPhase.isBusy
+        ) else { return }
+
+        let hasSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+        defer { if hasSecurityScope { sourceURL.stopAccessingSecurityScopedResource() } }
+
+        var installedURLs: [URL] = []
+        var graphWasSaved = false
+        var meeting: Meeting?
+        do {
+            if let requestedMeetingID {
+                meeting = try await store.meeting(id: requestedMeetingID)
+            } else {
+                meeting = Meeting(
+                    title: MeetingRecordingImportPolicy.suggestedTitle(for: sourceURL),
+                    startedAt: Date(),
+                    updatedAt: Date(),
+                    status: .idle,
+                    retainsAudio: state.retainAudio,
+                    folderID: state.selectedFolderID
+                )
+                try await store.saveMeeting(meeting!)
+                updateListItem(meeting!, excerpt: "Preparing imported recording…")
+            }
+            guard let meeting else {
+                throw CoordinatorError.providerUnavailable("The destination meeting could not be loaded.")
+            }
+
+            let sessions = try await store.recordingSessions(meetingID: meeting.id)
+            let existingTranscript = try await store.segments(meetingID: meeting.id)
+            let timelineStart = ContinueRecordingPolicy.timelineStartMilliseconds(
+                sessions: sessions,
+                existingTranscript: existingTranscript
+            )
+            let ordinal = (sessions.map(\.ordinal).max() ?? -1) + 1
+
+            state.activeMeetingID = meeting.id
+            setSelection(.meeting(meeting.id))
+            state.markFinalizing(stage: .savingAudio, progress: 0, detail: "Importing source audio…")
+            let imported = try await MeetingRecordingImportService().prepareImport(
+                sourceURL: sourceURL,
+                destinationDirectory: recoveryAudioDirectory(for: meeting.id),
+                meetingID: meeting.id,
+                sessionOrdinal: ordinal,
+                timelineStartMilliseconds: timelineStart,
+                progress: { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        self?.state.updateFinalization(
+                            stage: .savingAudio,
+                            progress: progress * 0.15,
+                            detail: "Importing source audio…"
+                        )
+                    }
+                }
+            )
+            installedURLs = imported.takes.map(\.fileURL)
+            let job = FinalizationJob(
+                sessionID: imported.session.id,
+                modelID: speechModel(named: state.draft.finalModel).id,
+                languageCode: languageCode,
+                audioDurationMilliseconds: imported.session.capturedDurationMilliseconds
+            )
+            try await store.saveImportedRecording(
+                session: imported.session,
+                sources: imported.sources,
+                takes: imported.takes,
+                job: job
+            )
+            graphWasSaved = true
+            if let first = imported.finalizationTracks().first {
+                try await store.saveAudioTrack(first)
+            }
+            try await store.updateMeetingStatus(id: meeting.id, status: .finalizing)
+            if var durable = try await store.meeting(id: meeting.id) {
+                durable.status = .finalizing
+                updateListItem(durable, excerpt: "Imported audio is queued for transcription.")
+            }
+            await recoverMeeting(meeting.id, finalizationJobID: job.id)
+        } catch {
+            // A relational failure after normalization must not leave invisible
+            // originals consuming storage. Once the graph is saved, recovery
+            // owns the files and `installedURLs` must remain intact on failure.
+            if !graphWasSaved {
+                for url in installedURLs { try? FileManager.default.removeItem(at: url) }
+            }
+            state.markFinished()
+            state.report(.recordingImport, error.localizedDescription)
+        }
+    }
+
     // MARK: - Meeting folders
 
     @discardableResult
@@ -246,15 +351,87 @@ final class AppCoordinator {
     }
 
     func startMeeting(meetingID requestedMeetingID: UUID? = nil) async {
+        await beginMeeting(meetingID: requestedMeetingID, continuation: nil)
+    }
+
+    func continueMeeting(_ meetingID: UUID) async {
         guard !state.recordingPhase.isBusy else { return }
-        let generation = UUID()
-        liveSessionGeneration = generation
+        // Claim ownership before reading durable context so two quick actions
+        // cannot create parallel continuation sessions.
         state.recordingPhase = .preparing
         state.recordingStartupStage = .arming
+        do {
+            guard let meeting = try await store.meeting(id: meetingID),
+                  ContinueRecordingPolicy.canContinue(
+                    status: meeting.status,
+                    recordingIsBusy: false
+                  ) else {
+                state.recordingPhase = .idle
+                state.recordingStartupStage = .idle
+                return
+            }
+            let segments = try await store.segments(meetingID: meetingID)
+            let sessions = try await store.recordingSessions(meetingID: meetingID)
+            let context = ContinuationContext(
+                baseSegments: segments,
+                timelineStartMilliseconds: ContinueRecordingPolicy.timelineStartMilliseconds(
+                    sessions: sessions,
+                    existingTranscript: segments
+                )
+            )
+            await beginMeeting(
+                meetingID: meetingID,
+                continuation: context,
+                ownsPreparingState: true
+            )
+        } catch {
+            state.recordingPhase = .idle
+            state.recordingStartupStage = .idle
+            state.report(.meetingLoad, error.localizedDescription)
+        }
+    }
+
+    private struct ContinuationContext {
+        let baseSegments: [TranscriptSegment]
+        let timelineStartMilliseconds: Int64
+    }
+
+    private func beginMeeting(
+        meetingID requestedMeetingID: UUID?,
+        continuation: ContinuationContext?,
+        ownsPreparingState: Bool = false
+    ) async {
+        if !ownsPreparingState {
+            guard !state.recordingPhase.isBusy else { return }
+        }
+        // Claim capture ownership before the asynchronous filesystem preflight
+        // so two quick Record actions cannot both pass the idle guard.
+        state.recordingPhase = .preparing
+        state.recordingStartupStage = .arming
+        let preflight: DiskHeadroomAssessment?
+        do {
+            let availableBytes = try await recordingFreeSpace.availableBytes(at: applicationDataURL)
+            preflight = RecordingDiskProtection.assessment(
+                availableBytes: availableBytes,
+                microphoneEnabled: state.microphoneCaptureEnabled
+            )
+        } catch {
+            preflight = nil
+            logger.info("Recording disk preflight unavailable: \(error.localizedDescription, privacy: .public)")
+        }
+        if let preflight, !preflight.canStartRecording {
+            state.recordingPhase = .idle
+            state.recordingStartupStage = .idle
+            state.report(.storage, RecordingDiskProtection.refusalMessage(preflight))
+            return
+        }
+        let generation = UUID()
+        liveSessionGeneration = generation
         var meeting: Meeting
         if let requestedMeetingID, let stored = try? await store.meeting(id: requestedMeetingID) {
             meeting = stored
-            meeting.startedAt = Date()
+            if continuation == nil { meeting.startedAt = Date() }
+            meeting.endedAt = nil
             meeting.updatedAt = Date()
             meeting.status = .idle
             meeting.errorMessage = nil
@@ -281,18 +458,30 @@ final class AppCoordinator {
             setSelection(.meeting(meeting.id))
             state.activeMeetingID = meeting.id
             assembler = TranscriptAssembler(meetingID: meeting.id)
+            activeContinuationBaseSegments = continuation?.baseSegments
+            if let continuation {
+                cachedSegments[meeting.id] = continuation.baseSegments
+                state.transcript = continuation.baseSegments.map(Self.lineItem)
+            }
             sequenceNumbers = [:]
             liveWrites.reset()
             sourcesWithDurableAudio = []
+            activePauseEvent = nil
+            state.recordingEvents = (try? await store.recordingEvents(meetingID: meeting.id)) ?? []
             microphoneConfigurationTask?.cancel()
             microphoneConfigurationTask = nil
 
-            let recordingGraph = try await prepareRecordingSession(for: meeting)
+            let recordingGraph = try await prepareRecordingSession(
+                for: meeting,
+                continuationTimelineStart: continuation?.timelineStartMilliseconds,
+                recordsContinuationBoundary: continuation != nil
+            )
             activeRecordingSession = recordingGraph.session
             activeRecordingSources = recordingGraph.sources
             state.recordingDiagnostics = initialRecordingDiagnostics(
                 microphoneEnabled: state.microphoneCaptureEnabled
             )
+            if let preflight { updateDiskDiagnostics(preflight) }
 
             let pipeline = AudioPipeline(rootDirectory: applicationDataURL.appending(path: "RecoveryAudio"))
             audioPipeline = pipeline
@@ -305,6 +494,8 @@ final class AppCoordinator {
                     timelineStartMilliseconds: recordingGraph.session.timelineStartMilliseconds
                 )
             )
+            startSleepResilience(for: pipeline)
+            startDiskHeadroomMonitoring(for: pipeline)
             // AudioDeviceStart can deliver its first callback before `start()`
             // returns. Never regress the ready state that callback established.
             if state.recordingPhase == .preparing {
@@ -318,11 +509,15 @@ final class AppCoordinator {
             // then begins optional live ASR. The file writer is upstream of
             // both, so no opening audio waits for a model.
         } catch {
+            sleepResilience?.stop()
+            sleepResilience = nil
             if let audioPipeline {
                 _ = try? await audioPipeline.stop()
             }
             eventTask?.cancel()
             transcriptTask?.cancel()
+            diskHeadroomTask?.cancel()
+            diskHeadroomTask = nil
             self.audioPipeline = nil
             if var recordingSession = activeRecordingSession {
                 recordingSession.wallEndedAt = Date()
@@ -330,6 +525,7 @@ final class AppCoordinator {
                 try? await store.saveRecordingSession(recordingSession)
             }
             activeRecordingSession = nil
+            activeContinuationBaseSegments = nil
             activeRecordingSources = [:]
             if liveSessionGeneration == generation { liveSessionGeneration = nil }
             logger.error("Start failed: \(error.localizedDescription, privacy: .public)")
@@ -402,8 +598,24 @@ final class AppCoordinator {
             if state.recordingPhase == .paused {
                 try await audioPipeline.resume()
                 state.markPaused(false)
+                await finishPauseBoundary(at: Date())
             } else {
                 try await audioPipeline.pause()
+                guard let session = activeRecordingSession else {
+                    throw CoordinatorError.providerUnavailable("The recording session manifest is missing.")
+                }
+                let event = RecordingEvent(
+                    sessionID: session.id,
+                    kind: .pause,
+                    timelineMilliseconds: await audioPipeline.timelinePositionMilliseconds,
+                    wallClockAt: Date()
+                )
+                activePauseEvent = event
+                do {
+                    try await store.saveRecordingEvent(event)
+                } catch {
+                    state.recordingNotice = "The pause boundary could not be saved yet; recorded audio remains safe."
+                }
                 state.markPaused(true)
             }
         } catch {
@@ -415,8 +627,36 @@ final class AppCoordinator {
         }
     }
 
+    private func finishPauseBoundary(at wallEndedAt: Date) async {
+        guard var event = activePauseEvent else { return }
+        activePauseEvent = nil
+        let duration = wallEndedAt.timeIntervalSince(event.wallClockAt)
+        event.durationMilliseconds = duration.isFinite && duration >= 0
+            ? Int64(min((duration * 1_000).rounded(), Double(Int64.max)))
+            : nil
+        do {
+            try await store.saveRecordingEvent(event)
+            if let index = state.recordingEvents.firstIndex(where: { $0.id == event.id }) {
+                state.recordingEvents[index] = event
+            } else {
+                state.recordingEvents.append(event)
+                state.recordingEvents.sort {
+                    ($0.timelineMilliseconds, $0.wallClockAt)
+                        < ($1.timelineMilliseconds, $1.wallClockAt)
+                }
+            }
+        } catch {
+            state.recordingNotice = "The pause duration could not be saved; recorded audio remains safe."
+        }
+    }
+
     func stopMeeting() async {
         guard let meetingID = state.activeMeetingID, let audioPipeline else { return }
+        await finishPauseBoundary(at: Date())
+        sleepResilience?.stop()
+        sleepResilience = nil
+        diskHeadroomTask?.cancel()
+        diskHeadroomTask = nil
         microphoneConfigurationTask?.cancel()
         microphoneConfigurationTask = nil
         defer {
@@ -491,129 +731,36 @@ final class AppCoordinator {
                 // not yet moved from `audioTracks` to the session graph.
                 try await store.saveAudioTrack(track)
             }
-            guard let systemTrack = finalizationTracks.first(where: { $0.source == .system }) else {
+            guard finalizationTracks.contains(where: { $0.source == .system }) else {
                 throw CoordinatorError.providerUnavailable("No system-audio take was finalized.")
             }
 
-            state.updateFinalization(
-                stage: LiveTranscriptionPolicy.stageAfterSavingAudio(
-                    isEnabled: state.liveTranscriptionEnabled
-                ),
-                progress: 0.15
-            )
+            // Capture ownership ends at this durable boundary. Final decoding
+            // is represented by a retryable job and must not prevent the next
+            // meeting from opening its own capture session.
             liveSetupTask?.cancel()
-            // Do not await this task. WhisperKit/Core ML model construction does
-            // not reliably cooperate with cancellation.
             liveSetupTask = nil
             transcriptTask?.cancel()
             transcriptTask = nil
             if let liveEngine = speechEngine {
-                // The live model (large-v3-turbo, 616 MB) and the final model
-                // (large-v3, 598 MB) are different artifacts, so an unfinished
-                // teardown leaves both resident exactly at the final pass's peak.
-                // `cancel()` releases the decoder, which makes this wait worth
-                // roughly 600 MB at the moment the machine has least to spare.
-                //
-                // It stays bounded because the risk is real: `cancel()` queues on
-                // the engine actor behind an in-flight Core ML decode. Five
-                // seconds comfortably exceeds one decode of Whisper's 30-second
-                // window on the slowest Mac this ships to, and a wedged decode
-                // then costs a pause in finalization rather than a hang — the
-                // teardown finishes on its own and its memory is merely late.
                 await BoundedWait.finish(within: .seconds(5)) { await liveEngine.cancel() }
             }
-
-            let liveSegments = assembler?.snapshot.segments ?? []
             speechEngine = nil
             loadedModel = nil
-
-            let finalRevision = (assembler?.snapshot.revision ?? 0) + 1
-            var finalSegments: [TranscriptSegment]
-            do {
-                let finalizer = WhisperKitFinalTranscriber(
-                    downloadBase: modelStoragePaths.whisperDownloadBase
-                )
-                let snapshot = try await finalizer.transcribe(
-                    meetingID: meetingID,
-                    tracks: finalizationTracks,
-                    model: speechModel(named: state.draft.finalModel),
-                    languageCode: languageCode,
-                    revision: finalRevision,
-                    progress: { [weak self] progress in
-                        await MainActor.run {
-                            guard let self,
-                                  self.state.activeMeetingID == meetingID,
-                                  case .finalizing = self.state.recordingPhase else { return }
-                            switch progress {
-                            case .loadingModel:
-                                self.state.updateFinalization(stage: .loadingFinalModel, progress: 0.25)
-                            case .transcribing:
-                                self.state.updateFinalization(stage: .transcribing, progress: 0.45)
-                            }
-                        }
-                    }
-                )
-                finalSegments = snapshot.segments
-            } catch {
-                logger.warning("Final ASR unavailable; preserving live transcript: \(error.localizedDescription, privacy: .public)")
-                guard LiveTranscriptionPolicy.fallback(liveSegmentCount: liveSegments.count)
-                    == .keepLiveTranscript else { throw error }
-                finalSegments = liveSegments
-            }
-            if !finalSegments.isEmpty {
-                let target = systemTrack
-                if FileManager.default.fileExists(atPath: target.fileURL.path) {
-                    state.updateFinalization(stage: .diarizing, progress: 0.72)
-                    do {
-                        let diarizer = diarizationEngine ?? FluidAudioDiarizationEngine(
-                            modelsDirectory: modelStoragePaths.diarizationModelsDirectory
-                        )
-                        diarizationEngine = diarizer
-                        let turns = try await diarizer.diarize(audioFileURL: target.fileURL)
-                        finalSegments = SpeakerAttributor.assign(turns: turns, to: finalSegments)
-                    } catch {
-                        logger.warning("Diarization unavailable: \(error.localizedDescription, privacy: .public)")
-                        finalSegments = SpeakerAttributor.assign(turns: [], to: finalSegments)
-                    }
-                }
-
-                let nextRevision = finalRevision
-                let final = finalSegments.map { segment in
-                    var copy = segment
-                    copy.revision = nextRevision
-                    copy.stability = .final
-                    return copy
-                }
-                let snapshot = TranscriptSnapshot(meetingID: meetingID, revision: nextRevision, segments: final)
-                try await store.replaceTranscript(snapshot)
-                cachedSegments[meetingID] = final
-                state.transcript = final.map(Self.lineItem)
-            }
-
-            var meeting = try await store.meeting(id: meetingID) ?? Meeting(id: meetingID, title: resolvedTitle)
-            meeting.endedAt = Date()
-            meeting.updatedAt = Date()
-            meeting.status = .ready
-            try await store.saveMeeting(meeting)
-            updateListItem(meeting, excerpt: finalSegments.first?.text ?? "Meeting captured locally")
-
-            if MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(
-                meetingRetainsAudio: meeting.retainsAudio
-            ) {
-                try await store.deleteAudioFiles(meetingID: meetingID)
-            }
-
+            let job = FinalizationJob(
+                sessionID: recordingSession.id,
+                modelID: speechModel(named: state.draft.finalModel).id,
+                languageCode: languageCode,
+                audioDurationMilliseconds: recordingSession.capturedDurationMilliseconds
+            )
+            try await store.enqueueFinalizationJob(job)
             self.audioPipeline = nil
             activeRecordingSession = nil
+            activeContinuationBaseSegments = nil
             activeRecordingSources = [:]
             sourcesWithDurableAudio = []
-            setWorkspaceTab(.summary, for: meetingID)
             state.markFinished()
-            // Insights are useful, but they must not hold the completed meeting
-            // hostage behind a multi-minute CLI or network round trip.
-            Task { [weak self] in
-                await self?.generateInsights(meetingID: meetingID)
-            }
+            enqueueBackgroundFinalization(meetingID: meetingID, jobID: job.id)
         } catch {
             logger.error("Finalization failed: \(error.localizedDescription, privacy: .public)")
             try? await store.updateMeetingStatus(id: meetingID, status: .interrupted, errorMessage: error.localizedDescription)
@@ -628,6 +775,7 @@ final class AppCoordinator {
                 try? await store.saveRecordingSession(recordingSession)
             }
             activeRecordingSession = nil
+            activeContinuationBaseSegments = nil
             activeRecordingSources = [:]
             sourcesWithDurableAudio = []
             state.markFailed(.init(
@@ -665,6 +813,7 @@ final class AppCoordinator {
         meetingLoadGeneration = generation
         do {
             let segments = try await store.segments(meetingID: id)
+            let recordingEvents = try await store.recordingEvents(meetingID: id)
             let versions = try await store.summaryVersions(meetingID: id, limit: 50)
             let activeVersion = try await store.activeSummaryVersion(meetingID: id)
             if let meeting = try await store.meeting(id: id),
@@ -699,6 +848,7 @@ final class AppCoordinator {
             cachedSegments[id] = segments
             guard state.activeMeetingID != id else { return }
             state.transcript = segments.map(Self.lineItem)
+            state.recordingEvents = recordingEvents
             // The natural moment to reconcile a published link with what this
             // Mac now holds. Costs one checksum and no request when nothing
             // shared has changed, which is almost always.
@@ -707,6 +857,28 @@ final class AppCoordinator {
             }
         } catch {
             state.report(.meetingLoad, error.localizedDescription)
+        }
+    }
+
+    func preparePlayback(meetingID: UUID) async {
+        guard playbackController.meetingID != meetingID || !playbackController.isAvailable else { return }
+        do {
+            let tracks = try await durableFinalizationTracks(meetingID: meetingID)
+                .filter { FileManager.default.fileExists(atPath: $0.fileURL.path) }
+            guard !tracks.isEmpty else {
+                if playbackController.meetingID == meetingID { playbackController.stop() }
+                return
+            }
+            let segments = try await store.segments(meetingID: meetingID).map(Self.lineItem)
+            let markers = try await store.recordingMarkers(meetingID: meetingID)
+            try await playbackController.load(
+                meetingID: meetingID,
+                tracks: tracks,
+                transcript: segments,
+                markers: markers
+            )
+        } catch {
+            logger.info("Playback unavailable: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -1293,17 +1465,31 @@ final class AppCoordinator {
         }
     }
 
-    func recoverMeeting(_ id: UUID) async {
+    func recoverMeeting(
+        _ id: UUID,
+        finalizationJobID: UUID? = nil,
+        presentsProgress: Bool = true
+    ) async {
+        guard !presentsProgress
+            || !state.recordingPhase.isBusy
+            || state.activeMeetingID == id else { return }
         defer {
             Task { @MainActor [weak self] in
                 await self?.applyQueuedModelStorageChangeIfPossible()
             }
         }
-        state.activeMeetingID = id
-        state.markFinalizing(stage: .savingAudio, progress: 0.05, detail: "Checking saved audio…")
+        if presentsProgress {
+            state.activeMeetingID = id
+            state.markFinalizing(stage: .savingAudio, progress: 0.05, detail: "Checking saved audio…")
+        }
+        var durableJob: FinalizationJob?
         do {
+            durableJob = try await prepareFinalizationJob(meetingID: id, preferredID: finalizationJobID)
             try await registerRecoveryAudio(for: id)
-            let tracks = try await store.audioTracks(meetingID: id)
+            let tracks = try await durableFinalizationTracks(
+                meetingID: id,
+                sessionID: durableJob?.sessionID
+            )
             guard !tracks.isEmpty else {
                 throw CoordinatorError.providerUnavailable("No recoverable audio was found for this meeting.")
             }
@@ -1312,15 +1498,27 @@ final class AppCoordinator {
             let finalizer = WhisperKitFinalTranscriber(
                 downloadBase: modelStoragePaths.whisperDownloadBase
             )
+            // Live provisional rows from the session being finalized are not a
+            // durable append base. Only the previously final transcript is
+            // preserved and merged with this session's new final pass.
+            let existing = try await store.segments(meetingID: id)
+                .filter { $0.stability == .final }
+            let revision = (existing.map(\.revision).max() ?? 0) + 1
+            let durableJobID = durableJob?.id
             var final = try await finalizer.transcribe(
                 meetingID: id,
                 tracks: tracks,
                 model: speechModel(named: state.draft.finalModel),
                 languageCode: languageCode,
-                revision: 1,
+                revision: revision,
+                startingOrdinals: AppendedTranscriptMergePolicy.startingOrdinals(
+                    meetingID: id,
+                    existing: existing
+                ),
                 progress: { [weak self] progress in
                     await MainActor.run {
                         guard let self,
+                              presentsProgress,
                               self.state.activeMeetingID == id,
                               case .finalizing = self.state.recordingPhase else { return }
                         switch progress {
@@ -1330,11 +1528,28 @@ final class AppCoordinator {
                             self.state.updateFinalization(stage: .transcribing, progress: 0.45)
                         }
                     }
+                    if let self, let durableJobID {
+                        let progressValue = progress == .loadingModel ? 0.25 : 0.55
+                        _ = try? await self.updateFinalizationJob(
+                            id: durableJobID,
+                            state: .transcribing,
+                            progress: progressValue
+                        )
+                    }
                 }
             ).segments
 
             if let systemTrack = tracks.first(where: { $0.source == .system }) {
-                state.updateFinalization(stage: .diarizing, progress: 0.72)
+                if presentsProgress {
+                    state.updateFinalization(stage: .diarizing, progress: 0.72)
+                }
+                if let jobID = durableJob?.id {
+                    durableJob = try await updateFinalizationJob(
+                        id: jobID,
+                        state: .diarizing,
+                        progress: 0.75
+                    )
+                }
                 do {
                     // The same engine as finalization, and for the same reason:
                     // both ask for the default configuration, which is the one
@@ -1343,7 +1558,12 @@ final class AppCoordinator {
                         modelsDirectory: modelStoragePaths.diarizationModelsDirectory
                     )
                     diarizationEngine = diarizer
-                    let turns = try await diarizer.diarize(audioFileURL: systemTrack.fileURL)
+                    let turns = try await diarizer.diarize(audioFileURL: systemTrack.fileURL).map { turn in
+                        var turn = turn
+                        turn.startMilliseconds += systemTrack.timelineStartMilliseconds
+                        turn.endMilliseconds += systemTrack.timelineStartMilliseconds
+                        return turn
+                    }
                     final = SpeakerAttributor.assign(turns: turns, to: final)
                 } catch {
                     final = SpeakerAttributor.assign(turns: [], to: final)
@@ -1351,12 +1571,16 @@ final class AppCoordinator {
             }
             final = final.map { segment in
                 var copy = segment
-                copy.stability = .final
+                copy.revision = revision
+                copy.stability = TranscriptStability.final
                 return copy
             }
-            try await store.replaceTranscript(.init(meetingID: id, revision: 1, segments: final))
-            cachedSegments[id] = final
-            state.transcript = final.map(Self.lineItem)
+            let merged = try AppendedTranscriptMergePolicy.merge(existing: existing, appended: final)
+            try await store.replaceTranscript(.init(meetingID: id, revision: revision, segments: merged))
+            cachedSegments[id] = merged
+            if presentsProgress || (!state.recordingPhase.isCapturing && selectedMeetingID == id) {
+                state.transcript = merged.map(Self.lineItem)
+            }
 
             guard var meeting = try await store.meeting(id: id) else {
                 throw CoordinatorError.providerUnavailable("The interrupted meeting could not be loaded.")
@@ -1366,26 +1590,159 @@ final class AppCoordinator {
             meeting.status = .ready
             meeting.errorMessage = nil
             try await store.saveMeeting(meeting)
-            updateListItem(meeting, excerpt: final.first?.text ?? "Recovered local transcript")
+            updateListItem(meeting, excerpt: merged.first?.text ?? "Recovered local transcript")
+            if let jobID = durableJob?.id {
+                if durableJob?.state == .transcribing {
+                    durableJob = try await updateFinalizationJob(
+                        id: jobID,
+                        state: .diarizing,
+                        progress: 0.9
+                    )
+                }
+                durableJob = try await updateFinalizationJob(
+                    id: jobID,
+                    state: .succeeded,
+                    progress: 1,
+                    finishedAt: Date()
+                )
+            }
             if MeetingAudioRetentionPolicy.shouldDeleteAfterFinalization(
                 meetingRetainsAudio: meeting.retainsAudio
             ) {
                 try await store.deleteAudioFiles(meetingID: id)
             }
-            state.markFinished()
+            if presentsProgress { state.markFinished() }
         } catch {
+            if let jobID = durableJob?.id {
+                _ = try? await updateFinalizationJob(
+                    id: jobID,
+                    state: .failed,
+                    progress: durableJob?.progress ?? 0,
+                    finishedAt: Date(),
+                    errorMessage: error.localizedDescription
+                )
+            }
             try? await store.updateMeetingStatus(id: id, status: .interrupted, errorMessage: error.localizedDescription)
             if var meeting = try? await store.meeting(id: id) {
                 meeting.status = .interrupted
                 meeting.errorMessage = error.localizedDescription
                 updateListItem(meeting, excerpt: "Recording is safe. Retry finalization when ready.")
             }
-            state.markFailed(.init(
-                kind: .finalization,
-                message: "Recovery stopped, but the original audio remains safe: \(error.localizedDescription)",
-                meetingID: id
-            ))
+            if presentsProgress {
+                state.markFailed(.init(
+                    kind: .finalization,
+                    message: "Recovery stopped, but the original audio remains safe: \(error.localizedDescription)",
+                    meetingID: id
+                ))
+            }
         }
+    }
+
+    private func enqueueBackgroundFinalization(meetingID: UUID, jobID: UUID) {
+        let previous = backgroundFinalizationTask
+        backgroundFinalizationTask = Task { [weak self] in
+            _ = await previous?.value
+            guard let self else { return }
+            // Heavy local decoding yields ownership to live capture. Jobs stay
+            // durable and queued while a meeting is preparing, recording, or
+            // paused, then resume in FIFO order when capture is idle.
+            while self.state.recordingPhase.isCapturing {
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return
+                }
+            }
+            await self.recoverMeeting(
+                meetingID,
+                finalizationJobID: jobID,
+                presentsProgress: false
+            )
+            if let finalizedMeeting = try? await self.store.meeting(id: meetingID),
+               finalizedMeeting.status == .ready {
+                await self.generateInsights(meetingID: meetingID)
+            }
+        }
+    }
+
+    private func prepareFinalizationJob(
+        meetingID: UUID,
+        preferredID: UUID?
+    ) async throws -> FinalizationJob? {
+        var job: FinalizationJob?
+        if let preferredID {
+            job = try await store.finalizationJob(id: preferredID)
+        } else {
+            job = try await store.finalizationJobs(meetingID: meetingID)
+                .last(where: { $0.state != .succeeded })
+        }
+        guard var job else { return nil }
+        if job.state == .failed {
+            job = try await store.retryFinalizationJob(id: job.id)
+        }
+        if job.state == .queued {
+            job.state = .transcribing
+            job.attemptCount += 1
+            job.progress = 0
+            job.startedAt = Date()
+            job.finishedAt = nil
+            job.errorMessage = nil
+            try await store.updateFinalizationJob(job)
+        }
+        return job
+    }
+
+    @discardableResult
+    private func updateFinalizationJob(
+        id: UUID,
+        state: FinalizationJobState,
+        progress: Double,
+        finishedAt: Date? = nil,
+        errorMessage: String? = nil
+    ) async throws -> FinalizationJob {
+        guard var job = try await store.finalizationJob(id: id) else {
+            throw CoordinatorError.providerUnavailable("The finalization job could not be loaded.")
+        }
+        job.state = state
+        job.progress = min(1, max(0, progress))
+        job.finishedAt = finishedAt
+        job.errorMessage = errorMessage
+        try await store.updateFinalizationJob(job)
+        return job
+    }
+
+    private func durableFinalizationTracks(
+        meetingID: UUID,
+        sessionID requestedSessionID: UUID? = nil
+    ) async throws -> [MeetingAudioTrack] {
+        var tracks: [MeetingAudioTrack] = []
+        let sessions = try await store.recordingSessions(meetingID: meetingID)
+            .filter { requestedSessionID == nil || $0.id == requestedSessionID }
+        for session in sessions {
+            let sources = try await store.sessionAudioSources(sessionID: session.id)
+            let sourceByID = Dictionary(uniqueKeysWithValues: sources.map { ($0.id, $0) })
+            for take in try await store.audioTakes(sessionID: session.id) where take.isComplete {
+                guard let source = sourceByID[take.sourceID] else { continue }
+                let audioSource: AudioSource = source.kind == .microphone ? .microphone : .system
+                tracks.append(MeetingAudioTrack(
+                    meetingID: meetingID,
+                    source: audioSource,
+                    fileURL: take.fileURL,
+                    sampleRate: take.sampleRate,
+                    channelCount: take.channelCount,
+                    timelineStartMilliseconds: take.timelineStartMilliseconds,
+                    durationMilliseconds: take.durationMilliseconds,
+                    isComplete: take.isComplete
+                ))
+            }
+        }
+        // Legacy meetings have no session graph. A session-specific job must
+        // never fall back to every compatibility track, which would decode an
+        // hour of existing audio for a five-minute append.
+        if tracks.isEmpty, requestedSessionID == nil {
+            return try await store.audioTracks(meetingID: meetingID)
+        }
+        return tracks
     }
 
     func searchMeetings(_ query: String) async {
@@ -1830,6 +2187,45 @@ final class AppCoordinator {
     func setRetainAudio(_ retainsAudio: Bool) {
         state.retainAudio = retainsAudio
         preferences.retainAudio = retainsAudio
+    }
+
+    /// Stamps user emphasis against the capture clock. Live ASR is deliberately
+    /// absent from this path: provisional text may be off or may not yet have
+    /// produced a segment, while the written audio timeline is already valid.
+    func markMoment(_ type: RecordingMarkerType = .important) async {
+        guard state.recordingPhase.isCapturing,
+              let meetingID = state.activeMeetingID,
+              let session = activeRecordingSession,
+              session.meetingID == meetingID,
+              let audioPipeline else { return }
+        let position = await audioPipeline.timelinePositionMilliseconds
+        do {
+            try await store.saveRecordingMarker(.init(
+                meetingID: meetingID,
+                sessionID: session.id,
+                type: type,
+                timelineMilliseconds: position
+            ))
+        } catch {
+            state.recordingNotice = "That moment could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    /// Captures a note against the same sample-derived meeting clock as markers.
+    /// It neither reads nor requires the provisional transcript.
+    @discardableResult
+    func saveQuickNote(_ draft: String) async -> Bool {
+        guard state.recordingPhase.isCapturing,
+              let meetingID = state.activeMeetingID,
+              let audioPipeline else { return false }
+        let position = await audioPipeline.timelinePositionMilliseconds
+        guard let updated = QuickNotePolicy.appending(
+            draft: draft,
+            at: position,
+            to: state.meetingNotes[meetingID] ?? ""
+        ) else { return false }
+        queueMeetingNotes(meetingID: meetingID, text: updated)
+        return true
     }
 
     func setMicrophoneCaptureEnabled(_ isEnabled: Bool) {
@@ -2347,13 +2743,15 @@ final class AppCoordinator {
     }
 
     private func prepareRecordingSession(
-        for meeting: Meeting
+        for meeting: Meeting,
+        continuationTimelineStart: Int64? = nil,
+        recordsContinuationBoundary: Bool = false
     ) async throws -> (session: RecordingSession, sources: [AudioSource: SessionAudioSource]) {
         let existing = try await store.recordingSessions(meetingID: meeting.id)
         let ordinal = (existing.map(\.ordinal).max() ?? -1) + 1
-        let timelineStart = existing.map {
+        let timelineStart = continuationTimelineStart ?? (existing.map {
             $0.timelineStartMilliseconds + $0.capturedDurationMilliseconds
-        }.max() ?? 0
+        }.max() ?? 0)
         let session = RecordingSession(
             meetingID: meeting.id,
             ordinal: ordinal,
@@ -2380,6 +2778,14 @@ final class AppCoordinator {
         try await store.saveRecordingSession(session)
         try await store.saveSessionAudioSource(system)
         try await store.saveSessionAudioSource(microphone)
+        if recordsContinuationBoundary {
+            try await store.saveRecordingEvent(.init(
+                sessionID: session.id,
+                kind: .continued,
+                timelineMilliseconds: timelineStart,
+                wallClockAt: session.wallStartedAt
+            ))
+        }
         return (session, [.system: system, .microphone: microphone])
     }
 
@@ -2465,6 +2871,110 @@ final class AppCoordinator {
         )
     }
 
+    private func startSleepResilience(for pipeline: AudioPipeline) {
+        sleepResilience?.stop()
+        let lifecycle = RecordingSleepResilience(
+            prepare: { [weak self, weak pipeline] monotonicSeconds in
+                guard let self,
+                      let pipeline,
+                      self.audioPipeline === pipeline,
+                      self.state.recordingPhase.isCapturing
+                else { throw AudioPipelineError.notRunning }
+                let boundary = try await pipeline.prepareForSleep(at: monotonicSeconds)
+                self.updateSourceDiagnostics(source: .system, state: .arming)
+                if self.state.microphoneCaptureEnabled {
+                    self.updateSourceDiagnostics(source: .microphone, state: .arming)
+                }
+                self.state.recordingNotice = "The Mac slept. Recorded audio is safe; capture will resume after wake."
+                return boundary
+            },
+            resume: { [weak self, weak pipeline] monotonicSeconds in
+                guard let self,
+                      let pipeline,
+                      self.audioPipeline === pipeline,
+                      self.state.recordingPhase.isCapturing
+                else { throw AudioPipelineError.notRunning }
+                return try await pipeline.resumeAfterWake(at: monotonicSeconds)
+            },
+            onGap: { [weak self, weak pipeline] gap in
+                guard let self,
+                      let pipeline,
+                      self.audioPipeline === pipeline,
+                      let session = self.activeRecordingSession else { return }
+                try? await self.store.saveRecordingEvent(.init(
+                    sessionID: session.id,
+                    kind: .sleepGap,
+                    timelineMilliseconds: gap.timelineMilliseconds,
+                    wallClockAt: gap.wallStartedAt,
+                    durationMilliseconds: gap.durationMilliseconds,
+                    metadata: [
+                        "resumedAt": ISO8601DateFormatter().string(from: gap.wallEndedAt),
+                    ]
+                ))
+                self.state.recordingNotice = gap.durationMilliseconds.map {
+                    "Recording resumed after a \(DurationText.spoken(Double($0) / 1_000)) sleep gap."
+                } ?? "Recording resumed after a sleep gap."
+            },
+            onRecoveryFailure: { [weak self, weak pipeline] error in
+                guard let self,
+                      let pipeline,
+                      self.audioPipeline === pipeline else { return }
+                self.updateSourceDiagnostics(
+                    source: .system,
+                    state: .unavailable(error.localizedDescription)
+                )
+                self.state.recordingNotice = "Audio devices did not return after wake. Check the selected output, then resume recording."
+            }
+        )
+        sleepResilience = lifecycle
+        lifecycle.start()
+    }
+
+    private func startDiskHeadroomMonitoring(for pipeline: AudioPipeline) {
+        diskHeadroomTask?.cancel()
+        diskHeadroomTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled,
+                  self.audioPipeline === pipeline,
+                  self.state.recordingPhase.isBusy {
+                do {
+                    let bytes = try await self.recordingFreeSpace.availableBytes(
+                        at: self.applicationDataURL
+                    )
+                    guard !Task.isCancelled,
+                          self.audioPipeline === pipeline else { return }
+                    self.updateDiskDiagnostics(
+                        RecordingDiskProtection.assessment(
+                            availableBytes: bytes,
+                            microphoneEnabled: self.state.microphoneCaptureEnabled
+                        )
+                    )
+                } catch {
+                    self.logger.info(
+                        "Recording disk check unavailable: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func updateDiskDiagnostics(_ assessment: DiskHeadroomAssessment) {
+        let snapshot = state.recordingDiagnostics
+        state.recordingDiagnostics = RecordingDiagnosticsSnapshot(
+            sources: snapshot.sources,
+            liveText: snapshot.liveText,
+            writer: RecordingWriterDiagnostics(
+                sampleRateHertz: snapshot.writer.sampleRateHertz,
+                diskState: RecordingDiskProtection.diagnosticsState(for: assessment.level)
+            )
+        )
+    }
+
     func revealApplicationData() {
         NSWorkspace.shared.activateFileViewerSelecting([applicationDataURL])
     }
@@ -2515,6 +3025,8 @@ final class AppCoordinator {
                         """)
                 case .status(let status):
                     if case .failed(let message) = status {
+                        self.sleepResilience?.stop()
+                        self.sleepResilience = nil
                         self.state.markFailed(.init(
                             kind: .capture,
                             message: message,
@@ -2526,6 +3038,20 @@ final class AppCoordinator {
                     if case .unavailable(let message) = health.state {
                         self.state.recordingNotice = message
                     }
+                case .transition(let transition):
+                    guard let session = self.activeRecordingSession,
+                          let source = self.activeRecordingSources[transition.source]
+                    else { continue }
+                    try? await self.store.saveRecordingEvent(.init(
+                        sessionID: session.id,
+                        sourceID: source.id,
+                        kind: transition.kind == .deviceChanged
+                            ? .deviceChanged
+                            : .formatChanged,
+                        timelineMilliseconds: transition.timelineMilliseconds,
+                        wallClockAt: Date(),
+                        metadata: transition.detail.map { ["detail": $0] } ?? [:]
+                    ))
                 }
             }
         }
@@ -2537,7 +3063,11 @@ final class AppCoordinator {
         guard liveSessionGeneration == generation,
               state.recordingPhase == .preparing,
               state.activeMeetingID == meetingID else { return }
-        state.markRecordingStarted(meetingID: meetingID)
+        state.markRecordingStarted(
+            meetingID: meetingID,
+            preservingExistingContent: activeContinuationBaseSegments != nil,
+            timelineStartMilliseconds: activeRecordingSession?.timelineStartMilliseconds ?? 0
+        )
         if state.liveTranscriptionEnabled {
             startLiveTranscription(meetingID: meetingID, generation: generation)
         }
@@ -2560,8 +3090,13 @@ final class AppCoordinator {
                     let snapshot = assembler.apply(delta)
                     guard snapshot.meetingID == meetingID else { continue }
                     self.assembler = assembler
-                    self.cachedSegments[snapshot.meetingID] = snapshot.segments
-                    self.state.transcript = snapshot.segments.map(Self.lineItem)
+                    let displayed = (self.activeContinuationBaseSegments ?? []) + snapshot.segments
+                    let orderedDisplay = displayed.sorted {
+                        ($0.startMilliseconds, $0.source.rawValue, $0.id)
+                            < ($1.startMilliseconds, $1.source.rawValue, $1.id)
+                    }
+                    self.cachedSegments[snapshot.meetingID] = orderedDisplay
+                    self.state.transcript = orderedDisplay.map(Self.lineItem)
                     let pending = self.liveWrites.unwritten(in: snapshot)
                     guard !pending.isEmpty else { continue }
                     do {

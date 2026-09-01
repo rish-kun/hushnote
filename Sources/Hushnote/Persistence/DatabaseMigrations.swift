@@ -444,6 +444,30 @@ enum HushnoteDatabaseMigrations {
                 }
             }
         }
+        migrator.registerMigration("v11_recording_markers") { db in
+            try db.create(table: "recordingMarkers") { table in
+                table.column("id", .text).primaryKey()
+                table.column("meetingID", .text)
+                    .notNull()
+                    .references("meetings", onDelete: .cascade)
+                table.column("sessionID", .text)
+                    .notNull()
+                    .references("recordingSessions", onDelete: .cascade)
+                table.column("type", .text).notNull()
+                table.column("timelineMilliseconds", .integer).notNull()
+                table.column("wallClockAt", .datetime).notNull()
+            }
+            try db.create(
+                index: "recordingMarkers_on_meetingID_timeline",
+                on: "recordingMarkers",
+                columns: ["meetingID", "timelineMilliseconds", "wallClockAt"]
+            )
+            try db.create(
+                index: "recordingMarkers_on_sessionID_timeline",
+                on: "recordingMarkers",
+                columns: ["sessionID", "timelineMilliseconds", "wallClockAt"]
+            )
+        }
         return migrator
     }
 

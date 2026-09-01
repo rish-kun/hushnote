@@ -157,6 +157,116 @@ final class EventCollector: @unchecked Sendable {
             }
         }
     }
+
+    var transitions: [AudioCaptureTransition] {
+        lock.withLock {
+            events.compactMap { event in
+                if case .transition(let transition) = event { return transition }
+                return nil
+            }
+        }
+    }
+}
+
+@Suite("System capture reconfiguration")
+struct SystemCaptureReconfigurationTests {
+    @Test("A device change closes the current take and continues in a new one")
+    func deviceChangeRotatesTake() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fleet = FakeCaptureFleet()
+        let collector = EventCollector()
+        let pipeline = makePipeline(directory: directory, fleet: fleet)
+        let watcher = Task { for await event in pipeline.events { collector.record(event) } }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[0].emit(milliseconds: 100)
+        fleet[0].report(.reconfigure(.deviceChanged, detail: "Built-in Output → AirPods"))
+        try await CaptureDurationTests.until { fleet.count == 2 && fleet[1].isRunning }
+        fleet[1].emit(milliseconds: 100, startingAt: 9_000)
+
+        let artifacts = try await pipeline.stop()
+        let takes = artifacts.sourceArtifacts.filter { $0.source == .system }
+        #expect(takes.count == 2)
+        #expect(takes.map(\.timelineStartMilliseconds) == [0, 100])
+        #expect(artifacts.durationMilliseconds == 200)
+        #expect(collector.transitions.first?.kind == .deviceChanged)
+        #expect(collector.transitions.first?.timelineMilliseconds == 100)
+    }
+
+    @Test("Recovery exhaustion warns without ending the meeting")
+    func boundedFailureKeepsMeetingAlive() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fleet = FakeCaptureFleet()
+        let collector = EventCollector()
+        let pipeline = makePipeline(
+            directory: directory,
+            fleet: fleet,
+            retryDelays: [0, 0, 0],
+            failCapturesAfterFirst: true
+        )
+        let watcher = Task { for await event in pipeline.events { collector.record(event) } }
+        defer { watcher.cancel() }
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[0].emit(milliseconds: 120)
+        fleet[0].report(.reconfigure(.formatChanged, detail: "48000 Hz became 24000 Hz"))
+        try await CaptureDurationTests.until {
+            collector.sourceHealth.contains { health in
+                guard health.source == .system else { return false }
+                if case .unavailable = health.state { return true }
+                return false
+            }
+        }
+
+        #expect(fleet.count == 4, "one initial capture plus three bounded attempts")
+        #expect(await pipeline.status == .recording)
+        let artifacts = try await pipeline.stop()
+        #expect(artifacts.durationMilliseconds == 120)
+        #expect(collector.transitions.first?.kind == .formatChanged)
+    }
+
+    @Test("A notice from the closed take cannot rotate its replacement")
+    func staleNoticeIsIgnored() async throws {
+        let directory = CaptureDurationTests.makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fleet = FakeCaptureFleet()
+        let pipeline = makePipeline(directory: directory, fleet: fleet)
+
+        _ = try await pipeline.start(sessionID: UUID())
+        fleet[0].emit(milliseconds: 80)
+        fleet[0].report(.reconfigure(.deviceChanged, detail: nil))
+        try await CaptureDurationTests.until { fleet.count == 2 && fleet[1].isRunning }
+        fleet[0].report(.reconfigure(.formatChanged, detail: "stale"))
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(fleet.count == 2)
+        #expect(fleet[1].isRunning)
+        _ = try await pipeline.stop()
+    }
+
+    private func makePipeline(
+        directory: URL,
+        fleet: FakeCaptureFleet,
+        retryDelays: [Double] = [0],
+        failCapturesAfterFirst: Bool = false
+    ) -> AudioPipeline {
+        AudioPipeline(
+            rootDirectory: directory,
+            captureFactory: { handler, notice in
+                let capture = fleet.next(handler, notice)
+                if failCapturesAfterFirst, fleet.count > 1 {
+                    capture.startError = AudioPipelineError.audioCaptureFailed
+                }
+                return capture
+            },
+            microphoneCaptureFactory: { MicrophoneAudioCapture() },
+            reconfigurationRetryDelays: retryDelays,
+            reconfigurationSleep: { _ in }
+        )
+    }
 }
 
 /// Hands out one fake per `start()`, so a test can hold on to a previous
@@ -712,6 +822,13 @@ struct DualSourceAudioPipelineTests {
         #expect(await pipeline.status == .paused)
         #expect(!system.isRunning)
         #expect(await pipeline.microphoneTakeIdentifier == nil)
+        try await CaptureDurationTests.until {
+            collector.sourceHealth.contains { health in
+                guard health.source == .microphone else { return false }
+                if case .unavailable = health.state { return true }
+                return false
+            }
+        }
         #expect(collector.sourceHealth.contains { health in
             guard health.source == .microphone else { return false }
             if case .unavailable = health.state { return true }

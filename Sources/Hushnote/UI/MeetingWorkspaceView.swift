@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Which face of a meeting workspace belongs on screen.
 ///
@@ -156,6 +157,22 @@ struct ActiveMeetingView: View {
 
     private var recordingControls: some View {
         HStack(spacing: 8) {
+            Menu {
+                ForEach(RecordingMarkerType.allCases) { type in
+                    Button(type.title) {
+                        Task { await coordinator.markMoment(type) }
+                    }
+                }
+            } label: {
+                Label("Mark moment", systemImage: "bookmark")
+            } primaryAction: {
+                Task { await coordinator.markMoment(.important) }
+            }
+            .hushnoteButton(.secondary)
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+            .accessibilityHint("Marks Important; open the menu to choose another type")
+            .disabled(!state.recordingPhase.isCapturing)
+
             Button(state.recordingPhase == .paused ? "Resume" : "Pause") {
                 Task { await coordinator.togglePause() }
             }
@@ -288,14 +305,108 @@ private struct ActiveTranscriptTab: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            TranscriptView(
-                // One source of truth rather than a hardcoded `false` that
-                // happens to agree with it.
-                isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
-                horizontalInset: horizontalInset,
-                isRecording: true
+            VStack(spacing: 0) {
+                LiveTranscriptFindBar(horizontalInset: horizontalInset)
+                TranscriptView(
+                    // One source of truth rather than a hardcoded `false` that
+                    // happens to agree with it.
+                    isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
+                    horizontalInset: horizontalInset,
+                    isRecording: true
+                )
+            }
+        }
+    }
+}
+
+/// Search controls for text already emitted by the live decoder.
+///
+/// This remains under `ActiveTranscriptTab`: observing the transcript here
+/// must not rebuild the active header, meters, or notes editor at ASR cadence.
+private struct LiveTranscriptFindBar: View {
+    let horizontalInset: CGFloat
+    @Environment(AppViewState.self) private var state
+    @State private var query = ""
+    @State private var selectedSegmentID: String?
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        let matches = LiveTranscriptFindPolicy.matches(query: query, in: state.transcript)
+
+        HStack(spacing: 9) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+
+            TextField("Find in live text", text: $query)
+                .textFieldStyle(.plain)
+                .focused($fieldFocused)
+                .onSubmit { move(.next, matches: matches) }
+                .hushnoteField()
+                .hushnoteFocusRing(fieldFocused)
+
+            Text(LiveTranscriptFindPolicy.positionText(selectedSegmentID: selectedSegmentID, in: matches))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+                .frame(minWidth: 72, alignment: .trailing)
+
+            Button {
+                move(.previous, matches: matches)
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .hushnoteButton(.quiet)
+            .accessibilityLabel("Previous match")
+            .disabled(matches.isEmpty)
+
+            Button {
+                move(.next, matches: matches)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .hushnoteButton(.quiet)
+            .accessibilityLabel("Next match")
+            .disabled(matches.isEmpty)
+
+            // This does not clear the query: the reader can return to the live
+            // edge, hear another minute, then continue through the same finds.
+            Button("Latest", systemImage: "arrow.down.to.line") {
+                state.transcriptJumpRequest = TranscriptJumpRequest(returnsToLatest: true)
+            }
+            .hushnoteButton(.secondary)
+            .accessibilityHint("Returns to the newest live transcript text")
+        }
+        .padding(.horizontal, horizontalInset)
+        .padding(.vertical, 10)
+        .overlay(alignment: .bottom) { HushnoteRule(opacity: 0.72) }
+        .onChange(of: query) { _, newQuery in
+            let newMatches = LiveTranscriptFindPolicy.matches(
+                query: newQuery,
+                in: state.transcript
+            )
+            selectedSegmentID = newMatches.first?.segmentID
+            if let destination = selectedSegmentID {
+                state.transcriptJumpRequest = TranscriptJumpRequest(segmentID: destination)
+            }
+        }
+        .onChange(of: matches) { _, newMatches in
+            selectedSegmentID = LiveTranscriptFindPolicy.resolvedSelection(
+                currentSegmentID: selectedSegmentID,
+                in: newMatches
             )
         }
+    }
+
+    private func move(
+        _ direction: LiveTranscriptFindPolicy.Direction,
+        matches: [LiveTranscriptMatch]
+    ) {
+        guard let destination = LiveTranscriptFindPolicy.adjacentSelection(
+            from: selectedSegmentID,
+            in: matches,
+            direction: direction
+        ) else { return }
+        selectedSegmentID = destination
+        state.transcriptJumpRequest = TranscriptJumpRequest(segmentID: destination)
     }
 }
 
@@ -303,6 +414,7 @@ struct CompletedMeetingView: View {
     let meetingID: UUID
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
+    @State private var isShowingRecordingImporter = false
 
     /// Not `state.recordingPhase`: this workspace also renders for meetings
     /// that are merely *not* the one recording. See `governingPhase`.
@@ -331,6 +443,8 @@ struct CompletedMeetingView: View {
             VStack(spacing: 0) {
                 meetingHeader(policy)
 
+                MeetingPlaybackControls(meetingID: meetingID, horizontalInset: policy.gutter)
+
                 if let exportState = state.audioExports[meetingID], exportState != .idle {
                     audioExportStatus(exportState, policy: policy)
                         .padding(.horizontal, policy.gutter)
@@ -348,7 +462,10 @@ struct CompletedMeetingView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .task(id: meetingID) { await coordinator.loadMeeting(meetingID) }
+        .task(id: meetingID) {
+            await coordinator.loadMeeting(meetingID)
+            await coordinator.preparePlayback(meetingID: meetingID)
+        }
         .sheet(
             isPresented: Binding(
                 get: { state.shareSheetMeetingID == meetingID },
@@ -356,6 +473,19 @@ struct CompletedMeetingView: View {
             )
         ) {
             MeetingShareSheet(meetingID: meetingID)
+        }
+        .fileImporter(
+            isPresented: $isShowingRecordingImporter,
+            allowedContentTypes: [.audio, .movie],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                Task { await coordinator.importRecording(from: url, into: meetingID) }
+            case .failure(let error):
+                state.report(.recordingImport, error.localizedDescription)
+            }
         }
     }
 
@@ -523,7 +653,20 @@ struct CompletedMeetingView: View {
     @ViewBuilder
     private var meetingActionControls: some View {
         shareControl
-        if canStartTranscribing {
+        if let status = meeting?.status,
+           MeetingRecordingImportPolicy.canImport(
+               into: status,
+               recordingIsBusy: state.recordingPhase.isBusy
+           ) {
+            Button("Import recording") { isShowingRecordingImporter = true }
+                .hushnoteButton(.secondary)
+        }
+        if canContinueRecording {
+            Button("Continue recording") {
+                Task { await coordinator.continueMeeting(meetingID) }
+            }
+            .hushnoteButton(.recording)
+        } else if canStartTranscribing {
             Button("Start Transcribing") {
                 Task { await coordinator.startMeeting(meetingID: meetingID) }
             }
@@ -578,6 +721,14 @@ struct CompletedMeetingView: View {
     private var canStartTranscribing: Bool {
         guard !state.recordingPhase.isBusy else { return false }
         return meeting?.status == .idle || meeting?.status == .failed
+    }
+
+    private var canContinueRecording: Bool {
+        guard let meeting else { return false }
+        return ContinueRecordingPolicy.canContinue(
+            status: meeting.status,
+            recordingIsBusy: state.recordingPhase.isBusy
+        )
     }
 
     @ViewBuilder
@@ -843,6 +994,83 @@ struct CompletedMeetingView: View {
         }
     }
 
+}
+
+private struct MeetingPlaybackControls: View {
+    let meetingID: UUID
+    let horizontalInset: CGFloat
+    @Environment(AppCoordinator.self) private var coordinator
+
+    var body: some View {
+        let playback = coordinator.playbackController
+        if playback.meetingID == meetingID, playback.isAvailable {
+            HStack(spacing: 12) {
+                Button { playback.skip(seconds: -15) } label: {
+                    Image(systemName: "gobackward.15")
+                }
+                .buttonStyle(.plain)
+                .help("Back 15 seconds")
+
+                Button { playback.togglePlayback() } label: {
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                        .frame(width: 18)
+                }
+                .hushnoteButton(.primary)
+                .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+
+                Button { playback.skip(seconds: 15) } label: {
+                    Image(systemName: "goforward.15")
+                }
+                .buttonStyle(.plain)
+                .help("Forward 15 seconds")
+
+                Text(DurationText.clock(playback.position))
+                    .font(.caption.monospacedDigit())
+                Slider(
+                    value: Binding(
+                        get: { playback.position },
+                        set: { playback.seek(to: $0) }
+                    ),
+                    in: 0...max(0.1, playback.duration)
+                )
+                .tint(HushnoteTheme.moss)
+                Text(DurationText.clock(playback.duration))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+
+                Menu("\(playback.rate.formatted())×") {
+                    ForEach([0.5, 0.75, 1, 1.25, 1.5, 2], id: \.self) { rate in
+                        Button("\(rate.formatted())×") { playback.setRate(Float(rate)) }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+
+                Menu("Jump") {
+                    ForEach(playback.jumpPoints) { point in
+                        Button("\(point.title) · \(DurationText.clock(point.seconds))") {
+                            playback.jump(to: point)
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .disabled(playback.jumpPoints.isEmpty)
+
+                Button {
+                    playback.skipsLongSilence.toggle()
+                } label: {
+                    Image(systemName: playback.skipsLongSilence ? "forward.end.fill" : "forward.end")
+                }
+                .buttonStyle(.plain)
+                .help(playback.skipsLongSilence ? "Long silence skipping is on" : "Skip long silence")
+            }
+            .font(.callout)
+            .foregroundStyle(HushnoteTheme.ink)
+            .padding(.horizontal, horizontalInset)
+            .padding(.vertical, 11)
+            .background(HushnoteTheme.controlSurface.opacity(0.45))
+            .overlay(alignment: .bottom) { HushnoteRule(opacity: 0.65) }
+        }
+    }
 }
 
 /// Product-owned workspace navigation. The selected state is carried by an
@@ -1423,6 +1651,7 @@ struct TranscriptView: View {
                 reader(
                     paragraphs: paragraphs,
                     chapters: chapters,
+                    recordingEvents: state.recordingEvents,
                     open: open,
                     liveParagraph: liveParagraph,
                     layout: layout
@@ -1467,6 +1696,7 @@ struct TranscriptView: View {
     private func reader(
         paragraphs: [TranscriptParagraph],
         chapters: [TranscriptChapter],
+        recordingEvents: [RecordingEvent],
         open: UUID?,
         liveParagraph: UUID?,
         layout: TranscriptLayout
@@ -1475,6 +1705,13 @@ struct TranscriptView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(paragraphs) { paragraph in
+                        ForEach(TranscriptPauseBoundaryPolicy.boundaries(
+                            before: paragraph,
+                            paragraphs: paragraphs,
+                            events: recordingEvents
+                        )) { boundary in
+                            TranscriptPauseBoundaryView(boundary: boundary, layout: layout)
+                        }
                         if paragraph.opensSection, let start = paragraph.timestamp {
                             TranscriptChapterHeader(
                                 start: start,
@@ -1504,11 +1741,23 @@ struct TranscriptView: View {
                             isEditable: isEditable,
                             isOpen: open == paragraph.id,
                             isLive: liveParagraph == paragraph.id,
+                            isPlaybackActive: paragraph.lines.contains {
+                                $0.segmentID == coordinator.playbackController.activeSegmentID
+                            },
+                            seek: coordinator.playbackController.isAvailable && !isRecording
+                                ? { coordinator.playbackController.seek(to: paragraph.start) }
+                                : nil,
                             toggleOpen: {
                                 openParagraph = open == paragraph.id ? nil : paragraph.id
                             },
                             onEdit: commit
                         )
+                    }
+                    ForEach(TranscriptPauseBoundaryPolicy.trailingBoundaries(
+                        paragraphs: paragraphs,
+                        events: recordingEvents
+                    )) { boundary in
+                        TranscriptPauseBoundaryView(boundary: boundary, layout: layout)
                     }
                 }
                 .frame(maxWidth: layout.columnWidth, alignment: .leading)
@@ -1599,7 +1848,10 @@ struct TranscriptView: View {
     private func resolveJump(_ proxy: ScrollViewProxy, paragraphs: [TranscriptParagraph]) {
         guard let request = state.transcriptJumpRequest else { return }
 
-        if let paragraphID = request.paragraphID {
+        if request.returnsToLatest, let paragraphID = paragraphs.last?.id {
+            scroll(proxy, to: paragraphID, anchor: .bottom)
+            isFollowing = true
+        } else if let paragraphID = request.paragraphID {
             // From the index: land on the chapter's own anchor, not the
             // paragraph's, or the rule and time it opens with end up above the
             // top edge and the reader arrives just past the beat.
@@ -1616,9 +1868,11 @@ struct TranscriptView: View {
             return
         }
 
-        // Without this the follow-scroll takes the view straight back to the
-        // bottom as soon as the next segment arrives.
-        isFollowing = false
+        // A search or chapter reveal stops follow; an explicit Latest request
+        // is the one destination that deliberately turns it back on.
+        isFollowing = TranscriptFollow.followsAfterJump(
+            returningToLatest: request.returnsToLatest
+        )
         state.transcriptJumpRequest = nil
     }
 
@@ -1719,6 +1973,37 @@ private struct TranscriptChapterHeader: View {
     }
 }
 
+/// An intentional omission from captured media. It sits in the document
+/// apparatus rather than the prose so exports, edits, and summaries never
+/// mistake the boundary for something a participant said.
+private struct TranscriptPauseBoundaryView: View {
+    let boundary: TranscriptPauseBoundary
+    let layout: TranscriptLayout
+
+    var body: some View {
+        HStack(spacing: layout.marginGap) {
+            if layout.hasMargin {
+                Text(DurationText.clock(boundary.timelineSeconds))
+                    .font(.footnote.monospacedDigit())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .frame(width: layout.marginWidth, alignment: .trailing)
+            }
+            HStack(spacing: 7) {
+                Image(systemName: "pause.circle")
+                Text("Paused for \(DurationText.spoken(boundary.durationSeconds))")
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(HushnoteTheme.secondaryInk)
+            .frame(maxWidth: layout.measure, alignment: .leading)
+        }
+        .padding(.vertical, 18)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Paused for \(DurationText.spoken(boundary.durationSeconds)) at captured time \(DurationText.spoken(boundary.timelineSeconds))"
+        )
+    }
+}
+
 /// The apparatus beside a paragraph: when it was said, the way into correcting
 /// it, and whether it is still being written.
 ///
@@ -1734,6 +2019,7 @@ private struct TranscriptMargin: View {
     let possibleLeakage: Bool
     let isRevealed: Bool
     let correct: () -> Void
+    var seek: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 6) {
@@ -1742,10 +2028,20 @@ private struct TranscriptMargin: View {
             // never call sites -- at 0.62 this composited to 2.87:1 in light,
             // failing AA. Below 1180pt there is no index rail and no scroll
             // indicator, so this timestamp is the reader's only orientation.
-            Text(DurationText.clock(start))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(HushnoteTheme.secondaryInk)
-                .accessibilityLabel("At \(DurationText.spoken(start))")
+            if let seek {
+                Button(action: seek) {
+                    Text(DurationText.clock(start))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(HushnoteTheme.moss)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Play from \(DurationText.spoken(start))")
+            } else {
+                Text(DurationText.clock(start))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(HushnoteTheme.secondaryInk)
+                    .accessibilityLabel("At \(DurationText.spoken(start))")
+            }
 
             if isEditable {
                 // A word, not a glyph. An affordance seen once every thirty
@@ -1901,6 +2197,8 @@ private struct TranscriptParagraphView: View {
     let isEditable: Bool
     let isOpen: Bool
     let isLive: Bool
+    let isPlaybackActive: Bool
+    let seek: (() -> Void)?
     let toggleOpen: () -> Void
     let onEdit: (TranscriptLineItem, String) -> Void
 
@@ -1922,7 +2220,8 @@ private struct TranscriptParagraphView: View {
                     isLive: isLive,
                     possibleLeakage: paragraph.possibleLeakage,
                     isRevealed: isHovering || isCorrectFocused,
-                    correct: toggleOpen
+                    correct: toggleOpen,
+                    seek: seek
                 )
                 .focused($isCorrectFocused)
             }
@@ -1943,7 +2242,12 @@ private struct TranscriptParagraphView: View {
             // Says "this block is a unit you can act on" in the app's own
             // vocabulary, using the same surface the opened paragraph uses --
             // so opening is continuous with hovering rather than a jump.
-            if isEditable, isHovering, !isOpen {
+            if isPlaybackActive {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(HushnoteTheme.selectionSurface.opacity(0.62))
+                    .padding(.horizontal, -12)
+                    .padding(.vertical, -8)
+            } else if isEditable, isHovering, !isOpen {
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(HushnoteTheme.paperRaised)
                     .padding(.horizontal, -12)
@@ -2063,7 +2367,12 @@ private struct TranscriptParagraphView: View {
     private var segments: some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(paragraph.lines) { line in
-                TranscriptRow(line: line) { onEdit(line, $0) }
+                TranscriptRow(
+                    line: line,
+                    seek: coordinator.playbackController.isAvailable
+                        ? { coordinator.playbackController.seek(to: line.start) }
+                        : nil
+                ) { onEdit(line, $0) }
             }
         }
         .padding(.vertical, 12)
@@ -2089,20 +2398,22 @@ private struct TranscriptParagraphView: View {
 /// no longer exists closes rather than keeping a row alive over nothing.
 private struct TranscriptRow: View {
     let line: TranscriptLineItem
+    let seek: (() -> Void)?
     let onEdit: (String) -> Void
 
     @State private var draft: String
     @FocusState private var isFocused: Bool
 
-    init(line: TranscriptLineItem, onEdit: @escaping (String) -> Void) {
+    init(line: TranscriptLineItem, seek: (() -> Void)? = nil, onEdit: @escaping (String) -> Void) {
         self.line = line
+        self.seek = seek
         self.onEdit = onEdit
         _draft = State(initialValue: TranscriptRowText.display(line.text))
     }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
-            TimestampButton(seconds: line.start)
+            TimestampButton(seconds: line.start, action: seek)
             TextField("Transcript", text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(HushnoteTheme.Font.reading)
@@ -2135,6 +2446,12 @@ private struct TranscriptRow: View {
 /// following is a state the user can leave by scrolling and return to
 /// deliberately.
 enum TranscriptFollow {
+    /// Search and chapter navigation are reading actions, so new text must not
+    /// pull the reader away. Only the separate Latest destination opts back in.
+    nonisolated static func followsAfterJump(returningToLatest: Bool) -> Bool {
+        returningToLatest
+    }
+
     /// - Parameters:
     ///   - bottomInset: blank scroll content below the last paragraph. The
     ///     auto-scroll aligns that paragraph's bottom with the viewport, so the

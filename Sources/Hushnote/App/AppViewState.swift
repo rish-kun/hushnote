@@ -566,6 +566,7 @@ enum FailureKind: Equatable {
     case insightGeneration
     case questionAnswering
     case export
+    case recordingImport
 }
 
 /// Where a failure has to appear to be seen at all.
@@ -594,6 +595,7 @@ enum FailureRoute: Equatable {
         case .transcriptEditSave: .appAlert(title: "Your transcript correction was not saved")
         case .storage: .appAlert(title: "Storage could not be updated")
         case .export: .appAlert(title: "The export did not finish")
+        case .recordingImport: .appAlert(title: "The recording could not be imported")
         case .insightGeneration, .questionAnswering: .insightWorkspace
         }
     }
@@ -638,6 +640,9 @@ final class AppViewState {
     var searchPhase: SearchPhase = .idle
 
     var transcript: [TranscriptLineItem] = []
+    /// Sparse recording apparatus for the selected meeting. These boundaries
+    /// are rendered beside the transcript and never become transcript prose.
+    var recordingEvents: [RecordingEvent] = []
     /// A request to bring one paragraph into view, raised by the transcript
     /// index. Carried as identity rather than as a position, for the same
     /// reason every other transcript address in this app is.
@@ -645,7 +650,11 @@ final class AppViewState {
     private var meetingInsights: [UUID: InsightWorkspaceState] = [:]
     private var unscopedInsights = InsightWorkspaceState()
     var recordingPhase = RecordingPhase.idle
+    /// Captured-media duration. It freezes during pause and sleep.
     var elapsed: TimeInterval = 0
+    /// Wall time since this meeting timeline began. Unlike `elapsed`, this
+    /// continues while the user intentionally pauses.
+    var wallElapsed: TimeInterval = 0
     var systemLevel = 0.0
     /// Read only by `MicrophoneLevelMeter`; active workspace parents must not
     /// observe this buffer-rate value.
@@ -881,12 +890,19 @@ final class AppViewState {
         return meetings.first { $0.id == activeMeetingID }
     }
 
-    func markRecordingStarted(meetingID: UUID) {
+    func markRecordingStarted(
+        meetingID: UUID,
+        preservingExistingContent: Bool = false,
+        timelineStartMilliseconds: Int64 = 0
+    ) {
         activeMeetingID = meetingID
         recordingPhase = .recording
-        elapsed = 0
-        transcript.removeAll()
-        meetingInsights[meetingID] = InsightWorkspaceState()
+        elapsed = Double(max(0, timelineStartMilliseconds)) / 1_000
+        wallElapsed = elapsed
+        if !preservingExistingContent {
+            transcript.removeAll()
+            meetingInsights[meetingID] = InsightWorkspaceState()
+        }
         recordingNotice = nil
         finalizationStage = nil
         finalizationDetail = nil
@@ -953,9 +969,8 @@ final class AppViewState {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
-                if self.recordingPhase == .recording {
-                    self.elapsed += 1
-                }
+                if self.recordingPhase.isCapturing { self.wallElapsed += 1 }
+                if self.recordingPhase == .recording { self.elapsed += 1 }
             }
         }
     }
@@ -980,11 +995,20 @@ struct TranscriptJumpRequest: Equatable, Sendable {
     /// ...or a segment, raised by search, which the pane resolves to whichever
     /// paragraph that segment was folded into.
     let segmentID: String?
+    /// A deliberate return to the live edge. Kept distinct from a segment
+    /// reveal so find navigation cannot accidentally re-enable auto-follow.
+    let returnsToLatest: Bool
     let issued: Date
 
-    init(paragraphID: UUID? = nil, segmentID: String? = nil, issued: Date = Date()) {
+    init(
+        paragraphID: UUID? = nil,
+        segmentID: String? = nil,
+        returnsToLatest: Bool = false,
+        issued: Date = Date()
+    ) {
         self.paragraphID = paragraphID
         self.segmentID = segmentID
+        self.returnsToLatest = returnsToLatest
         self.issued = issued
     }
 }

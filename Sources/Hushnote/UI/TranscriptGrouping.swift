@@ -245,6 +245,53 @@ struct TranscriptChapter: Identifiable, Equatable {
     let paragraphIDs: [UUID]
 }
 
+struct TranscriptPauseBoundary: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let timelineSeconds: TimeInterval
+    let durationSeconds: TimeInterval
+}
+
+enum TranscriptPauseBoundaryPolicy {
+    nonisolated static func boundaries(
+        from events: [RecordingEvent]
+    ) -> [TranscriptPauseBoundary] {
+        events.compactMap { event in
+            guard event.kind == .pause,
+                  let duration = event.durationMilliseconds,
+                  duration >= 0 else { return nil }
+            return TranscriptPauseBoundary(
+                id: event.id,
+                timelineSeconds: Double(max(0, event.timelineMilliseconds)) / 1_000,
+                durationSeconds: Double(duration) / 1_000
+            )
+        }
+        .sorted {
+            ($0.timelineSeconds, $0.id.uuidString)
+                < ($1.timelineSeconds, $1.id.uuidString)
+        }
+    }
+
+    nonisolated static func boundaries(
+        before paragraph: TranscriptParagraph,
+        paragraphs: [TranscriptParagraph],
+        events: [RecordingEvent]
+    ) -> [TranscriptPauseBoundary] {
+        boundaries(from: events).filter { boundary in
+            paragraphs.first(where: { $0.start >= boundary.timelineSeconds })?.id
+                == paragraph.id
+        }
+    }
+
+    nonisolated static func trailingBoundaries(
+        paragraphs: [TranscriptParagraph],
+        events: [RecordingEvent]
+    ) -> [TranscriptPauseBoundary] {
+        boundaries(from: events).filter { boundary in
+            !paragraphs.contains(where: { $0.start >= boundary.timelineSeconds })
+        }
+    }
+}
+
 extension TranscriptGrouping {
     /// How much of a chapter's first paragraph the index shows.
     static let chapterOpeningLimit = 64

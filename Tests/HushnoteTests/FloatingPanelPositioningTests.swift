@@ -75,4 +75,39 @@ final class FloatingPanelPositioningTests: XCTestCase {
             .zero
         )
     }
+
+    func testExpandedContentOnlyAppearsDuringCapture() {
+        XCTAssertTrue(FloatingRecordingPanelPolicy.showsExpandedContent(
+            requested: true,
+            phase: .recording
+        ))
+        XCTAssertTrue(FloatingRecordingPanelPolicy.showsExpandedContent(
+            requested: true,
+            phase: .paused
+        ))
+        XCTAssertFalse(FloatingRecordingPanelPolicy.showsExpandedContent(
+            requested: true,
+            phase: .finalizing(0.4)
+        ))
+        XCTAssertFalse(FloatingRecordingPanelPolicy.showsExpandedContent(
+            requested: false,
+            phase: .recording
+        ))
+    }
+
+    func testQuickNoteTrimsAndAppendsWithoutRewritingExistingNotes() {
+        XCTAssertNil(FloatingRecordingPanelPolicy.appendingQuickNote("   ", to: "Existing"))
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.appendingQuickNote("  Follow up  ", to: "Existing"),
+            "Existing\nFollow up"
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.appendingQuickNote("Decision", to: "Existing\n"),
+            "Existing\nDecision"
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.appendingQuickNote("First", to: ""),
+            "First"
+        )
+    }
 }

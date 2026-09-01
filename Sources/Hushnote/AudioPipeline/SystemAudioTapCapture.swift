@@ -38,6 +38,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
     private var bufferRing: CaptureBufferRing?
     private var formatListener: AudioObjectPropertyListenerBlock?
     private var listeningTapID = kAudioObjectUnknown
+    private var defaultOutputListener: AudioObjectPropertyListenerBlock?
     private var running = false
 
     init(
@@ -52,10 +53,9 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         watchdog = CaptureStallWatchdog(threshold: stallThreshold)
         watchdog.onStall = { [weak self] silence in
             let seconds = String(format: "%.1f", silence)
-            self?.reportFailure(
-                "System audio stopped reaching Hushnote \(seconds) s ago. The Mac may have slept, "
-                    + "the audio device may have changed, or System Audio Recording access may have "
-                    + "been revoked. Stop and start the meeting to resume recording."
+            self?.reportReconfiguration(
+                .deviceChanged,
+                detail: "System audio stopped arriving for \(seconds) s."
             )
         }
         // Drops are counted on the real-time thread and reported from here, off
@@ -67,11 +67,9 @@ final class SystemAudioTapCapture: @unchecked Sendable {
                 self.noticeHandler?(.dropped(report))
             }
             if self.drops.isPermanentlyFailing {
-                self.reportFailure(
-                    "Hushnote could not read \(self.drops.consecutiveFailureLimit) system-audio "
-                        + "buffers in a row, which means the device's format no longer matches the "
-                        + "one this recording started with. Stop and start the meeting to record "
-                        + "with the current device."
+                self.reportReconfiguration(
+                    .formatChanged,
+                    detail: "The device rejected \(self.drops.consecutiveFailureLimit) consecutive buffers."
                 )
             }
         }
@@ -111,6 +109,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
             // the session. Plugging in AirPods mid-meeting changes it
             // underneath, and nothing noticed.
             installFormatListener(expecting: format)
+            installDefaultOutputListener()
 
             let aggregateUID = "dev.rishit.hushnote.tap.\(UUID().uuidString)"
             let aggregateDescription: [String: Any] = [
@@ -218,6 +217,7 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         watchdog.stop()
         watchdog.stopTimer()
         removeFormatListener()
+        removeDefaultOutputListener()
         if aggregateDeviceID != kAudioObjectUnknown, let ioProcID {
             if running {
                 AudioDeviceStop(aggregateDeviceID, ioProcID)
@@ -271,6 +271,19 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         noticeHandler?(.failure(message))
     }
 
+    private func reportReconfiguration(
+        _ kind: AudioCaptureTransitionKind,
+        detail: String?
+    ) {
+        let isFirst = hasReportedFailure.withLock { reported -> Bool in
+            guard !reported else { return false }
+            reported = true
+            return true
+        }
+        guard isFirst else { return }
+        noticeHandler?(.reconfigure(kind, detail: detail))
+    }
+
     /// Watches the one property the whole capture path is pinned to.
     private func installFormatListener(expecting format: AVAudioFormat) {
         let observedTap = tapID
@@ -278,17 +291,16 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self else { return }
             guard let updated = try? Self.tapFormat(for: observedTap) else {
-                self.reportFailure(
-                    "The system audio device changed and Hushnote could not read its new format. "
-                        + "Stop and start the meeting to record with the new device."
+                self.reportReconfiguration(
+                    .formatChanged,
+                    detail: "The updated system-audio format could not be read."
                 )
                 return
             }
             guard Self.isFatalFormatChange(from: format, to: updated) else { return }
-            self.reportFailure(
-                "The system audio device changed mid-recording "
-                    + "(\(Self.describe(format)) became \(Self.describe(updated))). "
-                    + "Stop and start the meeting to record with the new device."
+            self.reportReconfiguration(
+                .formatChanged,
+                detail: "\(Self.describe(format)) became \(Self.describe(updated))."
             )
         }
         let status = AudioObjectAddPropertyListenerBlock(observedTap, &address, listenerQueue, listener)
@@ -306,8 +318,44 @@ final class SystemAudioTapCapture: @unchecked Sendable {
         listeningTapID = kAudioObjectUnknown
     }
 
+    private func installDefaultOutputListener() {
+        var address = Self.defaultOutputAddress
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.reportReconfiguration(
+                .deviceChanged,
+                detail: "The default output device changed."
+            )
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            listenerQueue,
+            listener
+        )
+        guard status == noErr else { return }
+        defaultOutputListener = listener
+    }
+
+    private func removeDefaultOutputListener() {
+        guard let defaultOutputListener else { return }
+        var address = Self.defaultOutputAddress
+        AudioObjectRemovePropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            listenerQueue,
+            defaultOutputListener
+        )
+        self.defaultOutputListener = nil
+    }
+
     private static let formatAddress = AudioObjectPropertyAddress(
         mSelector: kAudioTapPropertyFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    private static let defaultOutputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )

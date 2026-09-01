@@ -355,6 +355,53 @@ public struct RecordingEvent: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// User emphasis captured against the durable audio clock. A marker is not a
+/// transcript claim and summary generation must treat it as emphasis only.
+public enum RecordingMarkerType: String, Codable, CaseIterable, Identifiable, Sendable {
+    case important
+    case decision
+    case action
+    case question
+    case followUp
+
+    public var id: Self { self }
+
+    public var title: String {
+        switch self {
+        case .important: "Important"
+        case .decision: "Decision"
+        case .action: "Action"
+        case .question: "Question"
+        case .followUp: "Follow up"
+        }
+    }
+}
+
+public struct RecordingMarker: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var meetingID: UUID
+    public var sessionID: UUID
+    public var type: RecordingMarkerType
+    public var timelineMilliseconds: Int64
+    public var wallClockAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        meetingID: UUID,
+        sessionID: UUID,
+        type: RecordingMarkerType,
+        timelineMilliseconds: Int64,
+        wallClockAt: Date = Date()
+    ) {
+        self.id = id
+        self.meetingID = meetingID
+        self.sessionID = sessionID
+        self.type = type
+        self.timelineMilliseconds = timelineMilliseconds
+        self.wallClockAt = wallClockAt
+    }
+}
+
 public enum FinalizationJobState: String, Codable, CaseIterable, Sendable {
     case queued
     case transcribing

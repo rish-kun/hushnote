@@ -59,6 +59,11 @@ final class HushnoteAppDelegate: NSObject, NSApplicationDelegate {
     /// ever been opened — the `MenuBarExtra` keeps the app alive without one.
     static weak var state: AppViewState?
     static weak var coordinator: AppCoordinator?
+    static weak var quickNoteShortcut: GlobalQuickNoteShortcut?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        Self.quickNoteShortcut?.stop()
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let state = Self.state else { return .terminateNow }

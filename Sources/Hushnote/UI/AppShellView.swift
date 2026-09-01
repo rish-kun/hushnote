@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 extension Notification.Name {
     static let hushnoteNewFolder = Notification.Name("hushnote.new-folder")
@@ -1350,6 +1351,7 @@ struct MeetingsHomeView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @State private var isShowingRecentlyDeleted = false
+    @State private var isShowingRecordingImporter = false
     var scope: MeetingLibraryScope = .all
 
     var body: some View {
@@ -1380,10 +1382,32 @@ struct MeetingsHomeView: View {
             .padding(.vertical, 36)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .fileImporter(
+            isPresented: $isShowingRecordingImporter,
+            allowedContentTypes: [.audio, .movie],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                Task { await coordinator.importRecording(from: url) }
+            case .failure(let error):
+                state.report(.recordingImport, error.localizedDescription)
+            }
+        }
     }
 
     private func libraryHeader(policy: AdaptiveLayoutPolicy) -> some View {
-        HushnotePageHeader(title: libraryTitle, subtitle: librarySubtitle, policy: policy)
+        HushnotePageHeader(title: libraryTitle, subtitle: librarySubtitle, policy: policy) {
+            if scope != .recentlyDeleted {
+                Button("Import Recording") { isShowingRecordingImporter = true }
+                    .hushnoteButton(.secondary)
+                    .disabled(!MeetingRecordingImportPolicy.canImport(
+                        into: nil,
+                        recordingIsBusy: state.recordingPhase.isBusy
+                    ))
+            }
+        }
     }
 
     @ViewBuilder
@@ -1399,9 +1423,14 @@ struct MeetingsHomeView: View {
                 .frame(maxWidth: 390, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
             if state.searchText.isEmpty, scope != .recentlyDeleted {
-                Button("Create your first note") { Task { await coordinator.createMeetingNote() } }
-                    .hushnoteButton(.primary)
-                    .disabled(state.recordingPhase.isBusy)
+                HStack(spacing: 10) {
+                    Button("Create your first note") { Task { await coordinator.createMeetingNote() } }
+                        .hushnoteButton(.primary)
+                        .disabled(state.recordingPhase.isBusy)
+                    Button("Import Recording") { isShowingRecordingImporter = true }
+                        .hushnoteButton(.secondary)
+                        .disabled(state.recordingPhase.isBusy)
+                }
             }
         }
 

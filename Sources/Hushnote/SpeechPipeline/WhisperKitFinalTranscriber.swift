@@ -69,6 +69,7 @@ public actor WhisperKitFinalTranscriber {
         model: SpeechModel,
         languageCode: String? = nil,
         revision: Int,
+        startingOrdinals: [AudioSource: Int] = [:],
         progress: (@Sendable (FinalTranscriptionProgress) async -> Void)? = nil
     ) async throws -> TranscriptSnapshot {
         await progress?(.loadingModel)
@@ -106,7 +107,10 @@ public actor WhisperKitFinalTranscriber {
 
         var segments: [TranscriptSegment] = []
         var failures: [any Error] = []
-        var nextOrdinal: [AudioSource: Int] = [:]
+        // Appended sessions transcribe only their new takes. Their caller seeds
+        // each source above the ordinals already present in the meeting so the
+        // final-pass primary keys remain unique without decoding old audio.
+        var nextOrdinal = startingOrdinals.mapValues { max(0, $0) }
         for (index, result) in results.enumerated() {
             guard index < ordered.count else { continue }
             let source = ordered[index].source

@@ -544,6 +544,67 @@ public actor MeetingStore {
         }
     }
 
+    public func recordingEvents(meetingID: UUID) throws -> [RecordingEvent] {
+        try database.read { db in
+            try RecordingEventRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT events.*
+                    FROM recordingEvents AS events
+                    JOIN recordingSessions AS sessions ON sessions.id = events.sessionID
+                    WHERE sessions.meetingID = ?
+                    ORDER BY events.timelineMilliseconds, events.wallClockAt, events.id
+                    """,
+                arguments: [meetingID.uuidString]
+            ).map { try $0.model() }
+        }
+    }
+
+    public func saveRecordingMarker(_ marker: RecordingMarker) throws {
+        try Self.validate(marker)
+        try database.write { db in
+            guard let session = try RecordingSessionRecord.fetchOne(
+                db,
+                key: marker.sessionID.uuidString
+            ) else {
+                throw PersistenceError.recordingSessionNotFound(marker.sessionID)
+            }
+            guard session.meetingID == marker.meetingID.uuidString else {
+                throw PersistenceError.invalidRecordingMarker(
+                    "the marker's session must belong to its meeting"
+                )
+            }
+            if let existing = try RecordingMarkerRecord.fetchOne(db, key: marker.id.uuidString),
+               existing.meetingID != marker.meetingID.uuidString ||
+               existing.sessionID != marker.sessionID.uuidString {
+                throw PersistenceError.invalidRecordingMarker(
+                    "an existing marker cannot move to another meeting or session"
+                )
+            }
+            try RecordingMarkerRecord(marker).save(db)
+        }
+    }
+
+    public func recordingMarkers(meetingID: UUID) throws -> [RecordingMarker] {
+        try database.read { db in
+            try RecordingMarkerRecord
+                .filter(Column("meetingID") == meetingID.uuidString)
+                .order(Column("timelineMilliseconds"), Column("wallClockAt"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
+    public func recordingMarkers(sessionID: UUID) throws -> [RecordingMarker] {
+        try database.read { db in
+            try RecordingMarkerRecord
+                .filter(Column("sessionID") == sessionID.uuidString)
+                .order(Column("timelineMilliseconds"), Column("wallClockAt"), Column("id"))
+                .fetchAll(db)
+                .map { try $0.model() }
+        }
+    }
+
     public func enqueueFinalizationJob(_ job: FinalizationJob) throws {
         try Self.validate(job)
         guard job.state == .queued else {
@@ -560,6 +621,42 @@ public actor MeetingStore {
                     "a session already has a finalization job"
                 )
             }
+            try FinalizationJobRecord(job).insert(db)
+        }
+    }
+
+    /// Registers an already-normalized import and its processing work as one
+    /// durable boundary. Files are staged before this transaction; either the
+    /// complete graph becomes retryable or no relational rows are added.
+    public func saveImportedRecording(
+        session: RecordingSession,
+        sources: [SessionAudioSource],
+        takes: [AudioTake],
+        job: FinalizationJob
+    ) throws {
+        try Self.validate(session)
+        try sources.forEach(Self.validate)
+        try takes.forEach(Self.validate)
+        try Self.validate(job)
+        guard session.origin == .imported, session.state == .captured else {
+            throw PersistenceError.invalidRecordingSession("an import must begin as a captured imported session")
+        }
+        guard !sources.isEmpty,
+              sources.allSatisfy({ $0.sessionID == session.id }),
+              Set(takes.map(\.sourceID)).isSubset(of: Set(sources.map(\.id))) else {
+            throw PersistenceError.invalidAudioTake("imported sources and takes must belong to the imported session")
+        }
+        guard job.sessionID == session.id, job.state == .queued else {
+            throw PersistenceError.invalidFinalizationJob("an imported session must enqueue one queued job")
+        }
+
+        try database.write { db in
+            guard try MeetingRecord.exists(db, key: session.meetingID.uuidString) else {
+                throw PersistenceError.meetingNotFound(session.meetingID)
+            }
+            try RecordingSessionRecord(session).insert(db)
+            for source in sources { try SessionAudioSourceRecord(source).insert(db) }
+            for take in takes { try AudioTakeRecord(take).insert(db) }
             try FinalizationJobRecord(job).insert(db)
         }
     }
@@ -1491,6 +1588,14 @@ public actor MeetingStore {
               event.durationMilliseconds.map({ $0 >= 0 }) ?? true else {
             throw PersistenceError.invalidRecordingEvent(
                 "timeline position and duration must not be negative"
+            )
+        }
+    }
+
+    private static func validate(_ marker: RecordingMarker) throws {
+        guard marker.timelineMilliseconds >= 0 else {
+            throw PersistenceError.invalidRecordingMarker(
+                "timeline position must not be negative"
             )
         }
     }

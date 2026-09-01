@@ -88,7 +88,7 @@ struct RecordingPill: View {
             Text(DurationText.clock(state.elapsed))
                 .font(.callout.monospacedDigit().weight(.medium))
                 .contentTransition(.numericText())
-                .accessibilityLabel("Elapsed time \(DurationText.spoken(state.elapsed))")
+                .accessibilityLabel("Captured time \(DurationText.spoken(state.elapsed))")
 
             Divider()
                 .frame(height: 22)
@@ -281,7 +281,26 @@ struct ElapsedTimeLabel: View {
         Text(DurationText.clock(state.elapsed))
             .font(font)
             .contentTransition(.numericText())
-            .accessibilityLabel("Elapsed time \(DurationText.spoken(state.elapsed))")
+            .accessibilityLabel("Captured time \(DurationText.spoken(state.elapsed))")
+    }
+}
+
+/// Keeps the one-second clocks at a leaf boundary and names the distinction
+/// that matters after an intentional pause.
+struct RecordingDurationComparison: View {
+    @Environment(AppViewState.self) private var state
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text("Captured \(DurationText.clock(state.elapsed))")
+            Text("Wall \(DurationText.clock(state.wallElapsed))")
+                .foregroundStyle(HushnoteTheme.secondaryInk)
+        }
+        .font(.caption.monospacedDigit().weight(.medium))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Captured \(DurationText.spoken(state.elapsed)); wall time \(DurationText.spoken(state.wallElapsed))"
+        )
     }
 }
 

@@ -114,6 +114,7 @@ struct RecordingDiagnosticsPolicyTests {
         #expect(row?.tone == .attention)
         #expect(line.kind == .diskLow)
         #expect(line.text.contains("recording continues"))
+        #expect(line.text.contains("finalized audio in Storage"))
     }
 }
 

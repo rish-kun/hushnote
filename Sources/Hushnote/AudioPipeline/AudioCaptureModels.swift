@@ -45,6 +45,30 @@ public struct AudioSourceCaptureHealth: Equatable, Sendable {
     }
 }
 
+public enum AudioCaptureTransitionKind: String, Equatable, Sendable {
+    case deviceChanged
+    case formatChanged
+}
+
+public struct AudioCaptureTransition: Equatable, Sendable {
+    public let source: AudioSource
+    public let kind: AudioCaptureTransitionKind
+    public let timelineMilliseconds: Int64
+    public let detail: String?
+
+    public init(
+        source: AudioSource,
+        kind: AudioCaptureTransitionKind,
+        timelineMilliseconds: Int64,
+        detail: String? = nil
+    ) {
+        self.source = source
+        self.kind = kind
+        self.timelineMilliseconds = timelineMilliseconds
+        self.detail = detail
+    }
+}
+
 /// A model-friendly copy of a captured PCM buffer. The matching CAF data is
 /// durably appended before this value is emitted by ``AudioPipeline``.
 public struct CapturedAudioChunk: Sendable {
@@ -128,6 +152,7 @@ public enum AudioCaptureEvent: Sendable {
     case level(AudioLevel)
     case dropped(AudioDropReport)
     case sourceHealth(AudioSourceCaptureHealth)
+    case transition(AudioCaptureTransition)
 }
 
 /// One normalized original produced by a source-specific capture writer.

@@ -359,7 +359,7 @@ enum RecordingConfidencePolicy {
         if snapshot.writer.diskState == .critical {
             return .init(
                 kind: .diskCritical,
-                text: "Disk space is critically low; audio already written is safe.",
+                text: "Disk space is critically low. Free space or remove finalized audio in Storage; audio already written is safe.",
                 tone: .attention
             )
         }
@@ -411,7 +411,7 @@ enum RecordingConfidencePolicy {
         if snapshot.writer.diskState == .low {
             return .init(
                 kind: .diskLow,
-                text: "Disk space is running low; recording continues.",
+                text: "Disk space is running low. Free space or remove finalized audio in Storage; recording continues.",
                 tone: .attention
             )
         }

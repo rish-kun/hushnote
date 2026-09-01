@@ -63,6 +63,25 @@ struct FloatingPanelPositioning {
     }
 }
 
+enum FloatingRecordingPanelPolicy {
+    nonisolated static func showsExpandedContent(
+        requested: Bool,
+        phase: RecordingPhase
+    ) -> Bool {
+        requested && phase.isCapturing
+    }
+
+    nonisolated static func appendingQuickNote(
+        _ draft: String,
+        to existing: String
+    ) -> String? {
+        let note = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !note.isEmpty else { return nil }
+        guard !existing.isEmpty else { return note }
+        return existing.hasSuffix("\n") ? existing + note : existing + "\n" + note
+    }
+}
+
 private extension CGRect {
     var center: CGPoint { CGPoint(x: midX, y: midY) }
 }
@@ -86,19 +105,12 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         self.state = state
         self.defaults = defaults
 
-        let content = FloatingRecordingPanelContent()
-            .environment(state)
-            .environment(coordinator)
-        let hostingView = NSHostingView(rootView: content)
-        hostingView.sizingOptions = [.preferredContentSize]
-
         panel = NSPanel(
             contentRect: CGRect(origin: .zero, size: CGSize(width: 390, height: 64)),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        panel.contentView = hostingView
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
@@ -111,6 +123,14 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         panel.animationBehavior = .utilityWindow
 
         super.init()
+        let content = FloatingRecordingPanelContent { [weak self] in
+            self?.resizeToFitContent()
+        }
+        .environment(state)
+        .environment(coordinator)
+        let hostingView = NSHostingView(rootView: content)
+        hostingView.sizingOptions = [.preferredContentSize]
+        panel.contentView = hostingView
         panel.delegate = self
 
         NotificationCenter.default.addObserver(
@@ -162,6 +182,34 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         }
     }
 
+    private func resizeToFitContent() {
+        Task { @MainActor [weak self] in
+            // Let SwiftUI commit the expanded/collapsed hierarchy before
+            // asking AppKit for its preferred size.
+            await Task.yield()
+            guard let self, let contentView = self.panel.contentView else { return }
+            contentView.layoutSubtreeIfNeeded()
+            let fittingSize = contentView.fittingSize
+            guard fittingSize.width > 0, fittingSize.height > 0 else { return }
+
+            let previousTop = self.panel.frame.maxY
+            self.panel.setContentSize(fittingSize)
+            let proposed = CGPoint(
+                x: self.panel.frame.minX,
+                y: previousTop - self.panel.frame.height
+            )
+            let origin = FloatingPanelPositioning.clampedOrigin(
+                savedOrigin: proposed,
+                panelSize: self.panel.frame.size,
+                visibleFrames: NSScreen.screens.map(\.visibleFrame),
+                defaultVisibleFrame: NSScreen.main?.visibleFrame
+            )
+            self.isRestoringPosition = true
+            self.panel.setFrameOrigin(origin)
+            self.isRestoringPosition = false
+        }
+    }
+
     private func restoreAndClampPosition() {
         let hasSavedOrigin = defaults.object(forKey: Self.savedXKey) != nil
             && defaults.object(forKey: Self.savedYKey) != nil
@@ -186,9 +234,195 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
 }
 
 private struct FloatingRecordingPanelContent: View {
+    let onSizeChange: @MainActor () -> Void
+    @Environment(AppViewState.self) private var state
+    @State private var isExpanded = false
+
     var body: some View {
-        RecordingPill()
-            .fixedSize()
-            .padding(8)
+        Group {
+            if FloatingRecordingPanelPolicy.showsExpandedContent(
+                requested: isExpanded,
+                phase: state.recordingPhase
+            ) {
+                ExpandedRecordingPanel {
+                    isExpanded = false
+                    onSizeChange()
+                }
+            } else {
+                HStack(spacing: 6) {
+                    RecordingPill()
+                    if state.recordingPhase.isCapturing {
+                        Button {
+                            isExpanded = true
+                            onSizeChange()
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.semibold))
+                                .frame(width: 28, height: 28)
+                                .background(HushnoteTheme.controlSurface, in: Circle())
+                                .overlay {
+                                    Circle().stroke(HushnoteTheme.rule.opacity(0.72), lineWidth: 1)
+                                }
+                        }
+                        .buttonStyle(.plain)
+                        .help("Show recording details")
+                        .accessibilityLabel("Expand recording panel")
+                    }
+                }
+                .fixedSize()
+            }
+        }
+        .padding(8)
+        .onExitCommand {
+            guard isExpanded else { return }
+            isExpanded = false
+            onSizeChange()
+        }
+        .onChange(of: state.recordingPhase) { _, phase in
+            if !phase.isCapturing { isExpanded = false }
+            onSizeChange()
+        }
+    }
+}
+
+private struct ExpandedRecordingPanel: View {
+    let collapse: @MainActor () -> Void
+    @Environment(AppViewState.self) private var state
+    @Environment(AppCoordinator.self) private var coordinator
+    @State private var quickNote = ""
+    @FocusState private var noteIsFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+            HushnoteRule(opacity: 0.72)
+
+            HStack(spacing: 24) {
+                SystemLevelMeter()
+                MicrophoneLevelMeter()
+            }
+
+            sourceHealth
+            confidence
+            controls
+            quickNoteField
+        }
+        .padding(14)
+        .frame(width: 370, alignment: .leading)
+        .background(HushnoteTheme.controlSurface, in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(HushnoteTheme.rule.opacity(0.8), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.13), radius: 14, y: 5)
+    }
+
+    private var header: some View {
+        HStack(spacing: 9) {
+            RecordingPulse(isActive: state.recordingPhase == .recording)
+            Text(RecordingStatusText.label(for: state.recordingPhase))
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(
+                    state.recordingPhase == .paused
+                        ? HushnoteTheme.secondaryInk
+                        : HushnoteTheme.vermilionInk
+                )
+            Spacer()
+            RecordingDurationComparison()
+            Button(action: collapse) {
+                Image(systemName: "chevron.up")
+                    .font(.caption2.weight(.semibold))
+                    .frame(width: 26, height: 26)
+            }
+            .buttonStyle(.plain)
+            .help("Collapse recording panel")
+            .accessibilityLabel("Collapse recording panel")
+        }
+    }
+
+    private var sourceHealth: some View {
+        let system = RecordingDiagnosticsPolicy.sourceRow(
+            state.recordingDiagnostics.diagnostics(for: .system)
+        )
+        let microphone = RecordingDiagnosticsPolicy.sourceRow(
+            state.recordingDiagnostics.diagnostics(for: .microphone)
+        )
+        return HStack(spacing: 18) {
+            health(system)
+            health(microphone)
+        }
+    }
+
+    private var confidence: some View {
+        let line = RecordingConfidencePolicy.line(for: state.recordingDiagnostics)
+        return HushnoteStatusLine(
+            text: line.text,
+            tone: statusTone(line.tone)
+        )
+        .lineLimit(2)
+    }
+
+    private var controls: some View {
+        HStack(spacing: 8) {
+            Menu {
+                ForEach(RecordingMarkerType.allCases) { type in
+                    Button(type.title) {
+                        Task { await coordinator.markMoment(type) }
+                    }
+                }
+            } label: {
+                Label("Mark", systemImage: "bookmark")
+            } primaryAction: {
+                Task { await coordinator.markMoment(.important) }
+            }
+            .hushnoteButton(.secondary)
+            .accessibilityHint("Marks Important; open the menu to choose another type")
+
+            Spacer(minLength: 8)
+
+            Button(state.recordingPhase == .paused ? "Resume" : "Pause") {
+                Task { await coordinator.togglePause() }
+            }
+            .hushnoteButton(.secondary)
+
+            Button("Stop") {
+                Task { await coordinator.stopMeeting() }
+            }
+            .hushnoteButton(.recording)
+        }
+    }
+
+    private var quickNoteField: some View {
+        TextField("Quick note — press Return to save", text: $quickNote)
+            .textFieldStyle(HushnoteFieldStyle())
+            .focused($noteIsFocused)
+            .hushnoteFocusRing(noteIsFocused)
+            .onSubmit(saveQuickNote)
+            .accessibilityHint("Adds this line to the active meeting notes")
+    }
+
+    private func health(_ row: RecordingDiagnosticRow) -> some View {
+        HushnoteStatusLine(
+            text: "\(row.title) · \(row.status)",
+            tone: statusTone(row.tone)
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func statusTone(_ tone: RecordingDiagnosticTone) -> HushnoteStatusTone {
+        switch tone {
+        case .neutral: .neutral
+        case .working: .working
+        case .good: .good
+        case .attention, .warning: .warning
+        }
+    }
+
+    private func saveQuickNote() {
+        let draft = quickNote
+        Task {
+            guard await coordinator.saveQuickNote(draft) else { return }
+            quickNote = ""
+        }
     }
 }

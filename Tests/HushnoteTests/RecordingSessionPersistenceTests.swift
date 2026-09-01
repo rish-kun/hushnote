@@ -4,6 +4,38 @@ import XCTest
 @testable import Hushnote
 
 final class RecordingSessionPersistenceTests: XCTestCase {
+    func testPauseBoundaryCanBeOpenedThenFinalizedAndLoadedByMeeting() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let meeting = Meeting(title: "Pause boundary")
+        let session = RecordingSession(
+            meetingID: meeting.id,
+            ordinal: 0,
+            origin: .live,
+            wallStartedAt: Date(timeIntervalSince1970: 1_000),
+            timelineStartMilliseconds: 0,
+            state: .capturing
+        )
+        var pause = RecordingEvent(
+            sessionID: session.id,
+            kind: .pause,
+            timelineMilliseconds: 42_000,
+            wallClockAt: Date(timeIntervalSince1970: 1_042)
+        )
+        try await store.saveMeeting(meeting)
+        try await store.saveRecordingSession(session)
+        try await store.saveRecordingEvent(pause)
+        let openEvents = try await store.recordingEvents(meetingID: meeting.id)
+        XCTAssertNil(openEvents.first?.durationMilliseconds)
+
+        pause.durationMilliseconds = 252_000
+        try await store.saveRecordingEvent(pause)
+
+        let sessionEvents = try await store.recordingEvents(sessionID: session.id)
+        let meetingEvents = try await store.recordingEvents(meetingID: meeting.id)
+        XCTAssertEqual(sessionEvents, [pause])
+        XCTAssertEqual(meetingEvents, [pause])
+    }
+
     func testSessionSourceTakeEventAndJobRoundTrip() async throws {
         let store = try MeetingStore(inMemory: ())
         let meeting = Meeting(title: "Durable capture")
@@ -563,6 +595,66 @@ final class RecordingSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(remainingSources.count, 2)
         XCTAssertNotNil(retainedSession)
         XCTAssertNotNil(retainedMeeting)
+    }
+
+    func testRetentionCleanupKeepsMetadataWhenFileRemovalFails() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let meeting = Meeting(title: "Retry cleanup")
+        try await store.saveMeeting(meeting)
+        let session = RecordingSession(
+            meetingID: meeting.id,
+            ordinal: 0,
+            origin: .live,
+            wallStartedAt: Date(timeIntervalSince1970: 10),
+            timelineStartMilliseconds: 0,
+            capturedDurationMilliseconds: 1_000,
+            state: .ready
+        )
+        let source = SessionAudioSource(
+            sessionID: session.id,
+            ordinal: 0,
+            kind: .microphone
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directory.path
+            )
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let audioURL = directory.appending(path: "microphone-0.caf")
+        try Data([1, 2, 3]).write(to: audioURL)
+        let take = AudioTake(
+            sourceID: source.id,
+            ordinal: 0,
+            fileURL: audioURL,
+            timelineStartMilliseconds: 0,
+            sampleRate: 48_000,
+            channelCount: 1,
+            durationMilliseconds: 1_000,
+            isComplete: true
+        )
+        try await store.saveRecordingSession(session)
+        try await store.saveSessionAudioSource(source)
+        try await store.saveAudioTake(take)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: directory.path
+        )
+
+        do {
+            try await store.deleteAudioFiles(meetingID: meeting.id)
+            XCTFail("Expected read-only directory to reject audio removal")
+        } catch {
+            // The filesystem failure is the behavior under test.
+        }
+
+        let retainedTakes = try await store.audioTakes(sessionID: session.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+        XCTAssertEqual(retainedTakes, [take])
     }
 
     func testPurgeRemovesNewTakeFilesAndCascadesSessionGraph() async throws {

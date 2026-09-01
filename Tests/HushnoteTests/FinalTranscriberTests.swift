@@ -106,6 +106,38 @@ struct FinalTranscriberTests {
         #expect(snapshot.segments.map(\.startMilliseconds) == [4_000, 9_000])
         #expect(Set(snapshot.segments.map(\.id)).count == 2)
     }
+
+    @Test("An appended pass starts each source in its supplied ordinal namespace")
+    func appendedPassStartsAtSuppliedOrdinals() async throws {
+        let meetingID = UUID()
+        let decoder = StubFileDecoder([
+            .success([result(segments: [whisperSegment(start: 0, end: 1, text: "You")])]),
+            .success([result(segments: [whisperSegment(start: 0, end: 1, text: "Them")])]),
+        ])
+        let transcriber = WhisperKitFinalTranscriber(decoder: decoder)
+
+        let snapshot = try await transcriber.transcribe(
+            meetingID: meetingID,
+            tracks: [track(meetingID, .system), track(meetingID, .microphone)],
+            model: SpeechModelCatalog.whisperSmall,
+            revision: 4,
+            startingOrdinals: [.system: 7, .microphone: 11]
+        )
+
+        let idsBySource = Dictionary(uniqueKeysWithValues: snapshot.segments.map { ($0.source, $0.id) })
+        #expect(idsBySource[.system] == TranscriptIdentifier.segment(
+            meetingID: meetingID,
+            source: .system,
+            pass: .final,
+            ordinal: 7
+        ))
+        #expect(idsBySource[.microphone] == TranscriptIdentifier.segment(
+            meetingID: meetingID,
+            source: .microphone,
+            pass: .final,
+            ordinal: 11
+        ))
+    }
 }
 
 // MARK: - Fixtures

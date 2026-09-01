@@ -413,6 +413,43 @@ struct RecordingEventRecord: Codable, FetchableRecord, PersistableRecord, TableR
     }
 }
 
+struct RecordingMarkerRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
+    static let databaseTableName = "recordingMarkers"
+
+    var id: String
+    var meetingID: String
+    var sessionID: String
+    var type: String
+    var timelineMilliseconds: Int64
+    var wallClockAt: Date
+
+    init(_ marker: RecordingMarker) {
+        id = marker.id.uuidString
+        meetingID = marker.meetingID.uuidString
+        sessionID = marker.sessionID.uuidString
+        type = marker.type.rawValue
+        timelineMilliseconds = marker.timelineMilliseconds
+        wallClockAt = marker.wallClockAt
+    }
+
+    func model() throws -> RecordingMarker {
+        guard let id = UUID(uuidString: id),
+              let meetingID = UUID(uuidString: meetingID),
+              let sessionID = UUID(uuidString: sessionID),
+              let type = RecordingMarkerType(rawValue: type) else {
+            throw PersistenceError.corruptRecord("recording marker \(self.id)")
+        }
+        return RecordingMarker(
+            id: id,
+            meetingID: meetingID,
+            sessionID: sessionID,
+            type: type,
+            timelineMilliseconds: timelineMilliseconds,
+            wallClockAt: wallClockAt
+        )
+    }
+}
+
 struct FinalizationJobRecord: Codable, FetchableRecord, PersistableRecord, TableRecord {
     static let databaseTableName = "finalizationJobs"
 
@@ -676,6 +713,7 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
     case invalidAudioSource(String)
     case invalidAudioTake(String)
     case invalidRecordingEvent(String)
+    case invalidRecordingMarker(String)
     case invalidFinalizationJob(String)
     case corruptRecord(String)
     case invalidSearchQuery
@@ -697,6 +735,7 @@ public enum PersistenceError: Error, Equatable, LocalizedError, Sendable {
         case .invalidAudioSource(let reason): "Invalid recording source: \(reason)"
         case .invalidAudioTake(let reason): "Invalid audio take: \(reason)"
         case .invalidRecordingEvent(let reason): "Invalid recording event: \(reason)"
+        case .invalidRecordingMarker(let reason): "Invalid recording marker: \(reason)"
         case .invalidFinalizationJob(let reason): "Invalid finalization job: \(reason)"
         case .corruptRecord(let description): "The database contains a corrupt \(description)."
         case .invalidSearchQuery: "Enter at least one searchable word."

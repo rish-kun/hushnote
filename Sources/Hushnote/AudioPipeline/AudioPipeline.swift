@@ -23,6 +23,9 @@ enum CaptureNotice: Sendable {
     case failure(String)
     /// Audio was lost, but capture continues.
     case dropped(AudioDropReport)
+    /// The source graph changed and this take must be closed before capture is
+    /// recreated against the new device configuration.
+    case reconfigure(AudioCaptureTransitionKind, detail: String?)
 }
 
 typealias SystemAudioCaptureFactory = @Sendable (
@@ -40,6 +43,8 @@ public actor AudioPipeline {
     private let rootDirectory: URL
     private let captureFactory: SystemAudioCaptureFactory
     private let microphoneCaptureFactory: MicrophoneAudioCaptureFactory
+    private let reconfigurationRetryDelays: [Double]
+    private let reconfigurationSleep: @Sendable (Double) async -> Void
     private var systemCapture: (any SystemAudioCapturing)?
     private var microphoneCapture: MicrophoneAudioCapture?
     private var systemOutput: CaptureOutputBridge?
@@ -51,12 +56,18 @@ public actor AudioPipeline {
     /// `MicrophoneAudioCapture` calls suspend this actor, so ownership cannot
     /// be inferred from which method started first.
     private var microphoneConfigurationGeneration: UInt64 = 0
+    private var systemCaptureGeneration: UInt64 = 0
+    private var isReconfiguringSystemCapture = false
     private var activeMicrophoneTakeID: UUID?
     private var currentStatus: AudioCaptureStatus = .idle
     private var sessionID: UUID?
     private var sessionDirectory: URL?
     private var systemAudioURL: URL?
     private var timelineStartMilliseconds: Int64 = 0
+    private var isSleeping = false
+    private var statusBeforeSleep: AudioCaptureStatus?
+    private var microphoneWasEnabledBeforeSleep = false
+    private var microphoneDeviceUIDBeforeSleep: String?
 
     public init(rootDirectory: URL? = nil) {
         self.init(
@@ -64,7 +75,8 @@ public actor AudioPipeline {
             captureFactory: { sampleHandler, noticeHandler in
                 SystemAudioTapCapture(sampleHandler: sampleHandler, noticeHandler: noticeHandler)
             },
-            microphoneCaptureFactory: { MicrophoneAudioCapture() }
+            microphoneCaptureFactory: { MicrophoneAudioCapture() },
+            reconfigurationRetryDelays: [0, 0.25, 0.5, 1, 2, 4]
         )
     }
 
@@ -72,14 +84,20 @@ public actor AudioPipeline {
         self.init(
             rootDirectory: rootDirectory,
             captureFactory: captureFactory,
-            microphoneCaptureFactory: { MicrophoneAudioCapture() }
+            microphoneCaptureFactory: { MicrophoneAudioCapture() },
+            reconfigurationRetryDelays: [0, 0.25, 0.5, 1, 2, 4]
         )
     }
 
     init(
         rootDirectory: URL?,
         captureFactory: @escaping SystemAudioCaptureFactory,
-        microphoneCaptureFactory: @escaping MicrophoneAudioCaptureFactory
+        microphoneCaptureFactory: @escaping MicrophoneAudioCaptureFactory,
+        reconfigurationRetryDelays: [Double] = [0, 0.25, 0.5, 1, 2, 4],
+        reconfigurationSleep: @escaping @Sendable (Double) async -> Void = { seconds in
+            guard seconds > 0 else { return }
+            try? await Task.sleep(for: .seconds(seconds))
+        }
     ) {
         let pair = AsyncStream<AudioCaptureEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
         events = pair.stream
@@ -87,6 +105,8 @@ public actor AudioPipeline {
         self.rootDirectory = rootDirectory ?? Self.defaultCaptureDirectory()
         self.captureFactory = captureFactory
         self.microphoneCaptureFactory = microphoneCaptureFactory
+        self.reconfigurationRetryDelays = reconfigurationRetryDelays
+        self.reconfigurationSleep = reconfigurationSleep
     }
 
     deinit {
@@ -130,11 +150,18 @@ public actor AudioPipeline {
                 timelineCoordinator: timeline,
                 eventContinuation: eventContinuation
             )
+            let systemGeneration = advanceSystemCaptureGeneration()
             // Every failure route is stamped with the session that owns it.
             // Without that, a failure fired by a meeting the user has already
             // stopped tears down the next one, with the old message.
             output.failureHandler = { [weak self] message in
-                Task { await self?.captureDidFail(message, session: id) }
+                Task {
+                    await self?.captureDidFail(
+                        message,
+                        session: id,
+                        generation: systemGeneration
+                    )
+                }
             }
             let continuation = eventContinuation
             let capture = captureFactory({ [weak output] buffer, presentationSeconds in
@@ -142,12 +169,27 @@ public actor AudioPipeline {
             }, { [weak self] notice in
                 switch notice {
                 case .failure(let message):
-                    Task { await self?.captureDidFail(message, session: id) }
+                    Task {
+                        await self?.captureDidFail(
+                            message,
+                            session: id,
+                            generation: systemGeneration
+                        )
+                    }
                 case .dropped(let report):
                     // Lost audio does not stop the meeting, but it must never
                     // pass silently: the CAF has no gaps, so everything after a
                     // drop shifts earlier against the transcript.
                     continuation.yield(.dropped(report))
+                case .reconfigure(let kind, let detail):
+                    Task {
+                        await self?.systemCaptureNeedsReconfiguration(
+                            kind: kind,
+                            detail: detail,
+                            session: id,
+                            generation: systemGeneration
+                        )
+                    }
                 }
             })
 
@@ -264,6 +306,149 @@ public actor AudioPipeline {
         updateStatus(.recording)
     }
 
+    /// Closes every active take before macOS suspends the process while keeping
+    /// ownership of the meeting. The shared media clock is frozen first, so a
+    /// callback racing the sleep notification is either durably included in
+    /// the closing take or rejected from the meeting entirely.
+    @discardableResult
+    public func prepareForSleep(
+        at monotonicSeconds: Double = ProcessInfo.processInfo.systemUptime
+    ) async throws -> Int64 {
+        guard currentStatus == .recording || currentStatus == .paused,
+              let timeline,
+              !isSleeping
+        else { throw AudioPipelineError.notRunning }
+
+        statusBeforeSleep = currentStatus
+        microphoneWasEnabledBeforeSleep = microphoneCapture != nil
+        microphoneDeviceUIDBeforeSleep = selectedMicrophone?.id
+        timeline.suspend(reason: .sleep, at: monotonicSeconds)
+        let boundary = timeline.positionMilliseconds
+
+        isSleeping = true
+        _ = advanceSystemCaptureGeneration()
+        closeSystemTake()
+        await closeMicrophoneTake()
+        return boundary
+    }
+
+    /// Recreates fresh source takes after wake without inserting the sleep
+    /// interval into captured-media time. A failed system restart leaves the
+    /// timeline suspended so a bounded caller may safely retry.
+    @discardableResult
+    func resumeAfterWake(
+        at monotonicSeconds: Double = ProcessInfo.processInfo.systemUptime
+    ) async throws -> CapturedMediaOmission? {
+        guard isSleeping,
+              let sessionID,
+              let sessionDirectory,
+              let timeline,
+              let statusBeforeSleep
+        else { throw AudioPipelineError.notRunning }
+
+        let systemURL = try Self.allocateTakeURL(for: .system, in: sessionDirectory)
+        let output = try CaptureOutputBridge(
+            source: .system,
+            audioURL: systemURL,
+            timelineCoordinator: timeline,
+            eventContinuation: eventContinuation
+        )
+        let systemGeneration = advanceSystemCaptureGeneration()
+        output.failureHandler = { [weak self] message in
+            Task {
+                await self?.captureDidFail(
+                    message,
+                    session: sessionID,
+                    generation: systemGeneration
+                )
+            }
+        }
+        let continuation = eventContinuation
+        let capture = captureFactory({ [weak output] buffer, presentationSeconds in
+            output?.consume(buffer, presentationSeconds: presentationSeconds)
+        }, { [weak self] notice in
+            switch notice {
+            case .failure(let message):
+                Task {
+                    await self?.captureDidFail(
+                        message,
+                        session: sessionID,
+                        generation: systemGeneration
+                    )
+                }
+            case .dropped(let report):
+                continuation.yield(.dropped(report))
+            case .reconfigure(let kind, let detail):
+                Task {
+                    await self?.systemCaptureNeedsReconfiguration(
+                        kind: kind,
+                        detail: detail,
+                        session: sessionID,
+                        generation: systemGeneration
+                    )
+                }
+            }
+        })
+
+        eventContinuation.yield(.sourceHealth(.init(source: .system, state: .arming)))
+        output.begin()
+        do {
+            try capture.start()
+            if statusBeforeSleep == .paused {
+                try capture.pause()
+                output.pause()
+            }
+        } catch {
+            capture.stop()
+            output.finish()
+            try? FileManager.default.removeItem(at: systemURL)
+            eventContinuation.yield(.sourceHealth(.init(
+                source: .system,
+                state: .unavailable(error.localizedDescription)
+            )))
+            throw error
+        }
+
+        systemCapture = capture
+        systemOutput = output
+        eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
+
+        let omission: CapturedMediaOmission?
+        if statusBeforeSleep == .recording {
+            // System audio owns wake success. Resume its durable clock before
+            // microphone permission or hardware work can suspend this actor.
+            omission = timeline.resume(at: monotonicSeconds)
+        } else {
+            // The user's pause already owns the suspended timeline. Sleep is
+            // still persisted by the lifecycle observer using its wall clock,
+            // and Resume later ends the original pause normally.
+            omission = CapturedMediaOmission(
+                reason: .sleep,
+                atMilliseconds: timeline.positionMilliseconds,
+                wallDurationMilliseconds: nil
+            )
+        }
+
+        if microphoneWasEnabledBeforeSleep {
+            let generation = advanceMicrophoneConfigurationGeneration()
+            do {
+                try await startMicrophone(
+                    deviceUID: microphoneDeviceUIDBeforeSleep,
+                    generation: generation
+                )
+            } catch {
+                // System audio is healthy. A missing microphone remains a
+                // source-specific warning and does not abort wake recovery.
+            }
+        }
+
+        isSleeping = false
+        self.statusBeforeSleep = nil
+        microphoneWasEnabledBeforeSleep = false
+        microphoneDeviceUIDBeforeSleep = nil
+        return omission
+    }
+
     /// Applies the microphone toggle to the current meeting. Enabling or
     /// changing devices opens a fresh take; disabling closes the current one.
     /// System audio remains untouched throughout.
@@ -294,9 +479,7 @@ public actor AudioPipeline {
 
     @discardableResult
     public func stop() async throws -> AudioCaptureArtifacts {
-        guard let systemCapture,
-              let systemOutput,
-              let sessionID,
+        guard let sessionID,
               let sessionDirectory,
               let systemAudioURL
         else {
@@ -305,11 +488,9 @@ public actor AudioPipeline {
 
         updateStatus(.stopping)
         _ = advanceMicrophoneConfigurationGeneration()
-        systemCapture.stop()
+        closeSystemTake()
         await closeMicrophoneTake()
-        systemOutput.finish()
-        let systemArtifact = systemOutput.sourceArtifact
-        let sourceArtifacts = [systemArtifact] + completedSourceArtifacts
+        let sourceArtifacts = completedSourceArtifacts
         // Use exact written-frame durations for the durable session boundary.
         // The addressing timeline rounds every callback to milliseconds, and
         // accumulating that sub-millisecond loss would undercount long takes.
@@ -384,17 +565,162 @@ public actor AudioPipeline {
         eventContinuation.yield(.status(status))
     }
 
-    private func captureDidFail(_ message: String, session: UUID) async {
+    private func captureDidFail(
+        _ message: String,
+        session: UUID,
+        generation: UInt64
+    ) async {
         // A failure only speaks for the session that raised it. Anything else
         // is a message from a meeting that is already over.
-        guard sessionID == session, let systemCapture else { return }
+        guard sessionID == session, systemCaptureGeneration == generation else { return }
         currentStatus = .stopping
         _ = advanceMicrophoneConfigurationGeneration()
-        systemCapture.stop()
+        closeSystemTake()
         await closeMicrophoneTake()
-        systemOutput?.finish()
         resetSession()
         updateStatus(.failed(message))
+    }
+
+    private func systemCaptureNeedsReconfiguration(
+        kind: AudioCaptureTransitionKind,
+        detail: String?,
+        session: UUID,
+        generation: UInt64
+    ) async {
+        guard sessionID == session,
+              systemCaptureGeneration == generation,
+              !isSleeping,
+              !isReconfiguringSystemCapture,
+              currentStatus == .recording || currentStatus == .paused,
+              let sessionDirectory,
+              let timeline
+        else { return }
+
+        isReconfiguringSystemCapture = true
+        _ = advanceSystemCaptureGeneration()
+        closeSystemTake()
+        let boundary = timeline.positionMilliseconds
+        eventContinuation.yield(.transition(.init(
+            source: .system,
+            kind: kind,
+            timelineMilliseconds: boundary,
+            detail: detail
+        )))
+        eventContinuation.yield(.sourceHealth(.init(source: .system, state: .arming)))
+
+        var finalError: Error?
+        for delay in reconfigurationRetryDelays {
+            await reconfigurationSleep(delay)
+            guard sessionID == session,
+                  isReconfiguringSystemCapture,
+                  !isSleeping,
+                  currentStatus == .recording || currentStatus == .paused
+            else { return }
+            do {
+                try openSystemTake(
+                    sessionID: session,
+                    sessionDirectory: sessionDirectory,
+                    timeline: timeline,
+                    paused: currentStatus == .paused
+                )
+                isReconfiguringSystemCapture = false
+                eventContinuation.yield(.sourceHealth(.init(source: .system, state: .healthy)))
+                return
+            } catch {
+                finalError = error
+            }
+        }
+
+        isReconfiguringSystemCapture = false
+        let message = finalError?.localizedDescription
+            ?? "The system audio device did not become available."
+        eventContinuation.yield(.sourceHealth(.init(
+            source: .system,
+            state: .unavailable(message)
+        )))
+    }
+
+    private func openSystemTake(
+        sessionID: UUID,
+        sessionDirectory: URL,
+        timeline: CapturedMediaTimelineCoordinator,
+        paused: Bool
+    ) throws {
+        let url = try Self.allocateTakeURL(for: .system, in: sessionDirectory)
+        let output = try CaptureOutputBridge(
+            source: .system,
+            audioURL: url,
+            timelineCoordinator: timeline,
+            eventContinuation: eventContinuation
+        )
+        let generation = advanceSystemCaptureGeneration()
+        output.failureHandler = { [weak self] message in
+            Task {
+                await self?.captureDidFail(
+                    message,
+                    session: sessionID,
+                    generation: generation
+                )
+            }
+        }
+        let continuation = eventContinuation
+        let capture = captureFactory({ [weak output] buffer, presentationSeconds in
+            output?.consume(buffer, presentationSeconds: presentationSeconds)
+        }, { [weak self] notice in
+            switch notice {
+            case .failure(let message):
+                Task {
+                    await self?.captureDidFail(
+                        message,
+                        session: sessionID,
+                        generation: generation
+                    )
+                }
+            case .dropped(let report):
+                continuation.yield(.dropped(report))
+            case .reconfigure(let kind, let detail):
+                Task {
+                    await self?.systemCaptureNeedsReconfiguration(
+                        kind: kind,
+                        detail: detail,
+                        session: sessionID,
+                        generation: generation
+                    )
+                }
+            }
+        })
+        output.begin()
+        do {
+            try capture.start()
+            if paused {
+                try capture.pause()
+                output.pause()
+            }
+        } catch {
+            capture.stop()
+            output.finish()
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+        systemCapture = capture
+        systemOutput = output
+    }
+
+    private func closeSystemTake() {
+        let capture = systemCapture
+        let output = systemOutput
+        systemCapture = nil
+        systemOutput = nil
+
+        capture?.stop()
+        if let output {
+            output.finish()
+            if output.durationMilliseconds > 0 {
+                completedSourceArtifacts.append(output.sourceArtifact)
+            } else {
+                try? FileManager.default.removeItem(at: output.sourceArtifact.audioURL)
+            }
+        }
     }
 
     private func startMicrophone(deviceUID: String?, generation: UInt64) async throws {
@@ -534,6 +860,7 @@ public actor AudioPipeline {
     }
 
     private func resetSession() {
+        _ = advanceSystemCaptureGeneration()
         _ = advanceMicrophoneConfigurationGeneration()
         systemCapture = nil
         microphoneCapture = nil
@@ -547,6 +874,11 @@ public actor AudioPipeline {
         sessionDirectory = nil
         systemAudioURL = nil
         timelineStartMilliseconds = 0
+        isSleeping = false
+        statusBeforeSleep = nil
+        microphoneWasEnabledBeforeSleep = false
+        microphoneDeviceUIDBeforeSleep = nil
+        isReconfiguringSystemCapture = false
     }
 
     var microphoneTakeIdentifier: UUID? { activeMicrophoneTakeID }
@@ -555,6 +887,12 @@ public actor AudioPipeline {
     private func advanceMicrophoneConfigurationGeneration() -> UInt64 {
         microphoneConfigurationGeneration &+= 1
         return microphoneConfigurationGeneration
+    }
+
+    @discardableResult
+    private func advanceSystemCaptureGeneration() -> UInt64 {
+        systemCaptureGeneration &+= 1
+        return systemCaptureGeneration
     }
 
     private static func defaultCaptureDirectory() -> URL {

@@ -17,6 +17,8 @@ final class CaptureOutputBridge: @unchecked Sendable {
     private let sourceWriter: IncrementalCAFWriter
     private let timelineCoordinator: CapturedMediaTimelineCoordinator
     private let timelineStartMilliseconds: Int64
+    private var firstRecordedStartMilliseconds: Int64?
+    private var committedDurationMilliseconds: Int64 = 0
     // One resampler for the whole session: its polyphase filter state has to
     // stay continuous across tap callbacks.
     private let resampler = SpeechFeedResampler(targetSampleRate: 16_000)
@@ -78,7 +80,8 @@ final class CaptureOutputBridge: @unchecked Sendable {
             AudioCaptureSourceArtifact(
                 source: source,
                 audioURL: sourceWriter.url,
-                timelineStartMilliseconds: timelineStartMilliseconds,
+                timelineStartMilliseconds: firstRecordedStartMilliseconds
+                    ?? timelineStartMilliseconds,
                 durationMilliseconds: Self.milliseconds(
                     frames: sourceWriter.framesWritten,
                     sampleRate: IncrementalCAFWriter.recoverySampleRate
@@ -142,10 +145,15 @@ final class CaptureOutputBridge: @unchecked Sendable {
                     }
                     // Use recovery frames, not resampler output: a converter's
                     // filter latency is not captured-media duration.
-                    let duration = Int64((
-                        Double(pcmBuffer.frameLength)
-                            / pcmBuffer.format.sampleRate * 1_000
-                    ).rounded())
+                    // Compute a delta from the exact cumulative frame count.
+                    // Rounding each 1,024-frame callback independently loses
+                    // roughly a third of a millisecond per callback.
+                    let totalDuration = Self.milliseconds(
+                        frames: sourceWriter.framesWritten,
+                        sampleRate: IncrementalCAFWriter.recoverySampleRate
+                    )
+                    let duration = max(0, totalDuration - committedDurationMilliseconds)
+                    committedDurationMilliseconds = totalDuration
                     return (
                         value: pcmBuffer,
                         durationMilliseconds: duration
@@ -154,6 +162,9 @@ final class CaptureOutputBridge: @unchecked Sendable {
                 guard let recorded,
                       recorded.range.endMilliseconds > recorded.range.startMilliseconds
                 else { return }
+                if firstRecordedStartMilliseconds == nil {
+                    firstRecordedStartMilliseconds = recorded.range.startMilliseconds
+                }
 
                 let sampleRate = resampler.targetSampleRate
                 let samples = try resampler.resample(recorded.value)
