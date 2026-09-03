@@ -512,6 +512,20 @@ public struct FinalizationJob: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// A finalization job together with the meeting that owns its recording
+/// session. `FinalizationJob` deliberately stores only a session identifier so
+/// the job remains a session-level unit of work; list and workspace UI need the
+/// meeting relationship without re-querying every session individually.
+public struct MeetingFinalizationJob: Equatable, Sendable {
+    public var meetingID: UUID
+    public var job: FinalizationJob
+
+    public init(meetingID: UUID, job: FinalizationJob) {
+        self.meetingID = meetingID
+        self.job = job
+    }
+}
+
 public enum TranscriptStability: String, Codable, CaseIterable, Comparable, Sendable {
     case partial
     case stable

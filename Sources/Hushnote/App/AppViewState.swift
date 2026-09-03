@@ -567,6 +567,7 @@ enum FailureKind: Equatable {
     case questionAnswering
     case export
     case recordingImport
+    case finalization
 }
 
 /// Where a failure has to appear to be seen at all.
@@ -596,6 +597,7 @@ enum FailureRoute: Equatable {
         case .storage: .appAlert(title: "Storage could not be updated")
         case .export: .appAlert(title: "The export did not finish")
         case .recordingImport: .appAlert(title: "The recording could not be imported")
+        case .finalization: .appAlert(title: "Finalization could not be retried")
         case .insightGeneration, .questionAnswering: .insightWorkspace
         }
     }
@@ -723,6 +725,10 @@ final class AppViewState {
     /// separate from the global recording phase because another meeting can
     /// be actively capturing while older jobs wait in the queue.
     var finalizationETAs: [UUID: FinalizationETARange] = [:]
+    /// Session-level durable jobs grouped by their meeting. This survives the
+    /// brief Stop handoff, where `recordingPhase` intentionally returns to
+    /// idle so another meeting can begin recording while this one finalizes.
+    var finalizationJobsByMeeting: [UUID: [FinalizationJob]] = [:]
     var alert: AppAlert?
     var audioExports: [UUID: AudioExportState] = [:]
     var storageReport: StorageReport?
@@ -842,6 +848,31 @@ final class AppViewState {
 
     var finalizationLabel: String {
         finalizationDetail ?? finalizationStage?.title ?? "Finalizing transcript…"
+    }
+
+    func finalizationPresentation(for meetingID: UUID) -> MeetingFinalizationPresentation? {
+        MeetingFinalizationPresentationPolicy.presentation(
+            jobs: finalizationJobsByMeeting[meetingID, default: []],
+            eta: finalizationETAs[meetingID],
+            isBlockedByLiveCapture: recordingPhase.isCapturing && activeMeetingID != meetingID
+        )
+    }
+
+    func replaceFinalizationJobs(_ jobs: [FinalizationJob], for meetingID: UUID) {
+        finalizationJobsByMeeting[meetingID] = jobs.sorted {
+            if $0.queuedAt != $1.queuedAt { return $0.queuedAt < $1.queuedAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+    }
+
+    func recordFinalizationJob(_ job: FinalizationJob, for meetingID: UUID) {
+        var jobs = finalizationJobsByMeeting[meetingID, default: []]
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
+            jobs[index] = job
+        } else {
+            jobs.append(job)
+        }
+        replaceFinalizationJobs(jobs, for: meetingID)
     }
 
     @ObservationIgnored private var elapsedTask: Task<Void, Never>?

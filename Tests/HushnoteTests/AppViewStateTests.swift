@@ -208,4 +208,36 @@ final class AppViewStateTests: XCTestCase {
         XCTAssertTrue(state.hasUnsavedSummaryChanges)
         XCTAssertEqual(state.unsavedSummaryMeetingID, meetingID)
     }
+
+    func testMeetingScopedFinalizationSurvivesStopAndUnrelatedRecording() {
+        let state = AppViewState()
+        let completedMeetingID = UUID()
+        let activeMeetingID = UUID()
+        let job = FinalizationJob(
+            sessionID: UUID(),
+            state: .queued,
+            modelID: "large-v3",
+            audioDurationMilliseconds: 60_000
+        )
+
+        state.recordFinalizationJob(job, for: completedMeetingID)
+        state.finalizationETAs[completedMeetingID] = .init(
+            lowerBoundSeconds: 30,
+            upperBoundSeconds: 45
+        )
+        state.activeMeetingID = completedMeetingID
+        state.markFinalizing(stage: .savingAudio, progress: 0.1)
+        state.markFinished()
+
+        XCTAssertEqual(state.finalizationPresentation(for: completedMeetingID)?.kind, .queued)
+        XCTAssertEqual(state.finalizationPresentation(for: completedMeetingID)?.eta?.lowerBoundSeconds, 30)
+
+        state.markRecordingStarted(meetingID: activeMeetingID)
+
+        XCTAssertEqual(state.finalizationPresentation(for: completedMeetingID)?.kind, .queued)
+        XCTAssertTrue(
+            state.finalizationPresentation(for: completedMeetingID)?.detail
+                .contains("after the current recording stops") == true
+        )
+    }
 }

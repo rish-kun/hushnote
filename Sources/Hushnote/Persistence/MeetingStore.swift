@@ -1022,6 +1022,39 @@ public actor MeetingStore {
         }
     }
 
+    /// Loads every durable finalization job together with its owning meeting.
+    ///
+    /// This is intentionally one store read for bootstrap rather than one
+    /// `finalizationJobs(meetingID:)` query per library row. Completed jobs are
+    /// included: an appended meeting can contain a completed session beside a
+    /// newer queued or failed one, and the caller needs the full graph to make
+    /// an honest meeting-level presentation.
+    public func allMeetingFinalizationJobs() throws -> [MeetingFinalizationJob] {
+        try database.read { db in
+            let records = try FinalizationJobRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT jobs.*
+                    FROM finalizationJobs AS jobs
+                    JOIN recordingSessions AS sessions ON sessions.id = jobs.sessionID
+                    JOIN meetings ON meetings.id = sessions.meetingID
+                    WHERE meetings.deletedAt IS NULL
+                    ORDER BY sessions.meetingID, jobs.queuedAt, jobs.id
+                    """
+            )
+            return try records.map { record in
+                let job = try record.model()
+                guard let session = try RecordingSessionRecord.fetchOne(db, key: job.sessionID.uuidString) else {
+                    throw PersistenceError.recordingSessionNotFound(job.sessionID)
+                }
+                guard let meetingID = UUID(uuidString: session.meetingID) else {
+                    throw PersistenceError.corruptRecord("recording session \(session.id)")
+                }
+                return MeetingFinalizationJob(meetingID: meetingID, job: job)
+            }
+        }
+    }
+
     public func upsertSegments(_ segments: [TranscriptSegment]) throws {
         guard !segments.isEmpty else { return }
         let meetingID = segments[0].meetingID

@@ -27,14 +27,11 @@ struct FloatingPanelPositioning {
         }
 
         let proposedFrame = CGRect(origin: savedOrigin, size: panelSize)
-        let target = visibleFrames.max { lhs, rhs in
-            intersectionArea(proposedFrame, lhs) < intersectionArea(proposedFrame, rhs)
-        }.flatMap { best in
-            intersectionArea(proposedFrame, best) > 0 ? best : nil
-        } ?? visibleFrames.min { lhs, rhs in
-            squaredDistance(from: proposedFrame.center, to: lhs)
-                < squaredDistance(from: proposedFrame.center, to: rhs)
-        }!
+        let target = targetVisibleFrame(
+            for: proposedFrame,
+            visibleFrames: visibleFrames,
+            defaultVisibleFrame: defaultVisibleFrame
+        )!
 
         return clamp(savedOrigin, panelSize: panelSize, to: target)
     }
@@ -56,6 +53,85 @@ struct FloatingPanelPositioning {
             visibleFrames: visibleFrames,
             defaultVisibleFrame: defaultVisibleFrame
         )
+    }
+
+    /// Resolves an entire resize in one place so the caller can apply one
+    /// AppKit frame change. A panel must never grow beyond the visible frame
+    /// that currently contains it: if there is insufficient room for the
+    /// expanded recording workspace, retain the compact control instead.
+    static func resizedFrame(
+        currentFrame: CGRect,
+        requestedSize: CGSize,
+        compactSize: CGSize,
+        visibleFrames: [CGRect],
+        defaultVisibleFrame: CGRect? = nil
+    ) -> CGRect {
+        guard let target = targetVisibleFrame(
+            for: currentFrame,
+            visibleFrames: visibleFrames,
+            defaultVisibleFrame: defaultVisibleFrame
+        ) else {
+            return CGRect(
+                origin: CGPoint(
+                    x: currentFrame.minX,
+                    y: currentFrame.maxY - requestedSize.height
+                ),
+                size: requestedSize
+            )
+        }
+
+        let requestedFits = requestedSize.width <= target.width
+            && requestedSize.height <= target.height
+        let preferredSize = requestedFits ? requestedSize : compactSize
+        // A display can itself be smaller than the compact pill (for example
+        // a remote-desktop surface). Keep as much of the persistent control
+        // reachable as the display permits rather than placing an edge off
+        // screen.
+        let fittedSize = CGSize(
+            width: min(preferredSize.width, target.width),
+            height: min(preferredSize.height, target.height)
+        )
+        let origin = clamp(
+            CGPoint(
+                x: currentFrame.minX,
+                y: currentFrame.maxY - fittedSize.height
+            ),
+            panelSize: fittedSize,
+            to: target
+        )
+        return CGRect(origin: origin, size: fittedSize)
+    }
+
+    static func canShowExpandedPanel(
+        frame: CGRect,
+        expandedSize: CGSize,
+        visibleFrames: [CGRect],
+        defaultVisibleFrame: CGRect? = nil
+    ) -> Bool {
+        guard let target = targetVisibleFrame(
+            for: frame,
+            visibleFrames: visibleFrames,
+            defaultVisibleFrame: defaultVisibleFrame
+        ) else {
+            return true
+        }
+        return expandedSize.width <= target.width && expandedSize.height <= target.height
+    }
+
+    private static func targetVisibleFrame(
+        for proposedFrame: CGRect,
+        visibleFrames: [CGRect],
+        defaultVisibleFrame: CGRect?
+    ) -> CGRect? {
+        guard !visibleFrames.isEmpty else { return nil }
+        return visibleFrames.max { lhs, rhs in
+            intersectionArea(proposedFrame, lhs) < intersectionArea(proposedFrame, rhs)
+        }.flatMap { best in
+            intersectionArea(proposedFrame, best) > 0 ? best : nil
+        } ?? visibleFrames.min { lhs, rhs in
+            squaredDistance(from: proposedFrame.center, to: lhs)
+                < squaredDistance(from: proposedFrame.center, to: rhs)
+        } ?? defaultVisibleFrame
     }
 
     private static func clamp(_ origin: CGPoint, panelSize: CGSize, to frame: CGRect) -> CGPoint {
@@ -276,6 +352,7 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let snapshotAction: FloatingRecordingPanelSnapshotAction
     @ObservationIgnored private let panel: NSPanel
+    @ObservationIgnored private var hostingView: NSView?
     @ObservationIgnored private var isRestoringPosition = false
 
     private static let savedXKey = "floatingRecordingPanel.origin.x"
@@ -315,7 +392,7 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
 
         super.init()
         let content = FloatingRecordingPanelContent { [weak self] isExpanded in
-            self?.applyPanelSize(isExpanded: isExpanded)
+            self?.applyPanelSize(isExpanded: isExpanded) ?? false
         } onSnapshot: { [snapshotAction] in
             try await snapshotAction()
         }
@@ -326,6 +403,12 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         // SwiftUI's preferred size reintroduces the expansion measurement
         // race this controller is responsible for avoiding.
         hostingView.sizingOptions = []
+        hostingView.frame = NSRect(
+            origin: .zero,
+            size: FloatingRecordingPanelPolicy.compactPanelSize
+        )
+        hostingView.autoresizingMask = [.width, .height]
+        self.hostingView = hostingView
         panel.contentView = hostingView
         panel.delegate = self
 
@@ -380,20 +463,32 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    private func applyPanelSize(isExpanded: Bool) {
-        let size = FloatingRecordingPanelPolicy.panelSize(isExpanded: isExpanded)
-        guard panel.frame.size != size else { return }
-
-        let origin = FloatingPanelPositioning.originPreservingTopEdge(
+    /// Applies one final panel rectangle. Resizing the content and moving the
+    /// panel separately can expose the expanded SwiftUI tree inside the old,
+    /// compact frame for a run-loop turn.
+    @discardableResult
+    private func applyPanelSize(isExpanded: Bool) -> Bool {
+        let requestedSize = FloatingRecordingPanelPolicy.panelSize(isExpanded: isExpanded)
+        let visibleFrames = NSScreen.screens.map(\.visibleFrame)
+        let targetFrame = FloatingPanelPositioning.resizedFrame(
             currentFrame: panel.frame,
-            newSize: size,
-            visibleFrames: NSScreen.screens.map(\.visibleFrame),
+            requestedSize: requestedSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: visibleFrames,
             defaultVisibleFrame: NSScreen.main?.visibleFrame
         )
-        panel.setContentSize(size)
+        let expansionFits = !isExpanded || targetFrame.size == requestedSize
+
+        guard panel.frame != targetFrame else { return expansionFits }
         isRestoringPosition = true
-        panel.setFrameOrigin(origin)
-        isRestoringPosition = false
+        defer { isRestoringPosition = false }
+        panel.setFrame(targetFrame, display: true, animate: false)
+        // `NSHostingView` deliberately has no intrinsic-size policy. Its
+        // autoresizing mask is the contract that makes it fill this native
+        // frame through the next SwiftUI layout pass.
+        hostingView?.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
+        return expansionFits
     }
 
     private func restoreAndClampPosition() {
@@ -414,13 +509,20 @@ final class FloatingRecordingPanelController: NSObject, NSWindowDelegate {
         )
 
         isRestoringPosition = true
-        panel.setFrameOrigin(origin)
-        isRestoringPosition = false
+        defer { isRestoringPosition = false }
+        panel.setFrame(
+            CGRect(origin: origin, size: panel.frame.size),
+            display: true,
+            animate: false
+        )
     }
 }
 
 private struct FloatingRecordingPanelContent: View {
-    let onSizeChange: @MainActor (Bool) -> Void
+    /// Returns false only when the current visible display cannot contain the
+    /// expanded panel. The view then returns to the compact control, where
+    /// its expand affordance is always reachable.
+    let onSizeChange: @MainActor (Bool) -> Bool
     let onSnapshot: @MainActor () async throws -> Void
     @Environment(AppViewState.self) private var state
     @State private var isExpanded = false
@@ -434,7 +536,6 @@ private struct FloatingRecordingPanelContent: View {
                 ExpandedRecordingPanel(
                     collapse: {
                         isExpanded = false
-                        onSizeChange(false)
                     },
                     onSnapshot: onSnapshot
                 )
@@ -444,7 +545,6 @@ private struct FloatingRecordingPanelContent: View {
                     if state.recordingPhase.isCapturing {
                         Button {
                             isExpanded = true
-                            onSizeChange(true)
                         } label: {
                             Image(systemName: "chevron.down")
                                 .font(.caption2.weight(.semibold))
@@ -466,11 +566,32 @@ private struct FloatingRecordingPanelContent: View {
         .onExitCommand {
             guard isExpanded else { return }
             isExpanded = false
-            onSizeChange(false)
+        }
+        .onAppear(perform: schedulePanelResize)
+        .onChange(of: isExpanded) { _, _ in
+            schedulePanelResize()
         }
         .onChange(of: state.recordingPhase) { _, phase in
             if !phase.isCapturing { isExpanded = false }
-            onSizeChange(isExpanded && phase.isCapturing)
+            schedulePanelResize()
+        }
+    }
+
+    private func schedulePanelResize() {
+        // State mutation and body recomposition happen after a button action
+        // returns. Yielding once lets the root switch branches before native
+        // geometry changes; this is the boundary that prevents the expanded
+        // tree being clipped by the old compact panel frame.
+        Task { @MainActor in
+            await Task.yield()
+            let shouldExpand = FloatingRecordingPanelPolicy.showsExpandedContent(
+                requested: isExpanded,
+                phase: state.recordingPhase
+            )
+            guard onSizeChange(shouldExpand) || !shouldExpand else {
+                isExpanded = false
+                return
+            }
         }
     }
 }
@@ -486,21 +607,32 @@ private struct ExpandedRecordingPanel: View {
     @FocusState private var noteIsFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 0) {
             header
+                .padding(.horizontal, 14)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
             HushnoteRule(opacity: 0.72)
 
-            HStack(spacing: 24) {
-                SystemLevelMeter()
-                MicrophoneLevelMeter()
-            }
+            // Keep the collapse control outside the scrollable body. Should
+            // copy grow (or a display force a smaller content rect), the user
+            // can always get back to the compact recording pill.
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 24) {
+                        SystemLevelMeter()
+                        MicrophoneLevelMeter()
+                    }
 
-            sourceHealth
-            confidence
-            controls
-            quickNoteField
+                    sourceHealth
+                    confidence
+                    controls
+                    quickNoteField
+                }
+                .padding(14)
+            }
+            .scrollIndicators(.never)
         }
-        .padding(14)
         .frame(
             width: FloatingRecordingPanelPolicy.expandedContentSize.width,
             height: FloatingRecordingPanelPolicy.expandedContentSize.height,

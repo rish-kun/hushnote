@@ -332,6 +332,98 @@ struct FinalizationBanner: View {
     }
 }
 
+/// The durable post-Stop status. Unlike `FinalizationBanner`, this reads a
+/// meeting-scoped queue projection and therefore remains useful once capture
+/// ownership has been released for the next meeting.
+struct MeetingFinalizationStatusBanner: View {
+    let meetingID: UUID
+    @Environment(AppViewState.self) private var state
+    @Environment(AppCoordinator.self) private var coordinator
+
+    var body: some View {
+        if let presentation = state.finalizationPresentation(for: meetingID) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: symbol(for: presentation.kind))
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(foreground(for: presentation.kind))
+                    .frame(width: 18, height: 18)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 7) {
+                        Text(presentation.title)
+                            .font(.callout.weight(.semibold))
+                        if presentation.unresolvedSessionCount > 1 {
+                            Text("\(presentation.unresolvedSessionCount) sessions")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(HushnoteTheme.secondaryInk)
+                        }
+                    }
+                    Text(presentation.detail)
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let eta = presentation.eta {
+                        Text(eta.userFacingText)
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .foregroundStyle(HushnoteTheme.secondaryInk)
+                    }
+                    if let progress = presentation.progress {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(HushnoteTheme.vermilion)
+                            .frame(maxWidth: 230)
+                            .padding(.top, 2)
+                    }
+                }
+
+                Spacer(minLength: 12)
+
+                if presentation.isRetryable {
+                    Button("Retry finalization") {
+                        Task {
+                            await coordinator.retryFinalization(
+                                meetingID: meetingID,
+                                jobID: presentation.jobID
+                            )
+                        }
+                    }
+                    .hushnoteButton(.recording)
+                }
+            }
+            .padding(.horizontal, 30)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(HushnoteTheme.controlSurface)
+            .hushnoteBottomRule(opacity: 0.65)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(accessibilityLabel(for: presentation))
+        }
+    }
+
+    private func symbol(for kind: MeetingFinalizationPresentation.Kind) -> String {
+        switch kind {
+        case .queued: "clock"
+        case .transcribing: "waveform"
+        case .diarizing: "person.2"
+        case .merging: "arrow.triangle.merge"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func foreground(for kind: MeetingFinalizationPresentation.Kind) -> Color {
+        switch kind {
+        case .failed: HushnoteTheme.vermilionInk
+        case .queued: HushnoteTheme.secondaryInk
+        case .transcribing, .diarizing, .merging: HushnoteTheme.moss
+        }
+    }
+
+    private func accessibilityLabel(for presentation: MeetingFinalizationPresentation) -> String {
+        let eta = presentation.eta.map { ", \($0.userFacingText)" } ?? ""
+        return "\(presentation.title). \(presentation.detail)\(eta)"
+    }
+}
+
 struct EmptyMeetingIllustration: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {

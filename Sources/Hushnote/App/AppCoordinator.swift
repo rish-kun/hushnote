@@ -187,6 +187,11 @@ final class AppCoordinator {
             // a meeting can have several appended sessions, and a failed job
             // must remain retryable without being retried silently at launch.
             let queuedJobs = try await store.queuedFinalizationJobs()
+            let finalizationJobs = try await store.allMeetingFinalizationJobs()
+            let jobsByMeeting = Dictionary(grouping: finalizationJobs, by: \.meetingID)
+            for (meetingID, jobs) in jobsByMeeting {
+                state.replaceFinalizationJobs(jobs.map(\.job), for: meetingID)
+            }
             recentFinalizationSamples = try await store.recentCompletedFinalizationJobs()
                 .compactMap { job in
                     job.realtimeFactor.map {
@@ -321,6 +326,8 @@ final class AppCoordinator {
                 durable.status = .finalizing
                 updateListItem(durable, excerpt: "Imported audio is queued for transcription.")
             }
+            state.recordFinalizationJob(job, for: meeting.id)
+            updateFinalizationETA(for: meeting.id, job: job)
             await recoverMeeting(meeting.id, finalizationJobID: job.id)
             if let finalizedMeeting = try? await store.meeting(id: meeting.id),
                finalizedMeeting.status == .ready {
@@ -805,6 +812,7 @@ final class AppCoordinator {
                 audioDurationMilliseconds: recordingSession.capturedDurationMilliseconds
             )
             try await store.enqueueFinalizationJob(job)
+            state.recordFinalizationJob(job, for: meetingID)
             updateFinalizationETA(for: meetingID, job: job)
             requestFinalizationNotificationAuthorization()
             self.audioPipeline = nil
@@ -1520,6 +1528,31 @@ final class AppCoordinator {
         }
     }
 
+    /// Re-enqueues one failed session without reclaiming capture ownership.
+    /// The serialized background worker will start it when no live meeting is
+    /// recording, so retrying a finished meeting cannot interrupt a new one.
+    func retryFinalization(meetingID: UUID, jobID: UUID) async {
+        do {
+            guard let existing = try await store.finalizationJob(id: jobID),
+                  let session = try await store.recordingSession(id: existing.sessionID),
+                  session.meetingID == meetingID else {
+                throw CoordinatorError.providerUnavailable("The finalization job does not belong to this meeting.")
+            }
+            let job = try await store.retryFinalizationJob(id: jobID)
+            try await store.updateMeetingStatus(id: meetingID, status: .finalizing)
+            if var meeting = try await store.meeting(id: meetingID) {
+                meeting.status = .finalizing
+                meeting.errorMessage = nil
+                updateListItem(meeting, excerpt: "Final transcription is queued.")
+            }
+            state.recordFinalizationJob(job, for: meetingID)
+            updateFinalizationETA(for: meetingID, job: job)
+            enqueueBackgroundFinalization()
+        } catch {
+            state.report(.finalization, error.localizedDescription)
+        }
+    }
+
     func recoverMeeting(
         _ id: UUID,
         finalizationJobID: UUID? = nil,
@@ -1551,7 +1584,10 @@ final class AppCoordinator {
                state.activeMeetingID != id,
                let durableJob,
                FinalizationJobTransitionPolicy.isRunning(durableJob.state) {
-                _ = try? await store.requeueRunningFinalizationJob(id: durableJob.id)
+                if let requeued = try? await store.requeueRunningFinalizationJob(id: durableJob.id) {
+                    state.recordFinalizationJob(requeued, for: id)
+                    updateFinalizationETA(for: id, job: requeued)
+                }
                 return
             }
             try await registerRecoveryAudio(for: id)
@@ -1575,6 +1611,7 @@ final class AppCoordinator {
             let revision = (existing.map(\.revision).max() ?? 0) + 1
             let durableJobID = durableJob?.id
             if let durableJob {
+                state.recordFinalizationJob(durableJob, for: id)
                 updateFinalizationETA(for: id, job: durableJob)
             }
             var final = try await finalizer.transcribe(
@@ -1603,6 +1640,7 @@ final class AppCoordinator {
                     if let self, let durableJobID {
                         let progressValue = progress == .loadingModel ? 0.25 : 0.55
                         if let updated = try? await self.updateFinalizationJob(
+                            meetingID: id,
                             id: durableJobID,
                             state: .transcribing,
                             progress: progressValue
@@ -1621,6 +1659,7 @@ final class AppCoordinator {
                 }
                 if let jobID = durableJob?.id {
                     durableJob = try await updateFinalizationJob(
+                        meetingID: id,
                         id: jobID,
                         state: .diarizing,
                         progress: 0.75
@@ -1653,6 +1692,27 @@ final class AppCoordinator {
                 return copy
             }
             let merged = try AppendedTranscriptMergePolicy.merge(existing: existing, appended: final)
+            if let jobID = durableJob?.id {
+                // Imported tracks need not include a system source, so they
+                // can legitimately skip the diarizer. The durable state still
+                // crosses its required checkpoint before the transcript merge.
+                if durableJob?.state == .transcribing {
+                    durableJob = try await updateFinalizationJob(
+                        meetingID: id,
+                        id: jobID,
+                        state: .diarizing,
+                        progress: 0.9
+                    )
+                    if let durableJob { updateFinalizationETA(for: id, job: durableJob) }
+                }
+                durableJob = try await updateFinalizationJob(
+                    meetingID: id,
+                    id: jobID,
+                    state: .merging,
+                    progress: 0.92
+                )
+                if let durableJob { updateFinalizationETA(for: id, job: durableJob) }
+            }
             try await store.replaceTranscript(.init(meetingID: id, revision: revision, segments: merged))
             cachedSegments[id] = merged
             if presentsProgress || (!state.recordingPhase.isCapturing && selectedMeetingID == id) {
@@ -1669,15 +1729,8 @@ final class AppCoordinator {
             try await store.saveMeeting(meeting)
             updateListItem(meeting, excerpt: merged.first?.text ?? "Recovered local transcript")
             if let jobID = durableJob?.id {
-                if durableJob?.state == .transcribing {
-                    durableJob = try await updateFinalizationJob(
-                        id: jobID,
-                        state: .diarizing,
-                        progress: 0.9
-                    )
-                    if let durableJob { updateFinalizationETA(for: id, job: durableJob) }
-                }
                 durableJob = try await updateFinalizationJob(
+                    meetingID: id,
                     id: jobID,
                     state: .succeeded,
                     progress: 1,
@@ -1692,6 +1745,7 @@ final class AppCoordinator {
                     )
                     try await store.updateFinalizationJob(completed)
                     durableJob = completed
+                    state.recordFinalizationJob(completed, for: id)
                     recentFinalizationSamples.append(.init(
                         modelID: completed.modelID,
                         realtimeFactor: completed.realtimeFactor!
@@ -1711,12 +1765,14 @@ final class AppCoordinator {
                 if let durableJob,
                    FinalizationJobTransitionPolicy.isRunning(durableJob.state),
                    let requeued = try? await store.requeueRunningFinalizationJob(id: durableJob.id) {
+                    state.recordFinalizationJob(requeued, for: id)
                     updateFinalizationETA(for: id, job: requeued)
                 }
                 return
             }
             if let jobID = durableJob?.id {
                 _ = try? await updateFinalizationJob(
+                    meetingID: id,
                     id: jobID,
                     state: .failed,
                     progress: durableJob?.progress ?? 0,
@@ -1910,11 +1966,13 @@ final class AppCoordinator {
             job.errorMessage = nil
             try await store.updateFinalizationJob(job)
         }
+        state.recordFinalizationJob(job, for: meetingID)
         return job
     }
 
     @discardableResult
     private func updateFinalizationJob(
+        meetingID: UUID,
         id: UUID,
         state: FinalizationJobState,
         progress: Double,
@@ -1929,6 +1987,7 @@ final class AppCoordinator {
         job.finishedAt = finishedAt
         job.errorMessage = errorMessage
         try await store.updateFinalizationJob(job)
+        self.state.recordFinalizationJob(job, for: meetingID)
         return job
     }
 
@@ -2960,6 +3019,27 @@ final class AppCoordinator {
         } catch {
             state.report(.export, error.localizedDescription)
         }
+    }
+
+    /// Copies source material rather than the mutable summary/insight layer.
+    /// The selected meeting's cached transcript is the durable one loaded from
+    /// SQLite, never the provisional text belonging to another live meeting.
+    @discardableResult
+    func copyTranscriptAsMarkdown(meetingID: UUID) -> Bool {
+        guard let meeting = state.meetings.first(where: { $0.id == meetingID }) else {
+            state.report(.export, "This meeting is no longer available.")
+            return false
+        }
+        let transcript = cachedSegments[meetingID] ?? []
+        guard !transcript.isEmpty else {
+            state.report(.export, "There is no transcript to copy yet.")
+            return false
+        }
+        guard TranscriptMarkdownClipboard.copy(meeting: meeting, transcript: transcript) else {
+            state.report(.export, "The transcript could not be copied to the clipboard.")
+            return false
+        }
+        return true
     }
 
     /// Copies the meeting's own recording out. The menu already decided this

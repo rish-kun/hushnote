@@ -89,7 +89,7 @@ enum MeetingExporter {
         let data: Data
         switch format {
         case .markdown:
-            data = Data(markdown(meeting: meeting, transcript: transcript, insights: insights).utf8)
+            data = Data(meetingMarkdown(meeting: meeting, transcript: transcript, insights: insights).utf8)
         case .srt:
             data = Data(srt(transcript: transcript).utf8)
         case .json:
@@ -125,7 +125,33 @@ enum MeetingExporter {
         try fileManager.copyItem(at: source, to: destination)
     }
 
-    private static func markdown(
+    /// The portable transcript representation. Clipboard copy and the Markdown
+    /// export deliberately call this same formatter: a pasted transcript must
+    /// not silently differ from the file a person can save from the adjacent
+    /// menu item.
+    ///
+    /// It is intentionally transcript-only. Summaries and action lists are
+    /// mutable interpretations of the conversation, whereas this document is
+    /// the timestamped, speaker-attributed source material.
+    static func transcriptMarkdown(
+        meeting: MeetingListItem,
+        transcript: [TranscriptSegment]
+    ) -> String {
+        var lines = ["# \(meeting.title)", ""]
+        lines.append("_\(meeting.startedAt.formatted(date: .long, time: .shortened)) · \(DurationText.clock(meeting.duration))_")
+        lines += ["", "## Transcript", ""]
+        for segment in transcript {
+            let speaker = segment.speakerName ?? segment.speakerID ?? "Speaker"
+            lines.append("**[\(DurationText.clock(Double(segment.startMilliseconds) / 1_000))] \(speaker):** \(segment.text)")
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// The saved Markdown export remains a full meeting document. Clipboard
+    /// copy deliberately uses `transcriptMarkdown` above, because it promises
+    /// source material rather than mutable summary interpretation.
+    private static func meetingMarkdown(
         meeting: MeetingListItem,
         transcript: [TranscriptSegment],
         insights: InsightWorkspaceState

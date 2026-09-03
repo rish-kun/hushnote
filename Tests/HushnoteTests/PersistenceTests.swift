@@ -709,4 +709,54 @@ final class PersistenceTests: XCTestCase {
         XCTAssertTrue(tracks.isEmpty)
         XCTAssertNotNil(fetchedMeeting)
     }
+
+    func testAllMeetingFinalizationJobsIncludesMeetingOwnership() async throws {
+        let store = try MeetingStore(inMemory: ())
+        let first = Meeting(title: "First")
+        let second = Meeting(title: "Second")
+        try await store.saveMeeting(first)
+        try await store.saveMeeting(second)
+
+        let firstSession = RecordingSession(
+            meetingID: first.id,
+            ordinal: 0,
+            origin: .live,
+            wallStartedAt: Date(timeIntervalSince1970: 1),
+            timelineStartMilliseconds: 0,
+            state: .captured
+        )
+        let secondSession = RecordingSession(
+            meetingID: second.id,
+            ordinal: 0,
+            origin: .live,
+            wallStartedAt: Date(timeIntervalSince1970: 2),
+            timelineStartMilliseconds: 0,
+            state: .captured
+        )
+        try await store.saveRecordingSession(firstSession)
+        try await store.saveRecordingSession(secondSession)
+        let firstJob = FinalizationJob(
+            sessionID: firstSession.id,
+            modelID: "small",
+            audioDurationMilliseconds: 30_000
+        )
+        let secondJob = FinalizationJob(
+            sessionID: secondSession.id,
+            modelID: "large-v3",
+            audioDurationMilliseconds: 60_000
+        )
+        try await store.enqueueFinalizationJob(firstJob)
+        try await store.enqueueFinalizationJob(secondJob)
+
+        let jobs = try await store.allMeetingFinalizationJobs()
+
+        let identifiers = Set(jobs.map { "\($0.meetingID.uuidString):\($0.job.id.uuidString)" })
+        XCTAssertEqual(
+            identifiers,
+            Set([
+                "\(first.id.uuidString):\(firstJob.id.uuidString)",
+                "\(second.id.uuidString):\(secondJob.id.uuidString)",
+            ])
+        )
+    }
 }

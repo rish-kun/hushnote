@@ -47,7 +47,10 @@ struct MeetingWorkspaceView: View {
                 CompletedMeetingView(meetingID: meetingID)
             }
         case .completed:
-            CompletedMeetingView(meetingID: meetingID)
+            VStack(spacing: 0) {
+                MeetingFinalizationStatusBanner(meetingID: meetingID)
+                CompletedMeetingView(meetingID: meetingID)
+            }
         }
     }
 }
@@ -475,6 +478,8 @@ struct CompletedMeetingView: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
     @State private var isShowingRecordingImporter = false
+    @State private var markdownCopyFeedback = TranscriptMarkdownCopyFeedback.idle
+    @State private var markdownCopyGeneration = UUID()
 
     /// Not `state.recordingPhase`: this workspace also renders for meetings
     /// that are merely *not* the one recording. See `governingPhase`.
@@ -509,6 +514,15 @@ struct CompletedMeetingView: View {
                     audioExportStatus(exportState, policy: policy)
                         .padding(.horizontal, policy.gutter)
                         .padding(.bottom, 12)
+                }
+
+                if markdownCopyFeedback == .copied {
+                    Label("Transcript copied as Markdown", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(HushnoteTheme.moss)
+                        .padding(.horizontal, policy.gutter)
+                        .padding(.bottom, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 MeetingWorkspaceTabBar(
@@ -740,6 +754,13 @@ struct CompletedMeetingView: View {
         }
         Menu {
             Button("Markdown") { coordinator.export(meetingID: meetingID, format: .markdown) }
+            Button(TranscriptMarkdownCopyFeedbackPolicy.title(for: markdownCopyFeedback)) {
+                copyTranscriptAsMarkdown()
+            }
+            .disabled(!TranscriptMarkdownCopyFeedbackPolicy.isEnabled(transcript: state.transcript))
+            .accessibilityLabel(
+                TranscriptMarkdownCopyFeedbackPolicy.accessibilityLabel(for: markdownCopyFeedback)
+            )
             Button("SubRip (.srt)") { coordinator.export(meetingID: meetingID, format: .srt) }
             Button("JSON") { coordinator.export(meetingID: meetingID, format: .json) }
             Divider()
@@ -755,6 +776,18 @@ struct CompletedMeetingView: View {
             Label("Export", systemImage: "square.and.arrow.up")
         }
         .menuStyle(.borderlessButton)
+    }
+
+    private func copyTranscriptAsMarkdown() {
+        guard coordinator.copyTranscriptAsMarkdown(meetingID: meetingID) else { return }
+        markdownCopyFeedback = .copied
+        let generation = UUID()
+        markdownCopyGeneration = generation
+        Task { @MainActor in
+            try? await Task.sleep(for: TranscriptMarkdownCopyFeedbackPolicy.confirmationDuration)
+            guard !Task.isCancelled, markdownCopyGeneration == generation else { return }
+            markdownCopyFeedback = .idle
+        }
     }
 
     /// Deliberately its own control rather than an item in the Export menu.

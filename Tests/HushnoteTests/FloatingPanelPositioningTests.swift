@@ -74,7 +74,7 @@ final class FloatingPanelPositioningTests: XCTestCase {
     func testResizePreservesTopEdgeWhenThereIsRoomOnDisplay() {
         let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
         let currentFrame = CGRect(x: 520, y: 700, width: 390, height: 64)
-        let newSize = CGSize(width: 386, height: 336)
+        let newSize = FloatingRecordingPanelPolicy.expandedPanelSize
 
         let origin = FloatingPanelPositioning.originPreservingTopEdge(
             currentFrame: currentFrame,
@@ -82,14 +82,17 @@ final class FloatingPanelPositioningTests: XCTestCase {
             visibleFrames: [screen]
         )
 
-        XCTAssertEqual(origin, CGPoint(x: 520, y: 428))
+        XCTAssertEqual(
+            origin,
+            CGPoint(x: 520, y: currentFrame.maxY - newSize.height)
+        )
         XCTAssertEqual(origin.y + newSize.height, currentFrame.maxY)
     }
 
     func testResizeClampsToDisplayWhenExpandedPanelWouldCrossTopEdge() {
         let screen = CGRect(x: 0, y: 25, width: 1_440, height: 875)
         let currentFrame = CGRect(x: 1_200, y: 40, width: 390, height: 64)
-        let newSize = CGSize(width: 386, height: 336)
+        let newSize = FloatingRecordingPanelPolicy.expandedPanelSize
 
         let origin = FloatingPanelPositioning.originPreservingTopEdge(
             currentFrame: currentFrame,
@@ -99,6 +102,69 @@ final class FloatingPanelPositioningTests: XCTestCase {
 
         XCTAssertEqual(origin, CGPoint(x: 1_054, y: 25))
         XCTAssertGreaterThanOrEqual(CGRect(origin: origin, size: newSize).minY, screen.minY)
+    }
+
+    func testAtomicResizeUsesCurrentExpandedDimensionsAndPreservesTopEdge() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let current = CGRect(
+            x: 520,
+            y: 700,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
+
+        let frame = FloatingPanelPositioning.resizedFrame(
+            currentFrame: current,
+            requestedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [screen]
+        )
+
+        XCTAssertEqual(frame.size, FloatingRecordingPanelPolicy.expandedPanelSize)
+        XCTAssertEqual(frame.maxY, current.maxY)
+        XCTAssertEqual(frame.minX, current.minX)
+    }
+
+    func testResizeFallsBackToAccessibleCompactPanelWhenDisplayCannotFitExpandedPanel() {
+        let smallScreen = CGRect(x: 0, y: 0, width: 500, height: 300)
+        let current = CGRect(
+            x: 20,
+            y: 220,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
+
+        let frame = FloatingPanelPositioning.resizedFrame(
+            currentFrame: current,
+            requestedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [smallScreen]
+        )
+
+        XCTAssertEqual(frame.size, FloatingRecordingPanelPolicy.compactPanelSize)
+        XCTAssertTrue(smallScreen.contains(frame))
+        XCTAssertEqual(frame.maxY, current.maxY)
+        XCTAssertFalse(FloatingPanelPositioning.canShowExpandedPanel(
+            frame: current,
+            expandedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            visibleFrames: [smallScreen]
+        ))
+    }
+
+    func testResizeChoosesTheScreenContainingTheCurrentPanelBeforeClamping() {
+        let left = CGRect(x: -1_440, y: 0, width: 1_440, height: 900)
+        let right = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let current = CGRect(x: -900, y: 650, width: 390, height: 64)
+
+        let frame = FloatingPanelPositioning.resizedFrame(
+            currentFrame: current,
+            requestedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [left, right]
+        )
+
+        XCTAssertTrue(left.contains(frame))
+        XCTAssertEqual(frame.maxY, current.maxY)
     }
 
     func testNoScreensPreservesSavedOriginAndFallsBackToZero() {
