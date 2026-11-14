@@ -18,6 +18,127 @@ final class FloatingPanelPositioningTests: XCTestCase {
         )
     }
 
+    func testCompactPolicyDimensionsFitMeasuredSingleCapsuleContent() {
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.compactPanelSize,
+            CGSize(width: 436, height: 64)
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.expandedPanelSize,
+            CGSize(width: 386, height: 368)
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.expandedContentSize,
+            CGSize(width: 370, height: 352)
+        )
+        // The expanded frame is exactly its content plus the 8pt outer
+        // padding on every edge.
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.expandedPanelSize.width,
+            FloatingRecordingPanelPolicy.expandedContentSize.width + 16
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.expandedPanelSize.height,
+            FloatingRecordingPanelPolicy.expandedContentSize.height + 16
+        )
+        // The single-capsule compact pill ("Recording paused" plus an
+        // 8-character H:MM:SS clock, measured in place) fits with the
+        // rounding margin to spare.
+        XCTAssertTrue(
+            FloatingRecordingPanelPolicy.compactContentFits(
+                contentWidth: FloatingRecordingPanelPolicy.measuredCompactContentWidth
+            )
+        )
+        XCTAssertEqual(
+            FloatingRecordingPanelPolicy.compactPanelSize.width
+                - FloatingRecordingPanelPolicy.measuredCompactContentWidth
+                - FloatingRecordingPanelPolicy.compactContentPadding * 2,
+            FloatingRecordingPanelPolicy.compactWidthMargin
+        )
+        // The margin is deliberately tight: content 6pt wider would clip
+        // against the fixed native frame.
+        XCTAssertFalse(
+            FloatingRecordingPanelPolicy.compactContentFits(
+                contentWidth: FloatingRecordingPanelPolicy.measuredCompactContentWidth + 6
+            )
+        )
+    }
+
+    func testAtomicCollapsePreservesTopEdge() {
+        let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let current = CGRect(
+            x: 520,
+            y: 400,
+            width: FloatingRecordingPanelPolicy.expandedPanelSize.width,
+            height: FloatingRecordingPanelPolicy.expandedPanelSize.height
+        )
+
+        let frame = FloatingPanelPositioning.resizedFrame(
+            currentFrame: current,
+            requestedSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [screen]
+        )
+
+        XCTAssertEqual(frame.size, FloatingRecordingPanelPolicy.compactPanelSize)
+        XCTAssertEqual(frame.maxY, current.maxY)
+        XCTAssertEqual(frame.minX, current.minX)
+    }
+
+    func testResizeClampsCompactPanelWhenDisplayIsNarrowerThanCompact() {
+        let narrowScreen = CGRect(x: 0, y: 0, width: 400, height: 300)
+        let current = CGRect(
+            x: 20,
+            y: 220,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
+
+        let frame = FloatingPanelPositioning.resizedFrame(
+            currentFrame: current,
+            requestedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [narrowScreen]
+        )
+
+        XCTAssertEqual(frame.size, CGSize(width: 400, height: 64))
+        XCTAssertTrue(narrowScreen.contains(frame))
+        XCTAssertEqual(frame.maxY, current.maxY)
+    }
+
+    func testStaleExpansionRequestCollapsesToCompactPanel() {
+        let smallScreen = CGRect(x: 0, y: 0, width: 500, height: 300)
+        let current = CGRect(
+            x: 20,
+            y: 220,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
+
+        XCTAssertFalse(FloatingPanelPositioning.canShowExpandedPanel(
+            frame: current,
+            expandedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            visibleFrames: [smallScreen]
+        ))
+
+        let frame = FloatingPanelPositioning.resizedFrame(
+            currentFrame: current,
+            requestedSize: FloatingRecordingPanelPolicy.expandedPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [smallScreen]
+        )
+        XCTAssertEqual(frame.size, FloatingRecordingPanelPolicy.compactPanelSize)
+
+        // A repeated collapse once already compact must not move the panel.
+        let again = FloatingPanelPositioning.resizedFrame(
+            currentFrame: frame,
+            requestedSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            compactSize: FloatingRecordingPanelPolicy.compactPanelSize,
+            visibleFrames: [smallScreen]
+        )
+        XCTAssertEqual(again, frame)
+    }
+
     func testDefaultPositionIsCenteredNearTopOfPreferredScreen() {
         let primary = CGRect(x: 0, y: 0, width: 1_440, height: 900)
         let secondary = CGRect(x: 1_440, y: 100, width: 1_920, height: 1_080)
@@ -73,7 +194,12 @@ final class FloatingPanelPositioningTests: XCTestCase {
 
     func testResizePreservesTopEdgeWhenThereIsRoomOnDisplay() {
         let screen = CGRect(x: 0, y: 0, width: 1_440, height: 900)
-        let currentFrame = CGRect(x: 520, y: 700, width: 390, height: 64)
+        let currentFrame = CGRect(
+            x: 520,
+            y: 700,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
         let newSize = FloatingRecordingPanelPolicy.expandedPanelSize
 
         let origin = FloatingPanelPositioning.originPreservingTopEdge(
@@ -91,7 +217,12 @@ final class FloatingPanelPositioningTests: XCTestCase {
 
     func testResizeClampsToDisplayWhenExpandedPanelWouldCrossTopEdge() {
         let screen = CGRect(x: 0, y: 25, width: 1_440, height: 875)
-        let currentFrame = CGRect(x: 1_200, y: 40, width: 390, height: 64)
+        let currentFrame = CGRect(
+            x: 1_200,
+            y: 40,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
         let newSize = FloatingRecordingPanelPolicy.expandedPanelSize
 
         let origin = FloatingPanelPositioning.originPreservingTopEdge(
@@ -154,7 +285,12 @@ final class FloatingPanelPositioningTests: XCTestCase {
     func testResizeChoosesTheScreenContainingTheCurrentPanelBeforeClamping() {
         let left = CGRect(x: -1_440, y: 0, width: 1_440, height: 900)
         let right = CGRect(x: 0, y: 0, width: 1_440, height: 900)
-        let current = CGRect(x: -900, y: 650, width: 390, height: 64)
+        let current = CGRect(
+            x: -900,
+            y: 650,
+            width: FloatingRecordingPanelPolicy.compactPanelSize.width,
+            height: FloatingRecordingPanelPolicy.compactPanelSize.height
+        )
 
         let frame = FloatingPanelPositioning.resizedFrame(
             currentFrame: current,

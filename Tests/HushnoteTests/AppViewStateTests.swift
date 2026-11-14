@@ -139,6 +139,74 @@ final class AppViewStateTests: XCTestCase {
         XCTAssertNil(state.finalizationDetail)
     }
 
+    func testLiveTranscriptDoesNotReplaceCompletedMeetingBeingRead() {
+        let state = AppViewState()
+        let liveMeetingID = UUID()
+        let completedMeetingID = UUID()
+        let completed = Self.line("completed", text: "Yesterday's decision")
+        let live = Self.line("live", text: "Words arriving now")
+
+        state.selection = .meeting(completedMeetingID)
+        state.transcript = [completed]
+        state.activeMeetingID = liveMeetingID
+        state.recordingPhase = .recording
+        state.liveTranscript = [live]
+
+        XCTAssertEqual(state.transcript(for: completedMeetingID), [completed])
+        XCTAssertEqual(state.transcript(for: liveMeetingID), [live])
+
+        state.liveTranscript.append(Self.line("new-live", text: "Another live delta"))
+        XCTAssertEqual(state.transcript(for: completedMeetingID), [completed])
+        XCTAssertEqual(state.transcript(for: liveMeetingID).count, 2)
+    }
+
+    func testNewRecordingClearsOnlyLiveWorkspaceContent() {
+        let state = AppViewState()
+        let completed = Self.line("completed", text: "Keep this visible")
+        state.transcript = [completed]
+        state.liveTranscript = [Self.line("stale-live", text: "Old capture")]
+        state.liveRecordingEvents = [
+            RecordingEvent(
+                sessionID: UUID(),
+                kind: .pause,
+                timelineMilliseconds: 1_000,
+                wallClockAt: Date(),
+                durationMilliseconds: 500
+            )
+        ]
+
+        state.markRecordingStarted(meetingID: UUID())
+
+        XCTAssertEqual(state.transcript, [completed])
+        XCTAssertTrue(state.liveTranscript.isEmpty)
+        XCTAssertTrue(state.liveRecordingEvents.isEmpty)
+    }
+
+    func testFinishingPromotesActiveTranscriptWithoutMixingMeetings() {
+        let state = AppViewState()
+        let liveMeetingID = UUID()
+        let live = Self.line("live", text: "Provisional but safe")
+        let event = RecordingEvent(
+            sessionID: UUID(),
+            kind: .pause,
+            timelineMilliseconds: 2_000,
+            wallClockAt: Date(),
+            durationMilliseconds: 750
+        )
+        state.activeMeetingID = liveMeetingID
+        state.recordingPhase = .finalizing(0.5)
+        state.liveTranscript = [live]
+        state.liveRecordingEvents = [event]
+
+        state.markFinished()
+
+        XCTAssertEqual(state.selection, .meeting(liveMeetingID))
+        XCTAssertEqual(state.transcript, [live])
+        XCTAssertEqual(state.recordingEvents, [event])
+        XCTAssertTrue(state.liveTranscript.isEmpty)
+        XCTAssertTrue(state.liveRecordingEvents.isEmpty)
+    }
+
     func testFirstDurableBufferPromotesStartupAndTerminalStatesClearIt() {
         let state = AppViewState()
         let meetingID = UUID()
@@ -156,6 +224,18 @@ final class AppViewStateTests: XCTestCase {
         state.recordingStartupStage = .arming
         state.markFailed(.init(kind: .capture, message: "Tap stopped"))
         XCTAssertEqual(state.recordingStartupStage, .idle)
+    }
+
+    private static func line(_ segmentID: String, text: String) -> TranscriptLineItem {
+        TranscriptLineItem(
+            id: UUID(),
+            segmentID: segmentID,
+            speaker: "Speaker",
+            start: 0,
+            end: 1,
+            text: text,
+            isProvisional: segmentID.contains("live")
+        )
     }
 
     func testInsightWorkRemainsVisibleToQuitGuardAfterNavigatingAway() {
@@ -239,5 +319,69 @@ final class AppViewStateTests: XCTestCase {
             state.finalizationPresentation(for: completedMeetingID)?.detail
                 .contains("after the current recording stops") == true
         )
+    }
+
+    func testPreparingAndFinalizingElsewhereAlsoBlockQueuedWork() {
+        let state = AppViewState()
+        let completedMeetingID = UUID()
+        let otherMeetingID = UUID()
+        let job = FinalizationJob(
+            sessionID: UUID(),
+            state: .queued,
+            modelID: "large-v3",
+            audioDurationMilliseconds: 60_000
+        )
+        state.recordFinalizationJob(job, for: completedMeetingID)
+
+        // Preparing owns the pipeline before the first buffer: the queue waits.
+        state.recordingPhase = .preparing
+        state.activeMeetingID = otherMeetingID
+        XCTAssertTrue(
+            state.finalizationPresentation(for: completedMeetingID)?.detail
+                .contains("after the current recording stops") == true
+        )
+
+        // A foreground finalization elsewhere also owns it.
+        state.recordingPhase = .finalizing(0.4)
+        state.activeMeetingID = otherMeetingID
+        XCTAssertTrue(
+            state.finalizationPresentation(for: completedMeetingID)?.detail
+                .contains("after the current recording stops") == true
+        )
+
+        // Idle never blocks, and the meeting being finalized never blocks itself.
+        state.recordingPhase = .idle
+        state.activeMeetingID = nil
+        XCTAssertTrue(
+            state.finalizationPresentation(for: completedMeetingID)?.detail
+                .contains("will start automatically") == true
+        )
+        state.recordingPhase = .finalizing(0.4)
+        state.activeMeetingID = completedMeetingID
+        XCTAssertTrue(
+            state.finalizationPresentation(for: completedMeetingID)?.detail
+                .contains("will start automatically") == true
+        )
+    }
+
+    func testWorkingPresentationSurvivesMarkFinishedWithProgress() {
+        let state = AppViewState()
+        let meetingID = UUID()
+        let job = FinalizationJob(
+            sessionID: UUID(),
+            state: .transcribing,
+            modelID: "large-v3",
+            progress: 0.55,
+            audioDurationMilliseconds: 60_000
+        )
+        state.recordFinalizationJob(job, for: meetingID)
+        state.finalizationETAs[meetingID] = .init(lowerBoundSeconds: 10, upperBoundSeconds: 20)
+        state.activeMeetingID = meetingID
+        state.markFinalizing(stage: .savingAudio, progress: 0.1)
+        state.markFinished()
+
+        XCTAssertEqual(state.finalizationPresentation(for: meetingID)?.kind, .transcribing)
+        XCTAssertEqual(state.finalizationPresentation(for: meetingID)?.progress, 0.55)
+        XCTAssertNotNil(state.finalizationPresentation(for: meetingID)?.eta)
     }
 }

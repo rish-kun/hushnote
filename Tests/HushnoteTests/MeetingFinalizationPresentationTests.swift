@@ -95,4 +95,105 @@ struct MeetingFinalizationPresentationTests {
 
         #expect(presentation == nil)
     }
+
+    @Test("A newer queued session outranks an older failure")
+    func newerQueuedOutranksOlderFailure() {
+        let presentation = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [
+                job(state: .failed, queuedAt: 10, errorMessage: "decoder stopped"),
+                job(state: .queued, queuedAt: 20),
+            ],
+            eta: .init(lowerBoundSeconds: 30, upperBoundSeconds: 45),
+            isBlockedByLiveCapture: false
+        )
+
+        #expect(presentation?.kind == .queued)
+        #expect(presentation?.title == "Final transcription queued")
+        #expect(presentation?.isRetryable == false)
+        #expect(presentation?.unresolvedSessionCount == 2)
+    }
+
+    @Test("Running work outranks newer queued work even when older")
+    func runningOutranksNewerQueued() {
+        let presentation = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [
+                job(state: .transcribing, queuedAt: 10, progress: 0.3),
+                job(state: .queued, queuedAt: 20),
+            ],
+            eta: .init(lowerBoundSeconds: 10, upperBoundSeconds: 20),
+            isBlockedByLiveCapture: false
+        )
+
+        #expect(presentation?.kind == .transcribing)
+        #expect(presentation?.title == "Transcribing recording")
+        #expect(presentation?.progress == 0.3)
+    }
+
+    @Test("Working stages expose progress, ETA and honest copy")
+    func workingStagesExposeProgress() {
+        let transcribing = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [job(state: .transcribing, progress: 0.55)],
+            eta: .init(lowerBoundSeconds: 10, upperBoundSeconds: 20),
+            isBlockedByLiveCapture: false
+        )
+        #expect(transcribing?.progress == 0.55)
+        #expect(transcribing?.eta != nil)
+        #expect(transcribing?.detail.contains("final transcript") == true)
+
+        let diarizing = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [job(state: .diarizing, progress: 0.75)],
+            eta: nil,
+            isBlockedByLiveCapture: false
+        )
+        #expect(diarizing?.title == "Identifying speakers")
+        #expect(diarizing?.progress == 0.75)
+
+        let merging = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [job(state: .merging, progress: 0.92)],
+            eta: nil,
+            isBlockedByLiveCapture: false
+        )
+        #expect(merging?.title == "Updating combined transcript")
+        #expect(merging?.progress == 0.92)
+    }
+
+    @Test("A failure without a message still promises the audio is safe")
+    func failedWithoutMessagePromisesAudioSafety() {
+        let presentation = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [job(state: .failed)],
+            eta: .init(lowerBoundSeconds: 30, upperBoundSeconds: 45),
+            isBlockedByLiveCapture: false
+        )
+
+        #expect(presentation?.kind == .failed)
+        #expect(presentation?.detail.contains("original recording is safe") == true)
+        #expect(presentation?.isRetryable == true)
+        #expect(presentation?.eta == nil)
+        #expect(presentation?.progress == nil)
+    }
+
+    @Test("The sidebar keeps its date beside the compact status")
+    func sidebarRetainsDate() {
+        #expect(MeetingFinalizationSidebarPolicy.subtitle(dateString: "Sep 4", compactText: nil) == "Sep 4")
+        #expect(
+            MeetingFinalizationSidebarPolicy.subtitle(
+                dateString: "Sep 4",
+                compactText: "Final transcription queued · About 30–45 sec left"
+            ) == "Sep 4 · Final transcription queued · About 30–45 sec left"
+        )
+        #expect(MeetingFinalizationSidebarPolicy.subtitle(dateString: "", compactText: "Final transcription queued") == "Final transcription queued")
+        #expect(MeetingFinalizationSidebarPolicy.systemImage(hasPresentation: true) == "clock.arrow.circlepath")
+        #expect(MeetingFinalizationSidebarPolicy.systemImage(hasPresentation: false) == "doc.text")
+    }
+
+    @Test("The finalizing route hands from global to durable without a gap")
+    func finalizingHandoff() {
+        #expect(FinalizationBannerHandoffPolicy.showsGlobalBanner(presentation: nil) == true)
+        let queued = MeetingFinalizationPresentationPolicy.presentation(
+            jobs: [job(state: .queued)],
+            eta: nil,
+            isBlockedByLiveCapture: false
+        )
+        #expect(FinalizationBannerHandoffPolicy.showsGlobalBanner(presentation: queued) == false)
+    }
 }

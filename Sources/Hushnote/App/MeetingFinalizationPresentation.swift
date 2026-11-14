@@ -104,9 +104,13 @@ enum MeetingFinalizationPresentationPolicy {
         }
     }
 
-    /// Work in progress is most useful, then a failure requiring attention,
-    /// then queued work. Within a class the newest session wins so continuing a
-    /// meeting describes the session most recently appended to it.
+    /// Work in progress is most useful, then the newest session wins so
+    /// continuing a meeting describes the session most recently appended to
+    /// it. Queued and failed share one recency class deliberately: an old
+    /// failure must not hide the queued work just appended after Continue,
+    /// and an old queued row must not hide a newer failure that still needs
+    /// Retry. Running outranks both even when older, because it carries the
+    /// live progress bar.
     private nonisolated static func isHigherPriority(_ lhs: FinalizationJob, _ rhs: FinalizationJob) -> Bool {
         let left = priority(lhs.state)
         let right = priority(rhs.state)
@@ -118,9 +122,37 @@ enum MeetingFinalizationPresentationPolicy {
     private nonisolated static func priority(_ state: FinalizationJobState) -> Int {
         switch state {
         case .transcribing, .diarizing, .merging: 0
-        case .failed: 1
-        case .queued: 2
-        case .succeeded: 3
+        case .failed, .queued: 1
+        case .succeeded: 2
         }
+    }
+}
+
+/// The sidebar keeps its date when a meeting is finalizing. Replacing the
+/// date with the status silently moves the row in time; the status is
+/// appended after it so both survive a narrow column's truncation from the
+/// tail.
+enum MeetingFinalizationSidebarPolicy {
+    nonisolated static func subtitle(dateString: String, compactText: String?) -> String {
+        guard let compactText, !compactText.isEmpty else { return dateString }
+        guard !dateString.isEmpty else { return compactText }
+        return "\(dateString) · \(compactText)"
+    }
+
+    nonisolated static func systemImage(hasPresentation: Bool) -> String {
+        hasPresentation ? "clock.arrow.circlepath" : "doc.text"
+    }
+}
+
+/// Which banner owns the finalizing route. The global phase owns the brief
+/// saving-audio window before a durable job exists; once the queue has the
+/// job, the durable banner owns it with its ETA, progress and Retry. Showing
+/// both would stack two control surfaces saying the same thing, and showing
+/// neither would be the dead frame Stop must never produce.
+enum FinalizationBannerHandoffPolicy {
+    nonisolated static func showsGlobalBanner(
+        presentation: MeetingFinalizationPresentation?
+    ) -> Bool {
+        presentation == nil
     }
 }

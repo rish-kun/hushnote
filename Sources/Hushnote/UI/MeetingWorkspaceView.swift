@@ -42,8 +42,18 @@ struct MeetingWorkspaceView: View {
         case .active:
             ActiveMeetingView(meetingID: meetingID)
         case .finalizing:
+            // Both banners stay pinned above the workspace, outside any scroll.
+            // The durable banner is always in the hierarchy (as an empty view
+            // when idle) so the handoff from the brief saving-audio phase never
+            // flashes an empty frame: global owns the window before a job
+            // exists, durable owns it after.
             VStack(spacing: 0) {
-                FinalizationBanner()
+                if FinalizationBannerHandoffPolicy.showsGlobalBanner(
+                    presentation: state.finalizationPresentation(for: meetingID)
+                ) {
+                    FinalizationBanner()
+                }
+                MeetingFinalizationStatusBanner(meetingID: meetingID)
                 CompletedMeetingView(meetingID: meetingID)
             }
         case .completed:
@@ -98,7 +108,7 @@ struct ActiveMeetingView: View {
                 )
 
                 // Deliberately a switch over two leaves rather than the two
-                // bodies inline. `state.transcript` is written on every live
+                // bodies inline. `state.liveTranscript` is written on every live
                 // ASR delta, so a body that reads it is rebuilt at speaking
                 // cadence -- and this one would then hold the notes editor.
                 // `ActiveTranscriptTab` owns that read the way `SystemLevelMeter`
@@ -335,7 +345,7 @@ private struct ActiveRecordingEvidenceView: View {
 /// The live transcript, and what stands in for it before there is one.
 ///
 /// A leaf for the same reason `SystemLevelMeter` and `ElapsedTimeLabel` are:
-/// `state.transcript` is replaced wholesale on every arriving delta, and
+/// `state.liveTranscript` is replaced wholesale on every arriving delta, and
 /// SwiftUI attributes that dependency to whichever `body` actually reads it.
 /// Read from `ActiveMeetingView.body` -- as it was until the recording screen
 /// gained tabs -- it rebuilt the header, the level strip and now the notes
@@ -345,7 +355,7 @@ private struct ActiveTranscriptTab: View {
     @Environment(AppViewState.self) private var state
 
     var body: some View {
-        if state.transcript.isEmpty {
+        if state.liveTranscript.isEmpty {
             // With live transcription off nothing is listening for text, so
             // the pane says what will actually happen instead. See
             // `LiveTranscriptionPolicy.emptyTranscript`. It is scoped to this
@@ -371,6 +381,8 @@ private struct ActiveTranscriptTab: View {
             VStack(spacing: 0) {
                 LiveTranscriptFindBar(horizontalInset: horizontalInset)
                 TranscriptView(
+                    transcript: state.liveTranscript,
+                    recordingEvents: state.liveRecordingEvents,
                     // One source of truth rather than a hardcoded `false` that
                     // happens to agree with it.
                     isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
@@ -394,7 +406,7 @@ private struct LiveTranscriptFindBar: View {
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
-        let matches = LiveTranscriptFindPolicy.matches(query: query, in: state.transcript)
+        let matches = LiveTranscriptFindPolicy.matches(query: query, in: state.liveTranscript)
 
         HStack(spacing: 9) {
             Image(systemName: "magnifyingglass")
@@ -444,7 +456,7 @@ private struct LiveTranscriptFindBar: View {
         .onChange(of: query) { _, newQuery in
             let newMatches = LiveTranscriptFindPolicy.matches(
                 query: newQuery,
-                in: state.transcript
+                in: state.liveTranscript
             )
             selectedSegmentID = newMatches.first?.segmentID
             if let destination = selectedSegmentID {
@@ -863,7 +875,9 @@ struct CompletedMeetingView: View {
         case .summary: summaryWorkspace(policy)
         case .transcript:
             TranscriptView(
-                isEditable: TranscriptEditPolicy.allowsEditing(phase: state.recordingPhase),
+                transcript: state.transcript(for: meetingID),
+                recordingEvents: state.recordingEvents(for: meetingID),
+                isEditable: TranscriptEditPolicy.allowsEditing(phase: phase),
                 horizontalInset: policy.gutter,
                 markers: state.markers(for: meetingID)
             )
@@ -1409,11 +1423,13 @@ struct MeetingNotesView: View {
     /// no honest time to stamp, and a wrong one is worse than none.
     ///
     /// Read only from `stampMoment`'s action closure, never from `body`.
-    /// `state.transcript` is replaced on every live ASR delta, and a `body`
+    /// `state.liveTranscript` is replaced on every live ASR delta, and a `body`
     /// that reads it is rebuilt at speaking cadence -- with the editor inside
     /// it. That is why the rail is `NotesRail`, a separate view.
     private var stampableSeconds: TimeInterval? {
-        state.transcript.last?.end
+        guard state.activeMeetingID == meetingID,
+              state.recordingPhase.isCapturing else { return nil }
+        return state.liveTranscript.last?.end
     }
 
     var body: some View {
@@ -1495,6 +1511,7 @@ struct MeetingNotesView: View {
             if notes.isEmpty {
                 Text(NotesPagePolicy.placeholder(
                     isCapturing: state.recordingPhase.isCapturing
+                        && state.activeMeetingID == meetingID
                 ))
                     .font(HushnoteTheme.Font.reading)
                     // 2.50:1 at 0.55. Quiet is not the same as unreadable.
@@ -1537,7 +1554,8 @@ struct MeetingNotesView: View {
 /// What is true about these notes, and about the meeting behind them.
 ///
 /// Its own view rather than a computed property on `MeetingNotesView`, because
-/// it reads `state.transcript` -- which is replaced on every live ASR delta.
+/// it reads the workspace transcript -- whose live buffer is replaced on every
+/// live ASR delta.
 /// Read from the page's own body, it would rebuild the notes editor every time
 /// somebody spoke. Same reason `SystemLevelMeter` is a leaf.
 private struct NotesRail: View {
@@ -1547,19 +1565,21 @@ private struct NotesRail: View {
     private var notes: String { state.meetingNotes[meetingID, default: ""] }
 
     var body: some View {
+        let transcript = state.transcript(for: meetingID)
+
         VStack(alignment: .leading, spacing: 26) {
             VStack(alignment: .leading, spacing: 8) {
                 HushnoteEyebrow("Notes")
                 NotesStatusLine(meetingID: meetingID, axis: .vertical)
             }
 
-            if !state.transcript.isEmpty {
+            if !transcript.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     HushnoteEyebrow("This meeting")
-                    Text(DurationText.clock(state.transcript.last?.end ?? 0))
+                    Text(DurationText.clock(transcript.last?.end ?? 0))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(HushnoteTheme.secondaryInk)
-                    Text("\(state.transcript.count) lines")
+                    Text("\(transcript.count) lines")
                         .font(.caption)
                         .foregroundStyle(HushnoteTheme.secondaryInk)
                     Text(state.insights.summary.isEmpty ? "No summary yet" : "Summary generated")
@@ -1594,7 +1614,9 @@ private struct NotesStatusLine: View {
                     .font(.caption)
                     .foregroundStyle(HushnoteTheme.secondaryInk)
             }
-            if state.recordingPhase.isCapturing, state.transcript.last != nil {
+            if state.recordingPhase.isCapturing,
+               state.activeMeetingID == meetingID,
+               state.liveTranscript.last != nil {
                 // Said where the writing is, not only in a menu. An affordance
                 // reachable solely by shortcut is one nobody finds.
                 Text("⌘⇧T stamps the moment")
@@ -1635,7 +1657,7 @@ private struct NotesStatusLine: View {
 /// rather than the model's.
 enum TranscriptEditPolicy {
     /// A transcript that is still being produced is not the user's to correct.
-    /// While capturing, every live delta replaces `state.transcript` wholesale;
+    /// While capturing, every live delta replaces `state.liveTranscript` wholesale;
     /// while finalizing, the final pass mints new segment identifiers and
     /// re-keys corrections by overlap. An edit made in either window is racing
     /// a writer it cannot see.
@@ -1709,6 +1731,8 @@ enum TranscriptRowText {
 /// text. Only one paragraph is open at a time, and it closes by itself if the
 /// transcript underneath it is replaced.
 struct TranscriptView: View {
+    let transcript: [TranscriptLineItem]
+    let recordingEvents: [RecordingEvent]
     let isEditable: Bool
     let horizontalInset: CGFloat
     var isRecording = false
@@ -1724,7 +1748,7 @@ struct TranscriptView: View {
         // One linear pass over the transcript. A paragraph that did not change
         // compares equal to the one it replaces, so a segment arriving live
         // rebuilds the paragraph it joins and leaves everything above it alone.
-        let paragraphs = TranscriptGrouping.paragraphs(state.transcript)
+        let paragraphs = TranscriptGrouping.paragraphs(transcript)
         let open = TranscriptEditingFocus.surviving(
             openParagraph,
             isEditable: isEditable,
@@ -1749,7 +1773,7 @@ struct TranscriptView: View {
                 reader(
                     paragraphs: paragraphs,
                     chapters: chapters,
-                    recordingEvents: state.recordingEvents,
+                    recordingEvents: recordingEvents,
                     markerPlacements: markerPlacements,
                     open: open,
                     liveParagraph: liveParagraph,
@@ -1912,7 +1936,7 @@ struct TranscriptView: View {
             // a segment that joins the paragraph already on screen lengthens it
             // without changing its identity, and the pane has to keep up with
             // that too.
-            .onChange(of: state.transcript.last?.id) { _, _ in
+            .onChange(of: transcript.last?.id) { _, _ in
                 guard isFollowing, let anchor = paragraphs.last?.id else { return }
                 scroll(proxy, to: anchor, anchor: .bottom)
             }

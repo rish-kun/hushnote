@@ -516,13 +516,15 @@ final class AppCoordinator {
             activeContinuationBaseSegments = continuation?.baseSegments
             if let continuation {
                 cachedSegments[meeting.id] = continuation.baseSegments
-                state.transcript = continuation.baseSegments.map(Self.lineItem)
+                state.liveTranscript = continuation.baseSegments.map(Self.lineItem)
+            } else {
+                state.liveTranscript = []
             }
             sequenceNumbers = [:]
             liveWrites.reset()
             sourcesWithDurableAudio = []
             activePauseEvent = nil
-            state.recordingEvents = (try? await store.recordingEvents(meetingID: meeting.id)) ?? []
+            state.liveRecordingEvents = (try? await store.recordingEvents(meetingID: meeting.id)) ?? []
             microphoneConfigurationTask?.cancel()
             microphoneConfigurationTask = nil
 
@@ -694,11 +696,11 @@ final class AppCoordinator {
             : nil
         do {
             try await store.saveRecordingEvent(event)
-            if let index = state.recordingEvents.firstIndex(where: { $0.id == event.id }) {
-                state.recordingEvents[index] = event
+            if let index = state.liveRecordingEvents.firstIndex(where: { $0.id == event.id }) {
+                state.liveRecordingEvents[index] = event
             } else {
-                state.recordingEvents.append(event)
-                state.recordingEvents.sort {
+                state.liveRecordingEvents.append(event)
+                state.liveRecordingEvents.sort {
                     ($0.timelineMilliseconds, $0.wallClockAt)
                         < ($1.timelineMilliseconds, $1.wallClockAt)
                 }
@@ -812,6 +814,12 @@ final class AppCoordinator {
                 audioDurationMilliseconds: recordingSession.capturedDurationMilliseconds
             )
             try await store.enqueueFinalizationJob(job)
+            // The durable banner must exist before capture ownership is
+            // released. `record` + ETA happen before `markFinished` with no
+            // await between them, so the workspace never renders an idle phase
+            // with no job: the saving-audio banner hands directly to the
+            // queued banner. Reordering these or inserting an await here
+            // reintroduces the dead frame where Stop appears to do nothing.
             state.recordFinalizationJob(job, for: meetingID)
             updateFinalizationETA(for: meetingID, job: job)
             requestFinalizationNotificationAuthorization()
@@ -909,7 +917,7 @@ final class AppCoordinator {
             }
             cachedSegments[id] = segments
             state.recordingMarkers[id] = recordingMarkers
-            guard state.activeMeetingID != id else { return }
+            guard state.activeMeetingID != id || !state.recordingPhase.isBusy else { return }
             state.transcript = segments.map(Self.lineItem)
             state.recordingEvents = recordingEvents
             // The natural moment to reconcile a published link with what this
@@ -1242,7 +1250,14 @@ final class AppCoordinator {
                 }
                 cachedSegments[segment.meetingID] = segments
             }
-            if selectedMeetingID == segment.meetingID {
+            if state.activeMeetingID == segment.meetingID {
+                for index in state.liveTranscript.indices
+                where cachedSegments[segment.meetingID]?.contains(where: {
+                    $0.id == state.liveTranscript[index].segmentID && $0.speakerID == speakerID
+                }) == true {
+                    state.liveTranscript[index].speaker = cleaned
+                }
+            } else if selectedMeetingID == segment.meetingID {
                 for index in state.transcript.indices
                 where cachedSegments[segment.meetingID]?.contains(where: {
                     $0.id == state.transcript[index].segmentID && $0.speakerID == speakerID
@@ -1715,7 +1730,9 @@ final class AppCoordinator {
             }
             try await store.replaceTranscript(.init(meetingID: id, revision: revision, segments: merged))
             cachedSegments[id] = merged
-            if presentsProgress || (!state.recordingPhase.isCapturing && selectedMeetingID == id) {
+            if state.activeMeetingID == id {
+                state.liveTranscript = merged.map(Self.lineItem)
+            } else if selectedMeetingID == id {
                 state.transcript = merged.map(Self.lineItem)
             }
 
@@ -3600,7 +3617,7 @@ final class AppCoordinator {
                             < ($1.startMilliseconds, $1.source.rawValue, $1.id)
                     }
                     self.cachedSegments[snapshot.meetingID] = orderedDisplay
-                    self.state.transcript = orderedDisplay.map(Self.lineItem)
+                    self.state.liveTranscript = orderedDisplay.map(Self.lineItem)
                     let pending = self.liveWrites.unwritten(in: snapshot)
                     guard !pending.isEmpty else { continue }
                     do {

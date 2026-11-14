@@ -896,11 +896,13 @@ private struct SidebarNavigationView: View {
                         ForEach(meetings.prefix(8)) { meeting in
                             SidebarNavigationRow(
                                 title: meeting.title,
-                                subtitle: state.finalizationPresentation(for: meeting.id)?.compactText
-                                    ?? meeting.startedAt.formatted(.dateTime.month(.abbreviated).day()),
-                                systemImage: state.finalizationPresentation(for: meeting.id) == nil
-                                    ? "doc.text"
-                                    : "clock.arrow.circlepath",
+                                subtitle: MeetingFinalizationSidebarPolicy.subtitle(
+                                    dateString: meeting.startedAt.formatted(.dateTime.month(.abbreviated).day()),
+                                    compactText: state.finalizationPresentation(for: meeting.id)?.compactText
+                                ),
+                                systemImage: MeetingFinalizationSidebarPolicy.systemImage(
+                                    hasPresentation: state.finalizationPresentation(for: meeting.id) != nil
+                                ),
                                 isSelected: state.selection == .meeting(meeting.id)
                             ) { coordinator.setSelection(.meeting(meeting.id)) }
                             .contextMenu {
@@ -1566,16 +1568,10 @@ struct MeetingsHomeView: View {
                 .foregroundStyle(HushnoteTheme.secondaryInk)
                 .fixedSize(horizontal: false, vertical: true)
             if let presentation = state.finalizationPresentation(for: meeting.id) {
-                Label(
-                    presentation.compactText,
-                    systemImage: presentation.isRetryable ? "exclamationmark.triangle" : "clock.arrow.circlepath"
+                HushnoteStatusLine(
+                    text: presentation.compactText,
+                    tone: presentation.isRetryable ? .warning : .working
                 )
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(
-                        presentation.isRetryable
-                            ? AnyShapeStyle(HushnoteTheme.vermilionInk)
-                            : AnyShapeStyle(HushnoteTheme.moss)
-                    )
             }
             HStack(spacing: 9) {
                 Text(meeting.template.rawValue)

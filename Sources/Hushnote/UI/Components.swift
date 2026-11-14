@@ -56,6 +56,18 @@ enum LevelMeterModel {
 struct RecordingPill: View {
     @Environment(AppViewState.self) private var state
     @Environment(AppCoordinator.self) private var coordinator
+    /// Expand affordance for the floating panel's compact control. The chevron
+    /// lives inside the pill's own capsule so the compact content is one
+    /// surface, sized by one policy. Other hosts pass nil and get the pill
+    /// alone.
+    let onExpand: (@MainActor () -> Void)?
+
+    // Explicit because the synthesized memberwise initializer is private
+    // (the `@Environment` members are private), which would hide `onExpand`
+    // from the floating panel host in another file.
+    init(onExpand: (@MainActor () -> Void)? = nil) {
+        self.onExpand = onExpand
+    }
 
     var body: some View {
         Group {
@@ -127,6 +139,20 @@ struct RecordingPill: View {
             .help("Stop and finalize")
             .accessibilityLabel("Stop recording and finalize transcript")
             .keyboardShortcut(".", modifiers: [.command, .shift])
+
+            if let onExpand {
+                Divider()
+                    .frame(height: 22)
+
+                Button(action: onExpand) {
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .help("Show recording details")
+                .accessibilityLabel("Expand recording panel")
+            }
         }
         .recordingPillSurface()
         .accessibilityElement(children: .contain)
@@ -353,9 +379,10 @@ struct MeetingFinalizationStatusBanner: View {
                         Text(presentation.title)
                             .font(.callout.weight(.semibold))
                         if presentation.unresolvedSessionCount > 1 {
-                            Text("\(presentation.unresolvedSessionCount) sessions")
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(HushnoteTheme.secondaryInk)
+                            HushnoteBadge(
+                                title: "\(presentation.unresolvedSessionCount) sessions",
+                                tone: .neutral
+                            )
                         }
                     }
                     Text(presentation.detail)
@@ -363,9 +390,7 @@ struct MeetingFinalizationStatusBanner: View {
                         .foregroundStyle(HushnoteTheme.secondaryInk)
                         .fixedSize(horizontal: false, vertical: true)
                     if let eta = presentation.eta {
-                        Text(eta.userFacingText)
-                            .font(.caption.monospacedDigit().weight(.medium))
-                            .foregroundStyle(HushnoteTheme.secondaryInk)
+                        HushnoteStatusLine(text: eta.userFacingText, tone: .working)
                     }
                     if let progress = presentation.progress {
                         ProgressView(value: progress)

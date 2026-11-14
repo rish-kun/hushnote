@@ -161,7 +161,20 @@ struct FloatingPanelPositioning {
 enum FloatingRecordingPanelPolicy {
     /// The controller owns these dimensions instead of asking SwiftUI for a
     /// transient fitting size while its hierarchy is changing.
-    static let compactPanelSize = CGSize(width: 390, height: 64)
+    ///
+    /// The compact control is one capsule: pulse, status, clock, level meter,
+    /// pause, stop, and the expand chevron inside `RecordingPill`. Its widest
+    /// honest state ("Recording paused" plus an 8-character H:MM:SS clock)
+    /// measures 414.5pt of opaque capsule in place. The panel adds the outer
+    /// padding on each side plus a small rounding margin, so fractional text
+    /// widths can never clip against the fixed native frame.
+    static let measuredCompactContentWidth: CGFloat = 414.5
+    static let compactContentPadding: CGFloat = 8
+    static let compactWidthMargin: CGFloat = 5.5
+    static let compactPanelSize = CGSize(
+        width: measuredCompactContentWidth + compactContentPadding * 2 + compactWidthMargin,
+        height: 64
+    )
     // ExpandedRecordingPanel has a 370x352 frame and the content container
     // contributes 8pt of padding on every edge.
     static let expandedPanelSize = CGSize(width: 386, height: 368)
@@ -169,6 +182,12 @@ enum FloatingRecordingPanelPolicy {
 
     nonisolated static func panelSize(isExpanded: Bool) -> CGSize {
         isExpanded ? expandedPanelSize : compactPanelSize
+    }
+
+    /// Whether a compact pill of the given opaque width fits inside the fixed
+    /// compact frame once the outer padding is applied.
+    nonisolated static func compactContentFits(contentWidth: CGFloat) -> Bool {
+        contentWidth + compactContentPadding * 2 <= compactPanelSize.width
     }
 
     nonisolated static func showsExpandedContent(
@@ -539,27 +558,17 @@ private struct FloatingRecordingPanelContent: View {
                     },
                     onSnapshot: onSnapshot
                 )
+            } else if state.recordingPhase.isCapturing {
+                // The expand chevron lives inside the pill's own capsule (see
+                // `RecordingPill.onExpand`), so this branch is one surface and
+                // always fits `compactPanelSize`. A second capsule beside the
+                // pill is what used to push the intrinsic width past the fixed
+                // native frame.
+                RecordingPill(onExpand: { isExpanded = true })
+                    .fixedSize()
             } else {
-                HStack(spacing: 6) {
-                    RecordingPill()
-                    if state.recordingPhase.isCapturing {
-                        Button {
-                            isExpanded = true
-                        } label: {
-                            Image(systemName: "chevron.down")
-                                .font(.caption2.weight(.semibold))
-                                .frame(width: 28, height: 28)
-                                .background(HushnoteTheme.controlSurface, in: Circle())
-                                .overlay {
-                                    Circle().stroke(HushnoteTheme.rule.opacity(0.72), lineWidth: 1)
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .help("Show recording details")
-                        .accessibilityLabel("Expand recording panel")
-                    }
-                }
-                .fixedSize()
+                RecordingPill()
+                    .fixedSize()
             }
         }
         .padding(8)

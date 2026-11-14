@@ -641,10 +641,21 @@ final class AppViewState {
     /// fast typist gets "No matching meetings" flashing between keystrokes.
     var searchPhase: SearchPhase = .idle
 
+    /// The durable transcript for the completed meeting currently selected in
+    /// the sidebar. Live ASR must never write here: the user may be reading a
+    /// different meeting while capture continues in the background.
     var transcript: [TranscriptLineItem] = []
+    /// Provisional text owned exclusively by `activeMeetingID`.
+    ///
+    /// Keeping this separate from `transcript` prevents each live decoder
+    /// delta from replacing the completed transcript currently being read.
+    var liveTranscript: [TranscriptLineItem] = []
     /// Sparse recording apparatus for the selected meeting. These boundaries
     /// are rendered beside the transcript and never become transcript prose.
     var recordingEvents: [RecordingEvent] = []
+    /// Pause and device boundaries for the active capture. Like live text,
+    /// these must not leak into another meeting's completed workspace.
+    var liveRecordingEvents: [RecordingEvent] = []
     /// Durable user emphasis, kept by meeting so loading another workspace
     /// cannot make markers appear to belong to the currently selected meeting.
     var recordingMarkers: [UUID: [RecordingMarker]] = [:]
@@ -851,10 +862,14 @@ final class AppViewState {
     }
 
     func finalizationPresentation(for meetingID: UUID) -> MeetingFinalizationPresentation? {
+        // `isBusy` rather than `isCapturing`: preparing and a foreground
+        // finalization also own the pipeline and the durable queue waits for
+        // `isBusy`, so a queued job behind either must honestly say it waits
+        // for the current work rather than that it starts automatically.
         MeetingFinalizationPresentationPolicy.presentation(
             jobs: finalizationJobsByMeeting[meetingID, default: []],
             eta: finalizationETAs[meetingID],
-            isBlockedByLiveCapture: recordingPhase.isCapturing && activeMeetingID != meetingID
+            isBlockedByLiveCapture: recordingPhase.isBusy && activeMeetingID != meetingID
         )
     }
 
@@ -932,6 +947,16 @@ final class AppViewState {
         return meetings.first { $0.id == activeMeetingID }
     }
 
+    /// The transcript belonging to one workspace, regardless of whether that
+    /// workspace is the active capture or a completed meeting being browsed.
+    func transcript(for meetingID: UUID) -> [TranscriptLineItem] {
+        activeMeetingID == meetingID ? liveTranscript : transcript
+    }
+
+    func recordingEvents(for meetingID: UUID) -> [RecordingEvent] {
+        activeMeetingID == meetingID ? liveRecordingEvents : recordingEvents
+    }
+
     func markRecordingStarted(
         meetingID: UUID,
         preservingExistingContent: Bool = false,
@@ -942,7 +967,8 @@ final class AppViewState {
         elapsed = Double(max(0, timelineStartMilliseconds)) / 1_000
         wallElapsed = elapsed
         if !preservingExistingContent {
-            transcript.removeAll()
+            liveTranscript.removeAll()
+            liveRecordingEvents.removeAll()
             meetingInsights[meetingID] = InsightWorkspaceState()
         }
         recordingNotice = nil
@@ -982,9 +1008,13 @@ final class AppViewState {
         recordingPhase = .idle
         elapsedTask?.cancel()
         if let activeMeetingID {
+            transcript = liveTranscript
+            recordingEvents = liveRecordingEvents
             selection = .meeting(activeMeetingID)
         }
         self.activeMeetingID = nil
+        liveTranscript.removeAll()
+        liveRecordingEvents.removeAll()
         finalizationStage = nil
         finalizationDetail = nil
         recordingStartupStage = .idle
